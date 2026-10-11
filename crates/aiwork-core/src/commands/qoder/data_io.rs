@@ -433,23 +433,29 @@ pub fn qoder_accounts_import(
     // P0 需求①：分组定义统一读共享 groups 表；导出载荷携带的 groups（旧版无此
     // 字段则跳过）按 id 幂等合并进共享定义——本地已有同 id 分组保留本地定义
     //（用户可能已改名），仅补缺失。持池锁执行防读改写竞争。
-    let mut defs: Vec<crate::models::Group> = crate::store::docs::group_defs_load(&store);
-    if let Some(groups) = payload.get("groups").and_then(Value::as_array) {
-        let mut defs_changed = false;
-        for g in groups {
-            let Ok(def) = serde_json::from_value::<crate::models::Group>(g.clone()) else {
-                continue;
-            };
-            if def.id.is_empty() || defs.iter().any(|x| x.id == def.id) {
-                continue;
+    // 审查修复：defs 表整删全写模型，RMW 全程加持 org_defs_lock（锁序「池→本」
+    // 单向嵌套的合法情形：此处已持 qoder_pool_lock）
+    let defs: Vec<crate::models::Group> = {
+        let _org = crate::store::docs::org_defs_lock();
+        let mut defs: Vec<crate::models::Group> = crate::store::docs::group_defs_load(&store);
+        if let Some(groups) = payload.get("groups").and_then(Value::as_array) {
+            let mut defs_changed = false;
+            for g in groups {
+                let Ok(def) = serde_json::from_value::<crate::models::Group>(g.clone()) else {
+                    continue;
+                };
+                if def.id.is_empty() || defs.iter().any(|x| x.id == def.id) {
+                    continue;
+                }
+                defs.push(def);
+                defs_changed = true;
             }
-            defs.push(def);
-            defs_changed = true;
+            if defs_changed {
+                crate::store::docs::group_defs_save(&store, &defs)?;
+            }
         }
-        if defs_changed {
-            crate::store::docs::group_defs_save(&store, &defs)?;
-        }
-    }
+        defs
+    };
     let valid_group_ids: std::collections::HashSet<String> =
         defs.iter().map(|g| g.id.clone()).collect();
     // 凭证写入先收集、落池成功后再执行（审查修复）：原实现循环内先落凭证

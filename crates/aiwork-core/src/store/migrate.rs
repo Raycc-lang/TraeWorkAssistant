@@ -589,7 +589,13 @@ fn migrate_unified_groups(store: &Store) -> Result<usize, String> {
         g.order = (i + 1) as i32;
     }
 
-    // 3. id_map 全量重定向（逐条 UPDATE，旧 id 不存在时 0 行受影响，幂等无害）
+    // 3. 全删全写统一 defs（先于引用重定向——审查修复：若沿用「先重定向后落 defs」
+    //    的顺序，在重定向已落库、defs 全删全写失败/未提交之间崩溃，groups 表无 shg_
+    //    残留可复用，重试会生成全新 id 使已重定向引用悬空；先落 defs 则任何时点崩溃
+    //    重试都能按 name 复用既有 shg_ id（上方 567-570 的恢复分支），重定向幂等续跑）
+    docs::group_defs_save(store, &new_defs)?;
+
+    // 4. id_map 全量重定向（逐条 UPDATE，旧 id 不存在时 0 行受影响，幂等无害）
     for (old, new) in &id_map {
         if old == new {
             continue;
@@ -606,8 +612,7 @@ fn migrate_unified_groups(store: &Store) -> Result<usize, String> {
     redirect_pool_group_ids(store, "qoder_accounts", &id_map)?;
     redirect_api_pool_group_ids(store, &id_map)?;
 
-    // 4. 全删全写统一 defs；5. 删除三套私有 kv
-    docs::group_defs_save(store, &new_defs)?;
+    // 5. 删除三套私有 kv；6. 置迁移标记
     store.kv_delete("workbuddy_groups")?;
     store.kv_delete("qoder_groups")?;
     store.kv_set("unified_groups_migrated", &true)?;
@@ -1048,6 +1053,59 @@ mod tests {
         assert!(store.kv_get_raw("workbuddy_groups").is_none());
 
         // 幂等：二次调用跳过
+        assert_eq!(migrate_unified_groups(&store).unwrap(), 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// v3→v4 容错验收（审查修复）：defs 已落库但引用重定向尚未执行/执行到一半时
+    /// 崩溃（defs 先行顺序下的残留态）——重试必须复用既有 shg_ id 并把旧 id 引用
+    /// 全量重定向，不得生成新 id 造成两代 shg_ 并存或引用悬空。
+    #[test]
+    fn unified_groups_migration_resumes_before_redirects() {
+        use crate::models::Group;
+        let dir = tmp_dir("unified_groups_resume_pre_redirect");
+        let store = db(&dir);
+        // 模拟残留态：shg_ 定义已入 groups 表，但成员与池账号仍指向旧 id
+        docs::group_defs_save(
+            &store,
+            &[Group { id: "shg_B".into(), name: "备份".into(), color: "#00f".into(), order: 1 }],
+        )
+        .unwrap();
+        store
+            .kv_set(
+                "workbuddy_groups",
+                &vec![Group { id: "wbg_9".into(), name: "备份".into(), color: "#0f0".into(), order: 1 }],
+            )
+            .unwrap();
+        store
+            .with_conn(|c| {
+                c.execute("INSERT INTO group_members(uid, group_id) VALUES('u2','wbg_9')", [])?;
+                Ok(())
+            })
+            .unwrap();
+        docs::wb_pool_save(&store, &json!({"accounts": [{"id": "wb-2", "group_id": "wbg_9"}]}))
+            .unwrap();
+
+        let n = migrate_unified_groups(&store).unwrap();
+        assert_eq!(n, 1, "同名旧定义并入既有 shg_ 定义 → 仍 1 条");
+        let defs = docs::group_defs_load(&store);
+        assert_eq!(defs.len(), 1);
+        assert_eq!(defs[0].id, "shg_B", "复用已落库的 shg_ id，不生成新 id");
+        let m: Vec<(String, String)> = store
+            .with_conn(|c| {
+                let mut stmt = c.prepare("SELECT uid, group_id FROM group_members")?;
+                let rows = stmt
+                    .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                Ok(rows)
+            })
+            .unwrap();
+        assert_eq!(m, vec![("u2".into(), "shg_B".into())], "未重定向成员补齐指向 shg_B");
+        let wb = docs::wb_pool_load(&store);
+        assert_eq!(wb["accounts"][0]["group_id"], json!("shg_B"), "未重定向池账号补齐");
+        assert!(store.kv_get_raw("workbuddy_groups").is_none());
+        assert!(store.kv_get::<bool>("unified_groups_migrated"), "迁移标记置位");
+
         assert_eq!(migrate_unified_groups(&store).unwrap(), 0);
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -356,10 +356,10 @@ fn task_times_from(cfg: &Value) -> std::collections::HashMap<String, String> {
         .unwrap_or_default()
 }
 
-/// 任务执行模式表（key → "hourly"；缺省 = 每日）：scheduler_cfg.task_modes，
-/// 仅 HOURLY_CAPABLE 内的任务生效（移植 main@c8e855b 看板数据同步 hourly 语义）。
-/// 看板数据任务缺省模式显式回填（issue #61：Trae 默认 hourly / Buddy 默认 daily，
-/// 对齐 main credits_sync_mode 兜底语义；前端展示与实际调度同源）
+/// 任务执行模式表（key → hourly/every_hours/daily；缺省 = every_hours）：
+/// scheduler_cfg.task_modes，仅 HOURLY_CAPABLE 内的任务生效（移植 main@c8e855b
+/// 看板数据同步 hourly 语义）。缺省模式经 fallback_task_mode 回填（恒 every_hours，
+/// 对齐 main credits_sync_mode 默认值，issue #82；前端展示与实际调度同源）
 fn task_modes(st: &AppState) -> std::collections::HashMap<String, String> {
     let mut m = task_modes_from(&load_cfg(st));
     for k in HOURLY_CAPABLE {

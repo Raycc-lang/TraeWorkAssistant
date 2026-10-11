@@ -279,6 +279,10 @@ pub fn accounts_import(
 ) -> Result<ImportReport, String> {
     let (accounts_arr, groups_arr) = parse_import_file(&content)?;
 
+    // 审查修复：groups 定义表为整删全写模型，导入跨「读 defs → 合并 → 落库」
+    // 全程持 org_defs_lock 防并发 RMW 丢更新（锁序：此处未持池锁，合规）
+    let _org = crate::store::docs::org_defs_lock();
+
     let mut accounts = crate::vault::load_accounts(state);
     let mut groups: GroupsFile = crate::store::docs::groups_load(&crate::store::db(&state.data_dir));
 
@@ -332,6 +336,9 @@ pub fn accounts_import(
 
     // 标签定义循环外一次加载（校验 tag id 存在用；导入过程不修改 tags 表，语义等价）
     let tag_defs = crate::store::docs::tags_load(&crate::store::db(&state.data_dir));
+    // 审查修复：标签绑定延迟落库（对齐 qoder 导入语义）——主体（accounts/groups）
+    // 落库成功后再批量写绑定，避免主体保存失败时绑定已先行落库的半程状态
+    let mut tag_bindings: Vec<(String, Vec<String>)> = Vec::new();
     for (_, entry) in selected {
         // 兼容导出格式(userId/cloudIdeJwt/dcId)与原始格式(UserID/jwt/dc_id)
         let user_id = pick_str(entry, &["userId", "UserID", "user_id", "uid"]);
@@ -393,12 +400,7 @@ pub fn accounts_import(
                 })
                 .collect();
             if !valid.is_empty() {
-                crate::store::docs::account_tags_set(
-                    &crate::store::db(&state.data_dir),
-                    &uid,
-                    &valid,
-                )?;
-                report.tags_restored += valid.len();
+                tag_bindings.push((uid.clone(), valid));
             }
             report.tags_ignored += ignored;
         }
@@ -422,6 +424,18 @@ pub fn accounts_import(
     if report.added > 0 || report.groups_added > 0 {
         crate::vault::save_accounts(state, &mut accounts)?;
         crate::store::docs::groups_save(&crate::store::db(&state.data_dir), &groups)?;
+        // 标签绑定批量落库（延迟写）：单条失败聚合进日志不中断导入，
+        // tags_restored 只计成功写入
+        for (uid, ids) in &tag_bindings {
+            match crate::store::docs::account_tags_set(&crate::store::db(&state.data_dir), uid, ids)
+            {
+                Ok(()) => report.tags_restored += ids.len(),
+                Err(e) => fs_utils::app_log(
+                    &state.data_dir,
+                    &format!("账号 {uid} 标签绑定恢复失败: {e}"),
+                ),
+            }
+        }
         fs_utils::app_log(
             &state.data_dir,
             &format!(
@@ -600,6 +614,8 @@ pub fn account_add_manual(
     });
     crate::vault::save_accounts(state, &mut accounts)?;
     if let Some(g) = group_id {
+        // 审查修复：membership 表整删全写模型，RMW 持 org_defs_lock 防并发丢更新
+        let _org = crate::store::docs::org_defs_lock();
         let mut groups: GroupsFile = crate::store::docs::groups_load(&crate::store::db(&state.data_dir));
         groups.membership.insert(uid, g);
         crate::store::docs::groups_save(&crate::store::db(&state.data_dir), &groups)?;
@@ -624,9 +640,13 @@ pub fn account_delete(
     // 同步清理 vault 中的凭据记录（失败仅记录日志，不阻断删除）
     crate::vault::remove_secret(state, &user_id);
 
-    let mut groups: GroupsFile = crate::store::docs::groups_load(&crate::store::db(&state.data_dir));
-    groups.membership.remove(&user_id);
-    crate::store::docs::groups_save(&crate::store::db(&state.data_dir), &groups)?;
+    // 审查修复：membership 表整删全写模型，RMW 持 org_defs_lock 防并发丢更新
+    {
+        let _org = crate::store::docs::org_defs_lock();
+        let mut groups: GroupsFile = crate::store::docs::groups_load(&crate::store::db(&state.data_dir));
+        groups.membership.remove(&user_id);
+        crate::store::docs::groups_save(&crate::store::db(&state.data_dir), &groups)?;
+    }
 
     // 共享标签绑定清理（审查修复）：防幽灵绑定污染标签计数与 Key 组/标签展开；
     // 失败不阻断删除（数据卫生问题，落日志可重试）
@@ -770,23 +790,27 @@ pub fn group_move(
     user_id: String,
     group_id: Option<String>,
 ) -> Result<(), String> {
-    // 目标分组校验：group_id 传了非空值但共享分组已删除/不存在时直接拒绝，防幽灵分组
-    // （对齐 workbuddy_account_move / qoder_account_move 语义）
-    if let Some(gid) = group_id.as_deref().filter(|g| !g.is_empty()) {
-        if !super::shared_groups::defs_load(state).iter().any(|g| g.id == gid) {
-            return Err(format!("目标分组不存在: {gid}"));
+    // 审查修复：membership 表整删全写模型，RMW 持 org_defs_lock 防并发丢更新；
+    // 目标分组校验（只读 defs_load）一并入锁，使校验与写入原子化；热重载在
+    // 锁释放后执行，不持本锁取池锁
+    {
+        let _org = crate::store::docs::org_defs_lock();
+        if let Some(gid) = group_id.as_deref().filter(|g| !g.is_empty()) {
+            if !super::shared_groups::defs_load(state).iter().any(|g| g.id == gid) {
+                return Err(format!("目标分组不存在: {gid}"));
+            }
         }
+        let mut groups: GroupsFile = crate::store::docs::groups_load(&crate::store::db(&state.data_dir));
+        match group_id {
+            Some(g) => {
+                groups.membership.insert(user_id, g);
+            }
+            None => {
+                groups.membership.remove(&user_id);
+            }
+        }
+        crate::store::docs::groups_save(&crate::store::db(&state.data_dir), &groups)?;
     }
-    let mut groups: GroupsFile = crate::store::docs::groups_load(&crate::store::db(&state.data_dir));
-    match group_id {
-        Some(g) => {
-            groups.membership.insert(user_id, g);
-        }
-        None => {
-            groups.membership.remove(&user_id);
-        }
-    }
-    crate::store::docs::groups_save(&crate::store::db(&state.data_dir), &groups)?;
     crate::api_server::org_index::invalidate(&state.data_dir);
     crate::api_server::runtime::reload_pools_after_change(state);
     Ok(())

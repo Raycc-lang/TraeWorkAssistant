@@ -69,6 +69,7 @@ pub fn tags_list(state: &AppState) -> Vec<TagView> {
 }
 
 fn create_inner(state: &AppState, name: String, color: String) -> Result<String, String> {
+    let _org = crate::store::docs::org_defs_lock();
     let mut defs = defs_load(state);
     let name = validate_name(&defs, &name, None)?;
     let rand = uuid::Uuid::new_v4().simple().to_string();
@@ -90,6 +91,7 @@ fn update_inner(
     color: Option<String>,
     order: Option<i32>,
 ) -> Result<(), String> {
+    let _org = crate::store::docs::org_defs_lock();
     let mut defs = defs_load(state);
     let new_name = match name.as_deref() {
         Some(n) => Some(validate_name(&defs, n, Some(&id))?),
@@ -125,10 +127,14 @@ fn delete_inner(state: &AppState, id: &str) -> Result<(), String> {
     let store = crate::store::db(&state.data_dir);
     // ① 清绑定
     crate::store::docs::account_tags_remove_tag(&store, id)?;
-    // ② 删定义
-    let mut defs = defs_load(state);
-    defs.retain(|t| t.id != id);
-    defs_save(state, &defs)?;
+    // ② 删定义（审查修复：defs 表整删全写模型，RMW 需持 org_defs_lock；
+    // ①段为单条绑定清理，不持本锁）
+    {
+        let _org = crate::store::docs::org_defs_lock();
+        let mut defs = defs_load(state);
+        defs.retain(|t| t.id != id);
+        defs_save(state, &defs)?;
+    }
     // ③ 清引用：api_keys.allowed_tags + api_pool 三池标签筛选
     // Key 引用清理走锁内原子修改（防与并发 UI 保存互覆约束字段）
     crate::api_server::api_keys::modify(&state.data_dir, |keys_file| {

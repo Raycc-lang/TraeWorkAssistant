@@ -73,6 +73,9 @@ export default function SessionsTab({
     })
       .then((r) => {
         if (!cancelled) setData(r);
+        // 翻页越界回夹：筛选后总数变少落在空页时回到最后一页（total=0 是「筛选无结果」空态，不触发）
+        if (!cancelled && r.rows.length === 0 && r.total > 0 && r.page > 1)
+          setPage(Math.max(1, Math.ceil(r.total / r.page_size)));
       })
       .catch((err) => {
         // 审查 No.11：失败保留上次成功结果（不清空已渲染表格），错误横幅持续可见

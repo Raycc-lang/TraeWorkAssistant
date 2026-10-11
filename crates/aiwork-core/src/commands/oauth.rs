@@ -1539,6 +1539,8 @@ pub fn oauth_login(
     // 明确选择分组时同步写入 membership（合并路径此前静默丢弃所选分组）；
     // 未选分组时保持原分组不变。
     if let Some(g) = group_id {
+        // 审查修复：membership 表整删全写模型，RMW 持 org_defs_lock 防并发丢更新
+        let _org = crate::store::docs::org_defs_lock();
         let mut groups: crate::models::GroupsFile =
             crate::store::docs::groups_load(&crate::store::db(&state.data_dir));
         groups.membership.insert(user_id.clone(), g);

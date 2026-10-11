@@ -624,13 +624,6 @@ export default function ApiService() {
                           </button>
                         );
                       })}
-                      {poolGroups.size > 0 && (
-                        <span className="pt-0.5 text-xs text-slate-400">
-                          将纳入 {poolPreview.inPool} 个账号
-                          {poolPreview.excluded > 0 &&
-                            `，${poolPreview.excluded} 个筛选外账号不参与调度`}
-                        </span>
-                      )}
                     </div>
                   </div>
                 )}

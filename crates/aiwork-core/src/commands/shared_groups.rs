@@ -125,6 +125,7 @@ pub(crate) fn list_for_pool(
 
 /// 创建共享分组（shg_ 前缀 + 全局重名校验）
 pub(crate) fn create_inner(state: &AppState, name: String, color: String) -> Result<String, String> {
+    let _org = crate::store::docs::org_defs_lock();
     let mut defs = defs_load(state);
     let name = validate_name(&defs, &name, None)?;
     let rand = uuid::Uuid::new_v4().simple().to_string();
@@ -146,6 +147,7 @@ pub(crate) fn update_inner(
     color: Option<String>,
     order: Option<i32>,
 ) -> Result<(), String> {
+    let _org = crate::store::docs::org_defs_lock();
     let mut defs = defs_load(state);
     // 先校验后可变借用（规避 iter_mut 与校验读借用冲突，对齐 qoder 实现）
     let new_name = match name.as_deref() {
@@ -220,10 +222,13 @@ pub(crate) fn delete_inner(state: &AppState, id: &str) -> Result<(), String> {
             crate::store::docs::qoder_pool_save(&store, &pool)?;
         }
     }
-    // ② 删定义
-    let mut defs = defs_load(state);
-    defs.retain(|g| g.id != id);
-    defs_save(state, &defs)?;
+    // ② 删定义（org 定义读-改-写互斥；①段池锁已释放，锁序「池→本」不成立反向）
+    {
+        let _org = crate::store::docs::org_defs_lock();
+        let mut defs = defs_load(state);
+        defs.retain(|g| g.id != id);
+        defs_save(state, &defs)?;
+    }
     // ③ 清引用：api_pool 三池分组筛选 + api_keys.allowed_groups
     let mut refs_changed = false;
     // 读改写基线统一走迁移入口（对齐上游 P1 审查修复）：直读 kv_get 会落 serde

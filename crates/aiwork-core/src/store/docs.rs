@@ -915,6 +915,21 @@ pub fn groups_save(s: &Store, f: &GroupsFile) -> Result<(), String> {
 
 // ── 共享分组定义（groups 表仅定义行；跨应用统一存储出口）──────────────────────
 
+/// 组织定义表（groups / tags）读-改-写互斥（审查修复）：两组表均为「整表
+/// 全删全写」写模型，Web 管理面并发请求下无锁的 load→save 段会互相覆盖丢更新
+/// （并发 create 丢一条 / delete 与 create 竞争丢新建）。所有此类段必须持本锁。
+/// 锁序约定：仅允许「池锁 → 本锁」单向嵌套（qoder 导入合并段持 qoder_pool_lock
+/// 时取本锁）；严禁持本锁再取任何池锁。启动迁移（migrate.rs）在 server bind 前
+/// 完成，无并发窗口，不取本锁。
+static ORG_DEFS_LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+
+pub fn org_defs_lock() -> std::sync::MutexGuard<'static, ()> {
+    ORG_DEFS_LOCK
+        .get_or_init(|| std::sync::Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+}
+
 /// 读统一分组定义（仅 groups 表定义行，不附带 membership）。
 /// 迁移器、三池 list 命令与共享分组命令共用。
 pub fn group_defs_load(s: &Store) -> Vec<crate::models::Group> {

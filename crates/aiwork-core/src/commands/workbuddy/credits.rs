@@ -1357,7 +1357,11 @@ pub fn workbuddy_sessions_query(
     rows.sort_by(|a, b| b.ts.cmp(&a.ts).then_with(|| b.session_id.cmp(&a.session_id)));
     let total = rows.len() as u64;
     let credits_total = rows.iter().map(|r| r.credits).sum();
-    let begin = ((page - 1) * page_size) as usize;
+    // 审查修复：page 无上界，u32 乘法 (page-1)*page_size 会回绕导致 skip 错页/
+    // 越界——页码夹取到最后一页（u64 中间量）后再算偏移，返回页码同步夹取，
+    // 防前端显示越界页码
+    let page = page.min(((total + page_size as u64 - 1) / page_size as u64).max(1) as u32);
+    let begin = ((page as u64 - 1) * page_size as u64) as usize;
     let rows: Vec<UsageSessionView> = rows
         .into_iter()
         .skip(begin)

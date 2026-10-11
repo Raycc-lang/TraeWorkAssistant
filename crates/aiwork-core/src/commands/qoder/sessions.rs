@@ -28,11 +28,19 @@ pub fn qoder_sessions_query(
     let model_filter = model.as_deref().map(str::trim).filter(|m| !m.is_empty());
     let uid_filter = user_id.as_deref().map(str::trim).filter(|u| !u.is_empty());
 
-    // 账号展示名以账号池为准（uid → nickname）；拷入闭包所有权（with_conn 要求 'static 闭包）
+    // 账号展示名以账号池为准；流水表 uid 列记账号 id（qd- 前缀，审查修复：
+    // 原按 a.uid 建键恒查不到，account_name 恒空）——按 a.id 为主键、a.uid 兜底
+    // 双键收录；拷入闭包所有权（with_conn 要求 'static 闭包）
     let name_of: std::collections::HashMap<String, String> = super::common::load_pool(state)
         .into_iter()
-        .filter(|a| !a.uid.is_empty())
-        .map(|a| (a.uid.clone(), a.nickname.clone()))
+        .flat_map(|a| {
+            let nickname = a.nickname.clone();
+            let mut keys = vec![a.id.clone()];
+            if !a.uid.is_empty() {
+                keys.push(a.uid);
+            }
+            keys.into_iter().map(move |k| (k, nickname.clone()))
+        })
         .collect();
 
     let raw = crate::store::db(&state.data_dir).with_conn(move |c| {
@@ -94,7 +102,11 @@ pub fn qoder_sessions_query(
     });
     let total = rows.len() as u64;
     let credits_total = rows.iter().map(|r| r.1.credits).sum();
-    let begin = ((page - 1) * page_size) as usize;
+    // 审查修复：page 无上界，u32 乘法 (page-1)*page_size 会回绕导致 skip 错页/
+    // 越界——页码夹取到最后一页（u64 中间量）后再算偏移，返回页码同步夹取，
+    // 防前端显示越界页码
+    let page = page.min(((total + page_size as u64 - 1) / page_size as u64).max(1) as u32);
+    let begin = ((page as u64 - 1) * page_size as u64) as usize;
     let rows: Vec<UsageSessionView> = rows
         .into_iter()
         .skip(begin)

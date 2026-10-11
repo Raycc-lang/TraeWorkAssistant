@@ -1097,7 +1097,7 @@ export default function QoderAccounts() {
             await api.qoder.groups.create(name, color);
           } catch (err) {
             pushToast('error', `新建分组失败：${String(err)}`);
-            return;
+            throw err;
           }
           reloadGroups();
         }}
@@ -1106,7 +1106,7 @@ export default function QoderAccounts() {
             await api.qoder.groups.update(id, { name });
           } catch (err) {
             pushToast('error', `重命名失败：${String(err)}`);
-            return;
+            throw err;
           }
           reloadGroups();
         }}
@@ -1115,7 +1115,7 @@ export default function QoderAccounts() {
             await api.qoder.groups.update(id, { color });
           } catch (err) {
             pushToast('error', `修改颜色失败：${String(err)}`);
-            return;
+            throw err;
           }
           reloadGroups();
         }}
@@ -1124,7 +1124,7 @@ export default function QoderAccounts() {
             await api.qoder.groups.remove(id);
           } catch (err) {
             pushToast('error', `删除分组失败：${String(err)}`);
-            return;
+            throw err;
           }
           // 组内账号本地同步回落「未分组」（后端 with_pool_mut 已置空，前端对齐）
           setAccounts((prev) => prev.map((x) => (x.group_id === id ? { ...x, group_id: '' } : x)));
@@ -1143,7 +1143,7 @@ export default function QoderAccounts() {
             await api.tags.create(name, color);
           } catch (err) {
             pushToast('error', `创建标签失败：${String(err)}`);
-            return;
+            throw err;
           }
           reloadTags();
         }}
@@ -1152,7 +1152,7 @@ export default function QoderAccounts() {
             await api.tags.update(id, { name });
           } catch (err) {
             pushToast('error', `重命名标签失败：${String(err)}`);
-            return;
+            throw err;
           }
           pushToast('success', `标签已重命名为「${name}」`);
           reloadTags();
@@ -1162,7 +1162,7 @@ export default function QoderAccounts() {
             await api.tags.update(id, { color });
           } catch (err) {
             pushToast('error', `修改颜色失败：${String(err)}`);
-            return;
+            throw err;
           }
           pushToast('success', '标签颜色已更新');
           reloadTags();
@@ -1172,7 +1172,7 @@ export default function QoderAccounts() {
             await api.tags.remove(id);
           } catch (err) {
             pushToast('error', `删除标签失败：${String(err)}`);
-            return;
+            throw err;
           }
           reloadTags();
           await refresh(); // 审查 No.15：绑定清理后账号列表标签徽标同步（对齐 Buddy 账号页）
