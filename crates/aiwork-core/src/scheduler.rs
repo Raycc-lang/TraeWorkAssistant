@@ -90,7 +90,10 @@ pub fn start(state: AppState) {
 
 /// 失败重试冷却基数：失败后按连续失败次数指数退避（30 分钟起步 ×2 封顶 120 分钟）
 const RETRY_COOLDOWN_MS: i64 = 30 * 60_000;
-
+/// 单轮 tick 内多个到期任务（典型为启动补跑积压）之间的错峰间隔（issue #84 C1）：
+/// 重任务（快照/用量同步）背靠背连跑会形成分钟级 CPU 爆发（实测 103s），任务间
+/// 睡眠错开峰值，给系统留出处理其他负载的余量。
+const TICK_STAGGER_SECS: u64 = 30;
 /// hourly 模式节流：距上次成功执行 ≥1h 才再跑（失败走退避冷却，不受此门限制）
 const HOURLY_INTERVAL_MS: i64 = 60 * 60_000;
 
@@ -98,8 +101,8 @@ const HOURLY_INTERVAL_MS: i64 = 60 * 60_000;
 /// 客户端 token 惰性窗 7h > 6h 调度间隔，任一 tick 必落窗内，确保过期令牌被续）
 const REFRESH_INTERVAL_HOURS: i64 = 6;
 
-/// 可配置「每小时」模式的任务（看板数据同步类，移植 main@c8e855b 的 credits 语义）：
-/// 仅这些任务接受 scheduler_cfg.task_modes 的 hourly 值，其余任务恒为每日模式
+/// 可配置「每小时/每N小时」模式的任务（看板数据同步类，移植 main@c8e855b 的 credits 语义）：
+/// 仅这些任务接受 scheduler_cfg.task_modes 的 hourly/every_hours 值，其余任务恒为每日模式
 const HOURLY_CAPABLE: &[&str] = &["wb-credits-snapshot", "trae-credits-snapshot", "trae-usage-sync"];
 
 /// 单任务的生效调度计划：Skip=关闭；Daily=每日 HH:MM（到点+当日未跑，启动补跑）；
@@ -125,31 +128,44 @@ fn sched_plan(cfg: &Value, t: &SchedTask, extra_enabled: bool) -> SchedPlan {
     if t.key == "qoder-refresh" {
         return SchedPlan::EveryHours(REFRESH_INTERVAL_HOURS);
     }
-    if HOURLY_CAPABLE.contains(&t.key) && effective_task_mode_from(cfg, t.key) == "hourly" {
-        SchedPlan::Hourly
+    if HOURLY_CAPABLE.contains(&t.key) {
+        match effective_task_mode_from(cfg, t.key).as_str() {
+            // 看板数据同步：按模式分档——hourly 每小时节流 / every_hours 每 N 小时节流
+            // （N 可手工设置，默认 2）/ daily（含非法值）按每日时刻
+            "hourly" => SchedPlan::Hourly,
+            "every_hours" => SchedPlan::EveryHours(effective_task_hours_from(cfg, t.key)),
+            _ => SchedPlan::Daily(effective_hhmm_from(cfg, t)),
+        }
     } else {
         SchedPlan::Daily(effective_hhmm_from(cfg, t))
     }
 }
 
 /// 看板数据任务的缺省执行模式（task_modes 缺省/非法值兜底，对齐 main
-/// credits_sync_mode 语义——issue #61：Trae 看板数据默认 hourly 保常驻页面
-/// 小时级新鲜度；Buddy 维持每日）
-fn fallback_task_mode(key: &str) -> &'static str {
-    match key {
-        "wb-credits-snapshot" => "daily",
-        // trae-credits-snapshot / trae-usage-sync
-        _ => "hourly",
-    }
+/// credits_sync_mode 语义——issue #82：会话明细需随账号定时落盘，
+/// Buddy/Trae 看板数据默认每 2 小时）
+fn fallback_task_mode(_key: &str) -> &'static str {
+    "every_hours"
 }
 
 /// 任务生效执行模式（HOURLY_CAPABLE 任务用）：scheduler_cfg.task_modes 显式
-/// 配置优先（hourly/daily），缺省或非法值回落 fallback_task_mode
+/// 配置优先（hourly/daily/every_hours），缺省或非法值回落 fallback_task_mode
 fn effective_task_mode_from(cfg: &Value, key: &str) -> String {
     match task_modes_from(cfg).get(key).map(String::as_str) {
-        Some(m @ ("hourly" | "daily")) => m.to_string(),
+        Some(m @ ("hourly" | "daily" | "every_hours")) => m.to_string(),
         _ => fallback_task_mode(key).to_string(),
     }
+}
+
+/// every_hours 模式的间隔小时数（scheduler_cfg.task_hours，key → 小时数）：
+/// 缺省/非法回退 2，越界 clamp 1..=24
+fn effective_task_hours_from(cfg: &Value, key: &str) -> i64 {
+    cfg.get("task_hours")
+        .and_then(Value::as_object)
+        .and_then(|m| m.get(key))
+        .and_then(Value::as_i64)
+        .unwrap_or(2)
+        .clamp(1, 24)
 }
 
 /// 任务外部设置语义门（整轮读一次）：wb-checkin 联动「启动自动补签」开关（F-55），
@@ -185,6 +201,7 @@ fn tick(st: &AppState) {
     // 调度配置与执行状态整轮各读一次（每 60s tick，避免每任务重复读 db）
     let cfg = load_cfg(st);
     let state = load_state(st);
+    let mut ran_this_tick: usize = 0;
     for t in TASKS {
         // 触发判定（trigger 用于日志展示：每日 HH:MM 或「每小时」）
         let trigger = match sched_plan(&cfg, t, extra_enabled(st, t.key)) {
@@ -225,6 +242,14 @@ fn tick(st: &AppState) {
                 continue;
             }
         }
+        // 错峰（issue #84 C1）：本轮此前已有任务执行（典型为启动补跑积压的多个到期
+        // 任务单 tick 连跑，实测 103s CPU 爆发），先隔一个间隔再跑下一个。睡眠只
+        // 发生在后台调度线程自身；触发判定用的 now_hm 取自 tick 起点，「已过 HH:MM」
+        // 语义不受影响，仅执行时刻顺延。
+        if ran_this_tick > 0 {
+            std::thread::sleep(std::time::Duration::from_secs(TICK_STAGGER_SECS));
+        }
+        ran_this_tick += 1;
         let outcome = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             run_task(t.key, st)
         })) {
@@ -355,6 +380,16 @@ fn task_modes_from(cfg: &Value) -> std::collections::HashMap<String, String> {
         .unwrap_or_default()
 }
 
+/// every_hours 间隔小时数表（key → 小时；缺省 = 2）：scheduler_cfg.task_hours，
+/// 仅 HOURLY_CAPABLE 内任务生效。查询时对合法键回填生效值（前端整表回显与实际调度同源）
+fn task_hours(st: &AppState) -> std::collections::HashMap<String, i64> {
+    let cfg = load_cfg(st);
+    HOURLY_CAPABLE
+        .iter()
+        .map(|k| ((*k).to_string(), effective_task_hours_from(&cfg, k)))
+        .collect()
+}
+
 /// 任务生效触发时刻：task_times 自定义覆盖 > 内置默认（HH:MM 零填充，字符串比较即时间序）
 fn effective_hhmm_from(cfg: &Value, t: &SchedTask) -> String {
     task_times_from(cfg)
@@ -374,6 +409,7 @@ pub fn scheduler_config_get(st: &AppState) -> Value {
         "disabled_tasks": disabled_tasks(st),
         "task_times": task_times(st),
         "task_modes": task_modes(st),
+        "task_hours": task_hours(st),
     })
 }
 
@@ -418,8 +454,8 @@ pub fn scheduler_config_set(st: &AppState, cfg: Value) -> Result<Value, String> 
             times.insert(k.clone(), s.to_string());
         }
     }
-    // 执行模式（移植 main@c8e855b）：仅 hourly/daily 两值，且仅看板同步类任务可 hourly；
-    // 整表替换（空对象 = 全部回每日）。非 hourly-capable 键一律拒绝，防前端误传。
+    // 执行模式（移植 main@c8e855b）：hourly/daily/every_hours 三值，且仅看板同步类任务可配；
+    // 整表替换（空对象 = 全部回默认）。非 HOURLY_CAPABLE 键一律拒绝，防前端误传。
     let mut modes: std::collections::HashMap<String, String> = std::collections::HashMap::new();
     if let Some(m) = cfg.get("task_modes") {
         let obj = m.as_object().ok_or("task_modes 应为对象")?;
@@ -427,18 +463,36 @@ pub fn scheduler_config_set(st: &AppState, cfg: Value) -> Result<Value, String> 
             if !HOURLY_CAPABLE.contains(&k.as_str()) {
                 return Err(format!("任务 {k} 不支持配置执行模式"));
             }
-            let s = v.as_str().ok_or_else(|| format!("任务 {k} 的模式应为 \"daily\" 或 \"hourly\""))?;
-            if s != "daily" && s != "hourly" {
-                return Err(format!("任务 {k} 的模式 {s} 非法（应为 daily/hourly）"));
+            let s = v
+                .as_str()
+                .ok_or_else(|| format!("任务 {k} 的模式应为 \"daily\"/\"hourly\"/\"every_hours\""))?;
+            if s != "daily" && s != "hourly" && s != "every_hours" {
+                return Err(format!("任务 {k} 的模式 {s} 非法（应为 daily/hourly/every_hours）"));
             }
             modes.insert(k.clone(), s.to_string());
+        }
+    }
+    // every_hours 间隔小时数（issue #82）：仅 every_hours 模式任务生效；
+    // 整数 1..=24 越界拒绝（由调用方 clamp 会掩盖配置错误，这里显式校验）
+    let mut hours: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
+    if let Some(m) = cfg.get("task_hours") {
+        let obj = m.as_object().ok_or("task_hours 应为对象")?;
+        for (k, v) in obj {
+            if !HOURLY_CAPABLE.contains(&k.as_str()) {
+                return Err(format!("任务 {k} 不支持配置执行间隔"));
+            }
+            let n = v.as_i64().ok_or_else(|| format!("任务 {k} 的间隔应为整数小时"))?;
+            if !(1..=24).contains(&n) {
+                return Err(format!("任务 {k} 的间隔 {n} 非法（应为 1–24 小时）"));
+            }
+            hours.insert(k.clone(), n);
         }
     }
     // 落库失败必须上抛（审查 P3）：静默成功会让用户以为配置已保存，
     // 实际重启后回退旧配置；磁盘/busy 异常时命令如实报错
     crate::store::db(&st.data_dir).kv_set(
         "scheduler_cfg",
-        &json!({ "disabled_tasks": disabled, "task_times": times, "task_modes": modes }),
+        &json!({ "disabled_tasks": disabled, "task_times": times, "task_modes": modes, "task_hours": hours }),
     )?;
     fs_utils::app_log(
         &st.data_dir,
@@ -446,7 +500,7 @@ pub fn scheduler_config_set(st: &AppState, cfg: Value) -> Result<Value, String> 
             "[调度器] 任务配置已更新：{} 项停用，{} 项自定义时刻，{} 项每小时模式",
             disabled.len(),
             times.len(),
-            modes.iter().filter(|(_, v)| v.as_str() == "hourly").count()
+            modes.iter().filter(|(_, v)| v.as_str() != "daily").count()
         ),
     );
     Ok(scheduler_config_get(st))
@@ -816,10 +870,13 @@ pub fn scheduler_status(st: &AppState) -> Value {
                     SchedPlan::Daily(hhmm) => hhmm,
                     SchedPlan::Skip => "已关闭".to_string(),
                 },
-                // 执行模式（daily/hourly/every6h/off）：前端据此切换时刻输入与徽标
+                // 执行模式（daily/hourly/every_hours/every6h/off）：前端据此切换
+                // 时刻输入/模式选择/间隔输入与徽标；every6h 保留给 qoder-refresh
+                // 固定档位（不可配置），看板数据类 every_hours 可配间隔小时数
                 "mode": match sched_plan(&cfg, t, extra_enabled(st, t.key)) {
                     SchedPlan::Hourly => "hourly",
-                    SchedPlan::EveryHours(_) => "every6h",
+                    SchedPlan::EveryHours(_) if t.key == "qoder-refresh" => "every6h",
+                    SchedPlan::EveryHours(_) => "every_hours",
                     SchedPlan::Daily(_) => "daily",
                     SchedPlan::Skip => "off",
                 },
@@ -903,17 +960,24 @@ mod sched_plan_tests {
         ));
     }
 
-    /// issue #61：Trae 看板数据同步默认 hourly（task_modes 缺省即生效，无需显式
-    /// 配置）；wb 维持每日。显式 daily 可覆盖回每日（23:40/23:50 内置错峰），
-    /// 非法模式值回落缺省口径
+    /// 看板同步任务的调度计划（issue #82）：默认 every_hours 每 2 小时；
+    /// hourly/daily 生效；非法值回 every_hours；间隔小时数可手工设置并 clamp；
+    /// off 关闭
     #[test]
-    fn trae_board_tasks_default_hourly() {
+    fn board_tasks_default_every_hours() {
+        // 默认（无配置）：every_hours 每 2 小时
         assert!(matches!(
             sched_plan(&json!({}), task("trae-credits-snapshot"), true),
-            SchedPlan::Hourly
+            SchedPlan::EveryHours(2)
         ));
         assert!(matches!(
             sched_plan(&json!({}), task("trae-usage-sync"), true),
+            SchedPlan::EveryHours(2)
+        ));
+        // 显式 hourly 覆盖：每小时节流
+        let hourly = json!({ "task_modes": { "trae-usage-sync": "hourly" } });
+        assert!(matches!(
+            sched_plan(&hourly, task("trae-usage-sync"), true),
             SchedPlan::Hourly
         ));
         // 显式 daily 覆盖：回落每日计划并用内置时刻（23:50，与积分同步 23:40 错峰）
@@ -922,16 +986,33 @@ mod sched_plan_tests {
             SchedPlan::Daily(hhmm) => assert_eq!(hhmm, "23:50"),
             other => panic!("daily 覆盖应为每日计划，实际 {other:?}"),
         }
-        // 非法模式值：回落缺省（trae → hourly）
+        // 非法模式值：回落缺省（every_hours 每 2 小时）
         let bogus = json!({ "task_modes": { "trae-usage-sync": "weekly" } });
         assert!(matches!(
             sched_plan(&bogus, task("trae-usage-sync"), true),
-            SchedPlan::Hourly
+            SchedPlan::EveryHours(2)
         ));
-        // wb 缺省仍为每日
+        // wb 缺省同为 every_hours 每 2 小时
         assert!(matches!(
             sched_plan(&json!({}), task("wb-credits-snapshot"), true),
-            SchedPlan::Daily(_)
+            SchedPlan::EveryHours(2)
+        ));
+        // 手工间隔生效 + 越界 clamp（1..=24）
+        let h6 = json!({ "task_modes": { "wb-credits-snapshot": "every_hours" }, "task_hours": { "wb-credits-snapshot": 6 } });
+        assert!(matches!(
+            sched_plan(&h6, task("wb-credits-snapshot"), true),
+            SchedPlan::EveryHours(6)
+        ));
+        let h99 = json!({ "task_modes": { "wb-credits-snapshot": "every_hours" }, "task_hours": { "wb-credits-snapshot": 99 } });
+        assert!(matches!(
+            sched_plan(&h99, task("wb-credits-snapshot"), true),
+            SchedPlan::EveryHours(24)
+        ));
+        // off 关闭（disabled_tasks 命中 → Skip）
+        let off = json!({ "disabled_tasks": ["trae-usage-sync"] });
+        assert!(matches!(
+            sched_plan(&off, task("trae-usage-sync"), true),
+            SchedPlan::Skip
         ));
     }
 

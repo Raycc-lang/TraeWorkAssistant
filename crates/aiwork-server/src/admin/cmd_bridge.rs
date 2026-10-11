@@ -14,7 +14,7 @@ use std::sync::Arc;
 
 use aiwork_core::commands::{
     accounts, api_server as api_server_cmd, checkin as checkin_cmd, misc, oauth, qoder,
-    usage_history, wb_config, workbuddy,
+    shared_groups, tags, usage_history, wb_config, workbuddy,
 };
 use aiwork_core::state::AppState;
 use axum::extract::{Path, State};
@@ -177,6 +177,17 @@ pub fn dispatch(admin: &AdminState, name: &str, args: Value) -> Result<Value, St
             let fresh = opt_arg(&args, "fresh")?;
             usage_history::usage_history_fetch(state, fresh).and_then(to_json)
         }
+        "usage_sessions_query" => {
+            let start = arg(&args, "start")?;
+            let end = arg(&args, "end")?;
+            let model = opt_arg(&args, "model")?;
+            let user_id = opt_arg(&args, "user_id")?;
+            let page = opt_arg(&args, "page")?;
+            let page_size = opt_arg(&args, "page_size")?;
+            usage_history::usage_sessions_query(state, start, end, model, user_id, page, page_size)
+                .and_then(to_json)
+        }
+        "trae_expired_ents" => usage_history::trae_expired_ents(state).and_then(to_json),
         "cooldown_clear" => {
             let user_id = arg(&args, "user_id")?;
             accounts::cooldown_clear(state, user_id).and_then(to_json)
@@ -187,6 +198,48 @@ pub fn dispatch(admin: &AdminState, name: &str, args: Value) -> Result<Value, St
             let force = opt_arg(&args, "force")?;
             accounts::refresh_jwt(state, user_id, force).and_then(to_json)
         }
+
+        // ==================== shared_groups/tags（共享分组与账号标签，D1-D3） ====================
+        "shared_groups_list" => to_json(shared_groups::shared_groups_list(state)),
+        "shared_groups_create" => {
+            let name_ = arg(&args, "name")?;
+            let color = arg(&args, "color")?;
+            shared_groups::shared_groups_create(state, name_, color).and_then(to_json)
+        }
+        "shared_groups_update" => {
+            let id = arg(&args, "id")?;
+            let name_ = opt_arg(&args, "name")?;
+            let color = opt_arg(&args, "color")?;
+            let order = opt_arg(&args, "order")?;
+            shared_groups::shared_groups_update(state, id, name_, color, order).and_then(to_json)
+        }
+        "shared_groups_delete" => {
+            let id = arg(&args, "id")?;
+            shared_groups::shared_groups_delete(state, id).and_then(to_json)
+        }
+        "tags_list" => to_json(tags::tags_list(state)),
+        "tags_create" => {
+            let name_ = arg(&args, "name")?;
+            let color = arg(&args, "color")?;
+            tags::tags_create(state, name_, color).and_then(to_json)
+        }
+        "tags_update" => {
+            let id = arg(&args, "id")?;
+            let name_ = opt_arg(&args, "name")?;
+            let color = opt_arg(&args, "color")?;
+            let order = opt_arg(&args, "order")?;
+            tags::tags_update(state, id, name_, color, order).and_then(to_json)
+        }
+        "tags_delete" => {
+            let id = arg(&args, "id")?;
+            tags::tags_delete(state, id).and_then(to_json)
+        }
+        "account_tags_set" => {
+            let uid = arg(&args, "uid")?;
+            let tag_ids = arg(&args, "tag_ids")?;
+            tags::account_tags_set(state, uid, tag_ids).and_then(to_json)
+        }
+        "account_tags_map" => to_json(tags::account_tags_map(state)),
 
         // ==================== checkin（Trae 签到） ====================
         "checkin_start" => {
@@ -220,6 +273,7 @@ pub fn dispatch(admin: &AdminState, name: &str, args: Value) -> Result<Value, St
             misc::logs_clear(state, log_type).and_then(to_json)
         }
         "settings_get" => to_json(misc::settings_get(state)),
+        "startup_notice_take" => to_json(misc::startup_notice_take(state)),
         "settings_set" => {
             // patch = body.patch（存在时）或整个 body
             let patch = args
@@ -264,6 +318,9 @@ pub fn dispatch(admin: &AdminState, name: &str, args: Value) -> Result<Value, St
             let qoder_group_ids = opt_arg(&args, "qoder_group_ids")?;
             let qoder_strategy = opt_arg(&args, "qoder_strategy")?;
             let trae_enabled = opt_arg(&args, "trae_enabled")?;
+            let trae_tag_ids = opt_arg(&args, "trae_tag_ids")?;
+            let wb_tag_ids = opt_arg(&args, "wb_tag_ids")?;
+            let qoder_tag_ids = opt_arg(&args, "qoder_tag_ids")?;
             api_server_cmd::pool_set(
                 state,
                 uids,
@@ -295,6 +352,9 @@ pub fn dispatch(admin: &AdminState, name: &str, args: Value) -> Result<Value, St
                 qoder_group_ids,
                 qoder_strategy,
                 trae_enabled,
+                trae_tag_ids,
+                wb_tag_ids,
+                qoder_tag_ids,
             )
             .and_then(to_json)
         }
@@ -344,6 +404,10 @@ pub fn dispatch(admin: &AdminState, name: &str, args: Value) -> Result<Value, St
             let keys = arg(&args, "keys")?;
             let auth_disabled = opt_arg(&args, "auth_disabled")?;
             api_server_cmd::api_keys_save(state, keys, auth_disabled).and_then(to_json)
+        }
+        "api_keys_org_preview" => {
+            let keys = arg(&args, "keys")?;
+            to_json(api_server_cmd::api_keys_org_preview(state, keys))
         }
         "api_unified_models" => {
             let available_only = opt_arg(&args, "available_only")?;
@@ -529,6 +593,16 @@ pub fn dispatch(admin: &AdminState, name: &str, args: Value) -> Result<Value, St
         "workbuddy_usage_official_all" => {
             workbuddy::workbuddy_usage_official_all(state).and_then(to_json)
         }
+        "workbuddy_sessions_query" => {
+            let start = arg(&args, "start")?;
+            let end = arg(&args, "end")?;
+            let model = opt_arg(&args, "model")?;
+            let user_id = opt_arg(&args, "user_id")?;
+            let page = opt_arg(&args, "page")?;
+            let page_size = opt_arg(&args, "page_size")?;
+            workbuddy::workbuddy_sessions_query(state, start, end, model, user_id, page, page_size)
+                .and_then(to_json)
+        }
         "workbuddy_activity_info" => {
             let user_id = opt_arg(&args, "user_id")?;
             let refresh = opt_arg(&args, "refresh")?;
@@ -636,6 +710,16 @@ pub fn dispatch(admin: &AdminState, name: &str, args: Value) -> Result<Value, St
             let payload = arg(&args, "payload")?;
             let password = opt_arg(&args, "password")?;
             qoder::qoder_accounts_import(state, payload, password).and_then(to_json)
+        }
+        "qoder_sessions_query" => {
+            let start = arg(&args, "start")?;
+            let end = arg(&args, "end")?;
+            let model = opt_arg(&args, "model")?;
+            let user_id = opt_arg(&args, "user_id")?;
+            let page = opt_arg(&args, "page")?;
+            let page_size = opt_arg(&args, "page_size")?;
+            qoder::qoder_sessions_query(state, start, end, model, user_id, page, page_size)
+                .and_then(to_json)
         }
 
         // ==================== scheduler（调度器） ====================

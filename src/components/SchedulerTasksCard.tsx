@@ -29,7 +29,7 @@ const TASK_DESC: Record<string, string> = {
   'qoder-catalog-sync': '同步 Qoder 上游模型目录（不消耗积分），供网关模型映射使用',
 };
 
-/** 可配置「每小时」模式的任务（看板数据同步类，与服务端 HOURLY_CAPABLE 对齐） */
+/** 可配置「每小时/每N小时」模式的任务（看板数据同步类，与服务端 HOURLY_CAPABLE 对齐） */
 const HOURLY_TASKS = ['wb-credits-snapshot', 'trae-credits-snapshot'];
 
 /** 外部接管开关（wb-checkin → settings.auto_checkin）：checked + 切换回调 */
@@ -59,8 +59,10 @@ export default function SchedulerTasksCard({
   const [disabled, setDisabled] = useState<string[]>([]);
   /** 自定义触发时刻表（key → HH:MM；空 = 默认时刻，状态接口回显生效值） */
   const [times, setTimes] = useState<Record<string, string>>({});
-  /** 执行模式表（key → "daily" | "hourly"；缺省 = 每日，仅看板同步类任务可 hourly） */
+  /** 执行模式表（key → "daily" | "hourly" | "every_hours"；缺省 = every_hours，仅看板同步类任务可配） */
   const [modes, setModes] = useState<Record<string, string>>({});
+  /** every_hours 间隔小时数（key → 1..24；缺省 2，状态接口回填生效值） */
+  const [taskHours, setTaskHours] = useState<Record<string, number>>({});
   const [toggling, setToggling] = useState<string | null>(null);
   const [timeSaving, setTimeSaving] = useState<string | null>(null);
   const [resetting, setResetting] = useState(false);
@@ -76,6 +78,7 @@ export default function SchedulerTasksCard({
         setDisabled(c.disabled_tasks);
         setTimes(c.task_times ?? {});
         setModes(c.task_modes ?? {});
+        setTaskHours(c.task_hours ?? {});
       })
       .catch(() => setDisabled([]));
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -96,8 +99,8 @@ export default function SchedulerTasksCard({
     setDisabled(nextList);
     setToggling(key);
     try {
-      // config_set 为整表替换：必须同时携带自定义时刻与执行模式，否则会被清空
-      const saved = await api.scheduler.configSet({ disabled_tasks: nextList, task_times: times, task_modes: modes });
+      // config_set 为整表替换：必须同时携带自定义时刻/执行模式/间隔小时数，否则会被清空
+      const saved = await api.scheduler.configSet({ disabled_tasks: nextList, task_times: times, task_modes: modes, task_hours: taskHours });
       setDisabled(saved.disabled_tasks);
       setTimes(saved.task_times ?? {});
       pushToast('success', next ? '任务已启用，明日按计划执行' : '任务已停用');
@@ -123,7 +126,7 @@ export default function SchedulerTasksCard({
     setTimes(next);
     setTimeSaving(key);
     try {
-      const saved = await api.scheduler.configSet({ disabled_tasks: disabled, task_times: next, task_modes: modes });
+      const saved = await api.scheduler.configSet({ disabled_tasks: disabled, task_times: next, task_modes: modes, task_hours: taskHours });
       setTimes(saved.task_times ?? {});
       pushToast('success', value ? `执行时间已改为 ${value}（当天已过新时刻会自动补跑）` : '已恢复默认执行时间');
       api.scheduler
@@ -138,16 +141,23 @@ export default function SchedulerTasksCard({
     }
   };
 
-  /** 切换执行模式（每日/每小时，仅看板同步类任务）：距上次成功 ≥1h 才再跑（hourly） */
+  /** 切换执行模式（每N小时/每日/每小时，仅看板同步类）：every_hours 每 N 小时节流 / hourly 每小时节流 */
   const saveMode = async (key: string, mode: string) => {
     const prev = modes;
     const next = { ...prev, [key]: mode };
     setModes(next);
     setToggling(key);
     try {
-      const saved = await api.scheduler.configSet({ disabled_tasks: disabled, task_times: times, task_modes: next });
+      const saved = await api.scheduler.configSet({ disabled_tasks: disabled, task_times: times, task_modes: next, task_hours: taskHours });
       setModes(saved.task_modes ?? {});
-      pushToast('success', mode === 'hourly' ? '已改为每小时执行（距上次成功 ≥1 小时才再跑）' : '已改为每日定时执行');
+      pushToast(
+        'success',
+        mode === 'hourly'
+          ? '已改为每小时执行（距上次成功 ≥1 小时才再跑）'
+          : mode === 'every_hours'
+            ? `已改为每 ${taskHours[key] ?? 2} 小时执行（距上次成功满间隔才再跑）`
+            : '已改为每日定时执行',
+      );
     } catch (e) {
       setModes(prev);
       pushToast('error', e instanceof Error ? e.message : '保存失败');
@@ -156,14 +166,38 @@ export default function SchedulerTasksCard({
     }
   };
 
+  /** 修改 every_hours 间隔小时数（1..24，失焦归一，与后端 clamp 口径一致） */
+  const saveHours = async (key: string, value: number) => {
+    const n = Math.min(24, Math.max(1, Math.round(value) || 2));
+    const prev = taskHours;
+    const next = { ...prev, [key]: n };
+    setTaskHours(next);
+    setTimeSaving(key);
+    try {
+      const saved = await api.scheduler.configSet({ disabled_tasks: disabled, task_times: times, task_modes: modes, task_hours: next });
+      setTaskHours(saved.task_hours ?? {});
+      pushToast('success', `已改为每 ${n} 小时执行一次（含积分快照与消耗/会话明细）`);
+      api.scheduler
+        .status()
+        .then((r) => setTasks(r.tasks.filter((t) => taskKeys.includes(t.key))))
+        .catch(() => {});
+    } catch (e) {
+      setTaskHours(prev);
+      pushToast('error', e instanceof Error ? e.message : '保存失败');
+    } finally {
+      setTimeSaving(null);
+    }
+  };
+
   /** 恢复推荐配置：清空停用名单与自定义时刻（全部启用 + 默认时刻） */
   const resetRecommended = async () => {
     setResetting(true);
     try {
-      const saved = await api.scheduler.configSet({ disabled_tasks: [], task_times: {}, task_modes: {} });
+      const saved = await api.scheduler.configSet({ disabled_tasks: [], task_times: {}, task_modes: {}, task_hours: {} });
       setDisabled(saved.disabled_tasks);
       setTimes(saved.task_times ?? {});
       setModes(saved.task_modes ?? {});
+      setTaskHours(saved.task_hours ?? {});
       pushToast('success', '已恢复推荐配置（全部任务启用 + 默认时刻）');
       api.scheduler
         .status()
@@ -177,9 +211,10 @@ export default function SchedulerTasksCard({
   };
 
   // 恢复推荐按钮只覆盖本卡内的 kv 配置任务；外部 override 绑定的开关由自身行内开关恢复
+  // （task_hours 回填生效值，仅 ≠2 视为自定义；modes 缺省 = every_hours 默认档，不算自定义）
   const hasCustom =
     disabled.some((k) => taskKeys.includes(k)) ||
-    taskKeys.some((k) => times[k] || modes[k] === 'hourly');
+    taskKeys.some((k) => times[k] || modes[k] || (taskHours[k] !== undefined && taskHours[k] !== 2));
 
   return (
     <section className={`card p-4 ${className ?? ''}`}>
@@ -226,23 +261,39 @@ export default function SchedulerTasksCard({
                     <span className="text-sm font-medium">{t?.name ?? key}</span>
                     {t && HOURLY_TASKS.includes(key) && (
                       <select
-                        value={modes[key] === 'hourly' ? 'hourly' : 'daily'}
+                        value={modes[key] ?? 'every_hours'}
                         disabled={toggling === key}
                         onChange={(e) => void saveMode(key, e.target.value)}
                         className="rounded-md border border-slate-200 bg-white px-1.5 py-0.5 text-xs text-slate-600 disabled:opacity-50 dark:border-zinc-700 dark:bg-zinc-800 dark:text-zinc-300"
-                        title="执行模式：每日定时或每小时（距上次成功 ≥1 小时才再跑）"
+                        title="执行模式：每 N 小时（默认 2h）/ 每日定时 / 每小时（距上次成功 ≥1 小时才再跑）"
                       >
+                        <option value="every_hours">每N小时</option>
                         <option value="daily">每日</option>
                         <option value="hourly">每小时</option>
                       </select>
                     )}
+                    {t &&
+                      HOURLY_TASKS.includes(key) &&
+                      (modes[key] ?? 'every_hours') === 'every_hours' && (
+                        <input
+                          type="number"
+                          min={1}
+                          max={24}
+                          value={taskHours[key] ?? 2}
+                          disabled={timeSaving === key}
+                          onChange={(e) => setTaskHours({ ...taskHours, [key]: Number(e.target.value) })}
+                          onBlur={(e) => void saveHours(key, Number(e.target.value))}
+                          className="w-14 rounded-md border border-slate-200 bg-white px-1.5 py-0.5 text-xs tabular-nums text-slate-600 disabled:opacity-50 dark:border-zinc-700 dark:bg-zinc-800 dark:text-zinc-300"
+                          title="间隔小时数（1-24，失焦保存；距上次成功满间隔才再跑）"
+                        />
+                      )}
                     {t && t.mode === 'every6h' ? (
                       <Badge tone="violet" title="固定周期任务：每 6 小时自动执行一次，触发时刻不可配置">
                         {t.time}
                       </Badge>
                     ) : (
                       t &&
-                      !(HOURLY_TASKS.includes(key) && modes[key] === 'hourly') && (
+                      !(HOURLY_TASKS.includes(key) && modes[key] !== 'daily') && (
                         <input
                           type="time"
                           value={t.time}

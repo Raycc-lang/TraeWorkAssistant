@@ -15,19 +15,23 @@ import {
   Users,
   HelpCircle,
   FolderCog,
+  Tags,
 } from 'lucide-react';
 import { useMemo } from 'react';
 import PageHeader from '../../components/PageHeader';
 import { Badge, EmptyState, Modal, Spinner } from '../../components/ui';
 import { BuddyHelpModal } from './HelpModal';
 import { GroupSelect } from '../accounts/GroupSelect';
-import { GroupsModal } from '../accounts/GroupsModal';
+import { GroupsModal, computePoolBadges } from '../accounts/GroupsModal';
+import { TagChips } from '../accounts/TagSelect';
+import { AccountTagsEditModal, TagsModal } from '../accounts/TagsModal';
 import { listen, api } from '../../lib/tauri';
 import { useAppStore } from '../../store';
 import { withMinDelay } from '../../lib/delay';
 import { copyText } from '../../lib/clipboard';
 import type {
   GroupView,
+  TagView,
   WbCheckinRecord,
   WorkBuddyAccountView,
   WbCreditPackage,
@@ -98,6 +102,13 @@ export default function BuddyAccounts() {
   // ---- 账号分组（对齐 Trae 账号管理）----
   const [wbGroups, setWbGroups] = useState<GroupView[]>([]);
   const [groupOpen, setGroupOpen] = useState(false);
+  // ---- 共享标签（P1 需求③，三池通用；uid 键 = wb- 账号 id）----
+  const [tagDefs, setTagDefs] = useState<TagView[]>([]);
+  const [tagMap, setTagMap] = useState<Record<string, string[]>>({});
+  const [tagsOpen, setTagsOpen] = useState(false);
+  const [tagEditTarget, setTagEditTarget] = useState<WorkBuddyAccountView | null>(null);
+  // 池来源徽标（需求①可选增强）：groupId → 在哪些池有成员
+  const [poolBadges, setPoolBadges] = useState<Record<string, string[]>>({});
   const [filter, setFilter] = useState<string>('all');
 
   /** 分组列表重取（count/uids 由后端按账号 group_id 实时推导） */
@@ -107,6 +118,28 @@ export default function BuddyAccounts() {
       .then(setWbGroups)
       .catch(() => {});
   }, []);
+
+  /** 共享标签重取（定义 + 全量绑定映射） */
+  const reloadTags = useCallback(() => {
+    Promise.all([api.tags.list(), api.tags.map()])
+      .then(([defs, map]) => {
+        setTagDefs(defs);
+        setTagMap(map);
+      })
+      .catch(() => {});
+  }, []);
+
+  /** 保存账号标签绑定（全量覆盖式） */
+  const saveAccountTags = async (uid: string, ids: string[]) => {
+    try {
+      await api.tags.setAccountTags(uid, ids);
+      reloadTags();
+      pushToast('success', '标签已更新');
+    } catch (err) {
+      pushToast('error', `标签保存失败：${String(err)}`);
+      throw err;
+    }
+  };
 
   // 分组过滤（对齐 Trae 账号管理）：all / ungrouped / 指定分组 id
   const filtered = useMemo(() => {
@@ -122,6 +155,8 @@ export default function BuddyAccounts() {
       setAccounts(accs);
       // 分组列表（失败静默：过滤 chips 缺失不阻断列表）
       reloadGroups();
+      // 共享标签（失败静默：标签 chips 缺失不阻断列表）
+      reloadTags();
       // 积分缓存查询（≥5min 缓存，失败不阻断列表展示）
       api.workbuddy
         .creditsFetch()
@@ -445,8 +480,29 @@ export default function BuddyAccounts() {
                 e.target.value = '';
               }}
             />
-            <button onClick={() => setGroupOpen(true)} className="btn-outline" title="管理账号分组">
+            <button
+              onClick={() => {
+                setGroupOpen(true);
+                // 池来源徽标：共享分组三池成员并集按前缀统计（可选增强，失败静默）
+                api.groups
+                  .sharedList()
+                  .then((defs) => setPoolBadges(computePoolBadges(defs)))
+                  .catch(() => {});
+              }}
+              className="btn-outline"
+              title="管理账号分组"
+            >
               <FolderCog size={15} /> 分组管理
+            </button>
+            <button
+              onClick={() => {
+                reloadTags();
+                setTagsOpen(true);
+              }}
+              className="btn-outline"
+              title="管理共享标签（三池通用）"
+            >
+              <Tags size={15} /> 标签管理
             </button>
           </>
         }
@@ -497,6 +553,7 @@ export default function BuddyAccounts() {
               <tr>
                 <th className="px-4 py-2 text-left">账号</th>
                 <th className="px-4 py-2 text-left">分组</th>
+                <th className="px-4 py-2 text-left">标签</th>
                 <th className="px-4 py-2 text-left">会员套餐</th>
                 <th className="px-4 py-2 text-left">积分包</th>
                 <th className="px-4 py-2 text-right">可用积分</th>
@@ -545,6 +602,13 @@ export default function BuddyAccounts() {
                             reloadGroups();
                           }).catch((err) => pushToast('error', `分组调整失败：${String(err)}`));
                         }}
+                      />
+                    </td>
+                    <td className="px-4 py-3">
+                      <TagChips
+                        tagIds={tagMap[a.id] ?? a.tags}
+                        allTags={tagDefs}
+                        onEdit={() => setTagEditTarget(a)}
                       />
                     </td>
                     <td className="px-4 py-3">
@@ -870,6 +934,7 @@ export default function BuddyAccounts() {
         open={groupOpen}
         onClose={() => setGroupOpen(false)}
         groups={wbGroups}
+        poolBadges={poolBadges}
         onCreate={async (name, color) => {
           try {
             await api.workbuddy.groups.create(name, color);
@@ -909,6 +974,64 @@ export default function BuddyAccounts() {
             pushToast('error', `删除分组失败：${String(err)}`);
             throw err;
           }
+        }}
+      />
+
+      {/* 共享标签管理 + 账号标签编辑（三池通用，P1 需求③） */}
+      <TagsModal
+        open={tagsOpen}
+        onClose={() => setTagsOpen(false)}
+        tags={tagDefs}
+        onCreate={async (name, color) => {
+          try {
+            await api.tags.create(name, color);
+            reloadTags();
+          } catch (err) {
+            pushToast('error', `创建标签失败：${String(err)}`);
+            throw err;
+          }
+        }}
+        onRename={async (id, name) => {
+          try {
+            await api.tags.update(id, { name });
+            pushToast('success', `标签已重命名为「${name}」`);
+            reloadTags();
+          } catch (err) {
+            pushToast('error', `重命名标签失败：${String(err)}`);
+            throw err;
+          }
+        }}
+        onRecolor={async (id, color) => {
+          try {
+            await api.tags.update(id, { color });
+            pushToast('success', '标签颜色已更新');
+            reloadTags();
+          } catch (err) {
+            pushToast('error', `修改标签颜色失败：${String(err)}`);
+            throw err;
+          }
+        }}
+        onDelete={async (id) => {
+          try {
+            await api.tags.remove(id);
+            reloadTags();
+            await refresh(); // 绑定清理后列表同步
+            pushToast('success', '标签已删除，引用已清理');
+          } catch (err) {
+            pushToast('error', `删除标签失败：${String(err)}`);
+            throw err;
+          }
+        }}
+      />
+      <AccountTagsEditModal
+        open={tagEditTarget != null}
+        onClose={() => setTagEditTarget(null)}
+        accountName={tagEditTarget?.nickname || tagEditTarget?.id || ''}
+        tags={tagDefs}
+        selected={tagEditTarget ? (tagMap[tagEditTarget.id] ?? tagEditTarget.tags ?? []) : []}
+        onSave={async (ids) => {
+          if (!tagEditTarget) return;
+          await saveAccountTags(tagEditTarget.id, ids);
         }}
       />
 

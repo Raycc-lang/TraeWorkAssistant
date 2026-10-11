@@ -8,6 +8,7 @@ pub mod dispatch;
 pub mod efforts;
 pub mod gateway_settings;
 pub mod models_sync;
+pub mod org_index;
 pub mod pool;
 pub mod payload;
 pub mod qoder_route;
@@ -238,7 +239,11 @@ impl ApiSharedState {
     }
 
     /// 记录一次 Qoder 请求用量（独立 qoder_days 桶，与 Trae/WB/Custom 分账）；
-    /// 与 WB 侧一致支持 TTFT 分位统计，落盘策略相同
+    /// 与 WB 侧一致支持 TTFT 分位统计，落盘策略相同。
+    /// `credits`/`original_credits`：上游 usage 中的积分测量（issue #82 T2），
+    /// 上游未下发 usage 时传 (None, None) 不入账（不得伪造）
+    /// `session`：请求级会话上下文（issue #82 问题5）——同步直写 qoder_sessions 流水
+    /// （INSERT OR IGNORE 幂等；写失败静默，不影响记账主路径）
     #[allow(clippy::too_many_arguments)]
     pub fn record_usage_qoder(
         &self,
@@ -250,19 +255,42 @@ impl ApiSharedState {
         duration_ms: u64,
         prompt_tokens: u64,
         completion_tokens: u64,
+        // F-76① 同构 TTFT 入账（审查补齐）：首字耗时；无首字语义的失败（no-healthy/
+        // identity 未达首字）传 None
         ttfb_ms: Option<u64>,
+        credits: Option<f64>,
+        original_credits: Option<f64>,
+        session: &usage::QoderSessionCtx,
     ) {
+        let day = usage::today_key();
         let mut guard = self
             .usage
             .lock()
             .unwrap_or_else(|e| e.into_inner());
+        guard.record_credits_qoder(model, &day, credits, original_credits);
         guard.record_in_ttfb(
-            usage::UsageBucket::Qoder, model, uid, key_id, ok, is_stream, duration_ms, prompt_tokens,
-            completion_tokens, ttfb_ms,
+            usage::UsageBucket::Qoder,
+            model, uid, key_id, ok, is_stream, duration_ms, prompt_tokens, completion_tokens,
+            ttfb_ms,
         );
-        // 批次 C 削峰：同 record_usage_ttfb，仅标脏不落盘
-        let day = usage::today_key();
+        // 批次 C 削峰：同 record_usage_custom，仅标脏不落盘
         drop(guard);
+        let _ = crate::store::docs::qoder_session_insert(
+            &crate::store::db(&self.data_dir),
+            &session.request_id,
+            &session.session_id,
+            uid,
+            &day,
+            session.ts,
+            model,
+            credits.unwrap_or(0.0),
+            prompt_tokens as i64,
+            completion_tokens as i64,
+            duration_ms as i64,
+            is_stream,
+            ok,
+            &session.preview,
+        );
         self.usage_dirty
             .lock()
             .unwrap_or_else(|e| e.into_inner())

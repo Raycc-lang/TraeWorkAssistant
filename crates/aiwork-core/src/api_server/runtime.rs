@@ -423,8 +423,22 @@ pub fn apply_pool_snapshot(
         .iter()
         .map(|(uid, c)| (uid.clone(), credits_file.general.get(uid).copied().unwrap_or(*c)))
         .collect();
+    // 共享标签筛选（P2 需求④）：tag_uid_set 非空时仅纳入带任一所选标签的账号，
+    // 与分组筛选取交集（D5 池语义：组 ∩ 标签，均空 = 不限）
+    let tag_map = crate::store::docs::account_tags_map(&store::db(&state.data_dir));
+    let trae_tag_filter =
+        crate::api_server::org_index::tag_uid_set(&pool_file.trae_tag_ids, &tag_map);
+    let trae_accounts: Vec<_> = match &trae_tag_filter {
+        Some(set) => accounts
+            .accounts
+            .iter()
+            .filter(|a| a.user_id.as_deref().map(|u| set.contains(u)).unwrap_or(false))
+            .cloned()
+            .collect(),
+        None => accounts.accounts.clone(),
+    };
     pool.sync_from_accounts(
-        &accounts.accounts,
+        &trae_accounts,
         &pool_file.enabled_uids,
         &pool_file.group_ids,
         &groups_file.membership,
@@ -435,18 +449,25 @@ pub fn apply_pool_snapshot(
     );
     let wb_accounts_all = wb_upstream_accounts(state);
     // Buddy 池分组筛选（对齐 Trae 池 T10 语义）：wb_group_ids 非空时仅纳入所选分组的
-    // WB 账号，未分组账号不参与；空 = 不限分组
+    // WB 账号，未分组账号不参与；空 = 不限分组。筛选在装配层先行完成，
+    // sync_from_wb 白名单交集语义不变。标签筛选与分组合取（D5 交集）。
     let wb_group_filter: Option<std::collections::HashSet<&str>> = if pool_file.wb_group_ids.is_empty() {
         None
     } else {
         Some(pool_file.wb_group_ids.iter().map(|s| s.as_str()).collect())
     };
-    let wb_accounts: Vec<_> = match &wb_group_filter {
-        Some(f) => wb_accounts_all
+    let wb_tag_filter = crate::api_server::org_index::tag_uid_set(&pool_file.wb_tag_ids, &tag_map);
+    let wb_accounts: Vec<_> = match (&wb_group_filter, &wb_tag_filter) {
+        (Some(f), Some(t)) => wb_accounts_all
+            .into_iter()
+            .filter(|a| f.contains(a.group_id.as_str()) && t.contains(&a.uid))
+            .collect(),
+        (Some(f), None) => wb_accounts_all
             .into_iter()
             .filter(|a| f.contains(a.group_id.as_str()))
             .collect(),
-        None => wb_accounts_all,
+        (None, Some(t)) => wb_accounts_all.into_iter().filter(|a| t.contains(&a.uid)).collect(),
+        (None, None) => wb_accounts_all,
     };
     let wb_uids = effective_wb_uids(&pool_file, &wb_accounts);
     wb_pool.sync_from_wb(&wb_accounts, &wb_uids);
@@ -460,13 +481,21 @@ pub fn apply_pool_snapshot(
         } else {
             Some(pool_file.qoder_group_ids.iter().map(|s| s.as_str()).collect())
         };
-    let qoder_accounts: Vec<_> = match &qoder_group_filter {
-        Some(f) => qoder_accounts_all
-            .into_iter()
-            .filter(|a| f.contains(a.group_id.as_str()))
-            .collect(),
-        None => qoder_accounts_all,
-    };
+    // Qoder 池标签筛选（与分组合取交集，D5）
+    let qoder_tag_filter =
+        crate::api_server::org_index::tag_uid_set(&pool_file.qoder_tag_ids, &tag_map);
+    let qoder_accounts: Vec<_> = qoder_accounts_all
+        .into_iter()
+        .filter(|a| {
+            let group_ok = qoder_group_filter
+                .as_ref()
+                .map_or(true, |f| f.contains(a.group_id.as_str()));
+            // tag_map 对 Qoder 的键即账号 id（qd-xxx）；QoderSyncAccount.uid 承载账号 id，
+            // 与 main 侧 `t.contains(&a.id)` 语义等价（main 的 QoderSyncAccount.uid 亦取 a.id）
+            let tag_ok = qoder_tag_filter.as_ref().map_or(true, |t| t.contains(&a.uid));
+            group_ok && tag_ok
+        })
+        .collect();
     // 生效白名单 fail-open 解析（对齐 Buddy 池 effective_wb_uids）：显式白名单优先，
     // 空 = 全部含凭证账号自动入池——直传空白名单会导致 Qoder 池恒为空
     //（支持模型 qoder 源恒「未启用」、调度配置无 Qoder 候选）

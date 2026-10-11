@@ -57,7 +57,7 @@ fn merge_pool_set(
     // Qoder 池入池白名单（qd- 前缀账号 id）；None = 保留原值，
     // Some(list) = 覆盖（Qoder 页账号池勾选保存；空数组 = fail-open 全量入池）
     qoder_uids: Option<Vec<String>>,
-    // Qoder 池分组筛选（qoder_groups 分组 id）；None = 保留原值
+    // Qoder 池分组筛选（共享分组 shg_ 前缀 id）；None = 保留原值
     qoder_group_ids: Option<Vec<String>>,
     // Qoder 池内调度策略；空串 = 跟随 Trae 池（同 wb_strategy 语义）；None = 保留原值
     qoder_strategy: Option<String>,
@@ -122,6 +122,10 @@ fn merge_pool_set(
         qoder_sticky_enabled: qoder_sticky_enabled.unwrap_or(existing.qoder_sticky_enabled),
         qoder_group_ids: qoder_group_ids.unwrap_or_else(|| existing.qoder_group_ids.clone()),
         qoder_strategy: qoder_strategy.unwrap_or_else(|| existing.qoder_strategy.clone()),
+        // 标签筛选不参与 merge_pool_set（pool_set 命令在 merge 后追加应用），原样保留
+        trae_tag_ids: existing.trae_tag_ids.clone(),
+        wb_tag_ids: existing.wb_tag_ids.clone(),
+        qoder_tag_ids: existing.qoder_tag_ids.clone(),
     }
 }
 
@@ -175,9 +179,14 @@ pub fn pool_set(
     qoder_strategy: Option<String>,
     // Trae 池参与调度开关（默认开）；None = 保留原值
     trae_enabled: Option<bool>,
+    // 各池共享标签筛选（tag_ 前缀 id）；None = 保留原值，Some(list) = 覆盖
+    // （与分组筛选取交集，D5 池语义）
+    trae_tag_ids: Option<Vec<String>>,
+    wb_tag_ids: Option<Vec<String>>,
+    qoder_tag_ids: Option<Vec<String>>,
 ) -> Result<(), String> {
     let existing: ApiPoolFile = crate::api_server::runtime::load_pool_file(&state.data_dir);
-    let pool_file = merge_pool_set(
+    let mut pool_file = merge_pool_set(
         &existing,
         uids,
         strategy,
@@ -209,6 +218,17 @@ pub fn pool_set(
         qoder_strategy,
         trae_enabled,
     );
+    // 标签筛选在 merge 后追加应用（merge_pool_set 纯函数签名不动，存量单测零改动）：
+    // 显式空数组 = 清空标签筛选，None = 保留
+    if let Some(v) = trae_tag_ids {
+        pool_file.trae_tag_ids = v;
+    }
+    if let Some(v) = wb_tag_ids {
+        pool_file.wb_tag_ids = v;
+    }
+    if let Some(v) = qoder_tag_ids {
+        pool_file.qoder_tag_ids = v;
+    }
     crate::store::db(&state.data_dir).kv_set("api_pool", &pool_file)?;
     // 热应用：网关运行中即改内存池策略（Buddy 池空值沿用 Trae 池策略，与启动逻辑一致）
     if let Some(shared) = crate::api_server::runtime::gateway_shared() {
@@ -561,6 +581,44 @@ pub fn api_keys_save(
     Ok(())
 }
 
+/// Key 组/标签约束覆盖预览（D4/D5）：对传入条目按 org_index 实时展开计算
+/// 各池覆盖账号数（前端「覆盖账号数 = 0」强提示用；只读不落盘）。
+/// 返回 {key_id: {trae: n, buddy: n, qoder: n, total: n}}。
+pub fn api_keys_org_preview(
+    state: &AppState,
+    keys: Vec<crate::api_server::api_keys::ApiKeyEntry>,
+) -> std::collections::HashMap<String, std::collections::HashMap<String, usize>> {
+    use crate::api_server::api_keys::split_pool_tagged;
+    use std::collections::HashMap;
+    let idx = crate::api_server::org_index::get(&state.data_dir);
+    let mut out: HashMap<String, HashMap<String, usize>> = HashMap::new();
+    for k in keys {
+        // effective_allowed = allowed_accounts（精确白名单）∪ 组∩标签展开（D5）
+        let mut allowed: std::collections::HashSet<String> =
+            k.allowed_accounts.iter().cloned().collect();
+        if !k.allowed_groups.is_empty() || !k.allowed_tags.is_empty() {
+            allowed.extend(crate::api_server::org_index::expand(
+                &k.allowed_groups,
+                &k.allowed_tags,
+                &idx,
+            ));
+        }
+        let mut counts: HashMap<String, usize> = HashMap::new();
+        for u in &allowed {
+            let pool = match split_pool_tagged(u) {
+                (Some(p), _) => p,
+                // 裸条目防御性归属 buddy（与 pool_constraints 白名单分池语义一致）
+                (None, _) => "buddy",
+            };
+            *counts.entry(pool.to_string()).or_default() += 1;
+        }
+        let total: usize = allowed.len();
+        counts.insert("total".into(), total);
+        out.insert(k.id, counts);
+    }
+    out
+}
+
 // ==================== 统一网关命令（Phase 1 §8.1） ====================
 
 /// 统一模型目录聚合视图（实时派生，不落盘）。
@@ -756,6 +814,9 @@ mod pool_merge_tests {
             qoder_pool_sticky_ttl_secs: 900,
             qoder_sticky_ttl_secs: 3600,
             qoder_group_ids: Vec::new(),
+            trae_tag_ids: Vec::new(),
+            wb_tag_ids: Vec::new(),
+            qoder_tag_ids: Vec::new(),
         }
     }
 

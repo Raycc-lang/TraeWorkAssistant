@@ -50,6 +50,9 @@ pub struct AccountView {
     /// F-78 批次 3 收尾，对齐 Buddy 侧 auth_saved_at 先例）
     #[serde(default)]
     pub auth_saved_at: Option<String>,
+    /// 共享标签 tag id 列表（从 account_tags 表联表填充，不落账号持久化结构，D3）
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tags: Vec<String>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Default)]
@@ -88,7 +91,7 @@ pub struct AccountsFile {
     pub accounts: Vec<RawAccount>,
 }
 
-#[derive(Serialize, Deserialize, Clone)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct Group {
     pub id: String,
     pub name: String,
@@ -102,6 +105,16 @@ pub struct GroupsFile {
     pub groups: Vec<Group>,
     #[serde(default)]
     pub membership: HashMap<String, String>,
+}
+
+/// 共享标签定义（跨池一张表，与 Group 同构；id 前缀 tag_）
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct Tag {
+    pub id: String,
+    pub name: String,
+    pub color: String,
+    #[serde(default)]
+    pub order: i32,
 }
 
 #[derive(Serialize, Deserialize, Clone, Default)]
@@ -212,6 +225,9 @@ pub struct Settings {
     /// 缺失/非法回退 APP_TABS 内置默认图标）
     #[serde(default)]
     pub app_icons: HashMap<String, String>,
+    /// 会话明细概述显示开关（issue #82 T6.1，默认开；关闭仅隐藏 UI 展示，不删存量缓存）
+    #[serde(default = "default_true")]
+    pub sessions_preview_enabled: bool,
 }
 
 fn default_api_port() -> u16 {
@@ -317,6 +333,11 @@ pub struct CreditsDailySnapshot {
     pub total: f64,
     pub earned: f64,
     pub consumed: f64,
+    /// 逐账号 earned 维度（uid → 当日获得积分；issue #82 问题4-1：
+    /// 看板「区间总获得」按分组/账号筛选时用此维度求和）。
+    /// 空 map = 老快照行无账号明细（前端筛选时该日不计入过滤后合计并如实标注）。
+    #[serde(default)]
+    pub accounts: std::collections::BTreeMap<String, f64>,
 }
 
 #[derive(Serialize, Deserialize, Default)]
@@ -524,10 +545,17 @@ pub struct ApiPoolFile {
     /// 覆盖 qoder_sticky store 的 EXPLICIT_TTL_SECS 常量（旧版硬编码不可配）
     #[serde(default = "default_sticky_ttl_secs")]
     pub qoder_sticky_ttl_secs: u64,
-    /// Qoder 池分组筛选（qoder_group_ids）：非空时仅纳入所选分组的 Qoder 账号
-    /// （未分组账号不参与，对齐 Buddy 池 wb_group_ids 语义）；空 = 不限分组
+    /// Qoder 池分组筛选（Qoder 账号 group_id，共享分组体系）；空 = 不限分组
     #[serde(default)]
     pub qoder_group_ids: Vec<String>,
+    /// 各池标签筛选（共享标签 tag id；空 = 不限）。与分组筛选取交集（D5：
+    /// 均空 = 不限；仅一方非空 = 该维度成员集）
+    #[serde(default)]
+    pub trae_tag_ids: Vec<String>,
+    #[serde(default)]
+    pub wb_tag_ids: Vec<String>,
+    #[serde(default)]
+    pub qoder_tag_ids: Vec<String>,
 }
 
 fn default_hedge_threshold_ms() -> u64 {
@@ -594,6 +622,9 @@ impl Default for ApiPoolFile {
             qoder_pool_sticky_ttl_secs: default_pool_sticky_ttl_secs(),
             qoder_sticky_ttl_secs: default_sticky_ttl_secs(),
             qoder_group_ids: Vec::new(),
+            trae_tag_ids: Vec::new(),
+            wb_tag_ids: Vec::new(),
+            qoder_tag_ids: Vec::new(),
         }
     }
 }

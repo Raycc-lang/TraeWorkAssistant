@@ -11,6 +11,7 @@ import {
   Pencil,
   RefreshCw,
   ShieldAlert,
+  Tags,
   Trash2,
   Upload,
   UserPlus,
@@ -21,7 +22,9 @@ import { Badge, EmptyState, Modal } from '../../components/ui';
 // 审查 #16：listen 走 web 桥（lib/tauri），浏览器环境无 @tauri-apps/api 运行时
 import { api, listen } from '../../lib/tauri';
 import { GroupSelect } from '../accounts/GroupSelect';
-import { GroupsModal } from '../accounts/GroupsModal';
+import { GroupsModal, computePoolBadges } from '../accounts/GroupsModal';
+import { TagChips } from '../accounts/TagSelect';
+import { AccountTagsEditModal, TagsModal } from '../accounts/TagsModal';
 import { QoderHelpModal } from './HelpModal';
 import { useAppStore } from '../../store';
 import type {
@@ -29,6 +32,7 @@ import type {
   QoderAccountView,
   QoderOauthDone,
   QoderOauthProgress,
+  TagView,
 } from '../../types';
 
 /**
@@ -98,6 +102,13 @@ export default function QoderAccounts() {
   // 账号分组（强加 Buddy 分组体系：chips 过滤 + GroupSelect 列 + 分组管理弹窗）
   const [qoderGroups, setQoderGroups] = useState<GroupView[]>([]);
   const [groupOpen, setGroupOpen] = useState(false);
+  // 共享标签（P1 需求③，三池通用；uid 键 = qd- 账号 id）
+  const [tagDefs, setTagDefs] = useState<TagView[]>([]);
+  const [tagMap, setTagMap] = useState<Record<string, string[]>>({});
+  const [tagsOpen, setTagsOpen] = useState(false);
+  const [tagEditTarget, setTagEditTarget] = useState<QoderAccountView | null>(null);
+  // 池来源徽标（需求①可选增强）：groupId → 在哪些池有成员
+  const [poolBadges, setPoolBadges] = useState<Record<string, string[]>>({});
   const [filter, setFilter] = useState('all');
   // PAT 导入弹框
   const [showImport, setShowImport] = useState(false);
@@ -160,6 +171,28 @@ export default function QoderAccounts() {
     api.qoder.groups.list().then(setQoderGroups).catch(() => setQoderGroups([]));
   }, []);
 
+  // 共享标签重取（定义 + 全量绑定映射；失败静默不阻断列表）
+  const reloadTags = useCallback(() => {
+    Promise.all([api.tags.list(), api.tags.map()])
+      .then(([defs, map]) => {
+        setTagDefs(defs);
+        setTagMap(map);
+      })
+      .catch(() => {});
+  }, []);
+
+  /** 保存账号标签绑定（全量覆盖式） */
+  const saveAccountTags = async (uid: string, ids: string[]) => {
+    try {
+      await api.tags.setAccountTags(uid, ids);
+      reloadTags();
+      pushToast('success', '标签已更新');
+    } catch (err) {
+      pushToast('error', `标签保存失败：${String(err)}`);
+      throw err;
+    }
+  };
+
   // 分组过滤（对齐 BuddyAccounts：全部 / 未分组 / 指定分组）
   const filtered =
     filter === 'all'
@@ -171,6 +204,7 @@ export default function QoderAccounts() {
   useEffect(() => {
     void refresh();
     reloadGroups();
+    reloadTags();
     let disposed = false;
     void listen<QoderOauthProgress>('qoder-oauth-progress', (ev) => {
       const p = ev.payload;
@@ -512,8 +546,29 @@ export default function QoderAccounts() {
             >
               {importingBackup ? <Loader2 size={15} className="animate-spin" /> : <Upload size={15} />} 导入账号
             </button>
-            <button onClick={() => setGroupOpen(true)} className="btn-outline" title="管理账号分组">
+            <button
+              onClick={() => {
+                setGroupOpen(true);
+                // 池来源徽标：共享分组三池成员并集按前缀统计（可选增强，失败静默）
+                api.groups
+                  .sharedList()
+                  .then((defs) => setPoolBadges(computePoolBadges(defs)))
+                  .catch(() => {});
+              }}
+              className="btn-outline"
+              title="管理账号分组"
+            >
               <FolderCog size={15} /> 分组管理
+            </button>
+            <button
+              onClick={() => {
+                reloadTags();
+                setTagsOpen(true);
+              }}
+              className="btn-outline"
+              title="管理共享标签（三池通用）"
+            >
+              <Tags size={15} /> 标签管理
             </button>
           </>
         }
@@ -570,6 +625,7 @@ export default function QoderAccounts() {
                 <tr>
                   <th className="px-4 py-2 text-left">账号</th>
                   <th className="px-4 py-2 text-left">分组</th>
+                  <th className="px-4 py-2 text-left">标签</th>
                   <th className="px-4 py-2 text-left">套餐</th>
                   <th className="px-4 py-2 text-left">凭证来源</th>
                   <th className="px-4 py-2 text-left">Token 状态</th>
@@ -581,7 +637,7 @@ export default function QoderAccounts() {
             <tbody>
               {loading ? (
                 <tr>
-                  <td colSpan={8} className="px-3 py-4 text-center text-xs text-slate-400">加载中…</td>
+                  <td colSpan={9} className="px-3 py-4 text-center text-xs text-slate-400">加载中…</td>
                 </tr>
               ) : (
                 filtered.map((a) => (
@@ -602,6 +658,13 @@ export default function QoderAccounts() {
                             reloadGroups();
                           }).catch((err) => pushToast('error', `分组调整失败：${String(err)}`));
                         }}
+                      />
+                    </td>
+                    <td className="px-4 py-3">
+                      <TagChips
+                        tagIds={tagMap[a.id] ?? a.tags}
+                        allTags={tagDefs}
+                        onEdit={() => setTagEditTarget(a)}
                       />
                     </td>
                     <td className="px-4 py-3 text-xs text-slate-500">
@@ -1028,6 +1091,7 @@ export default function QoderAccounts() {
         open={groupOpen}
         onClose={() => setGroupOpen(false)}
         groups={qoderGroups}
+        poolBadges={poolBadges}
         onCreate={async (name, color) => {
           try {
             await api.qoder.groups.create(name, color);
@@ -1066,6 +1130,64 @@ export default function QoderAccounts() {
           setAccounts((prev) => prev.map((x) => (x.group_id === id ? { ...x, group_id: '' } : x)));
           if (filter === id) setFilter('all');
           reloadGroups();
+        }}
+      />
+
+      {/* 共享标签管理 + 账号标签编辑（三池通用，P1 需求③） */}
+      <TagsModal
+        open={tagsOpen}
+        onClose={() => setTagsOpen(false)}
+        tags={tagDefs}
+        onCreate={async (name, color) => {
+          try {
+            await api.tags.create(name, color);
+          } catch (err) {
+            pushToast('error', `创建标签失败：${String(err)}`);
+            return;
+          }
+          reloadTags();
+        }}
+        onRename={async (id, name) => {
+          try {
+            await api.tags.update(id, { name });
+          } catch (err) {
+            pushToast('error', `重命名标签失败：${String(err)}`);
+            return;
+          }
+          pushToast('success', `标签已重命名为「${name}」`);
+          reloadTags();
+        }}
+        onRecolor={async (id, color) => {
+          try {
+            await api.tags.update(id, { color });
+          } catch (err) {
+            pushToast('error', `修改颜色失败：${String(err)}`);
+            return;
+          }
+          pushToast('success', '标签颜色已更新');
+          reloadTags();
+        }}
+        onDelete={async (id) => {
+          try {
+            await api.tags.remove(id);
+          } catch (err) {
+            pushToast('error', `删除标签失败：${String(err)}`);
+            return;
+          }
+          reloadTags();
+          await refresh(); // 审查 No.15：绑定清理后账号列表标签徽标同步（对齐 Buddy 账号页）
+          pushToast('success', '标签已删除，引用已清理');
+        }}
+      />
+      <AccountTagsEditModal
+        open={tagEditTarget != null}
+        onClose={() => setTagEditTarget(null)}
+        accountName={tagEditTarget?.nickname || tagEditTarget?.id || ''}
+        tags={tagDefs}
+        selected={tagEditTarget ? (tagMap[tagEditTarget.id] ?? tagEditTarget.tags ?? []) : []}
+        onSave={async (ids) => {
+          if (!tagEditTarget) return;
+          await saveAccountTags(tagEditTarget.id, ids);
         }}
       />
 

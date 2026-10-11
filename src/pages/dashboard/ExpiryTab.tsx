@@ -4,13 +4,14 @@ import { Badge, EmptyState } from '../../components/ui';
 import ExpiryCalendar, { type ExpiryItem } from '../../components/ExpiryCalendar';
 import { fmtCredits, dateStrToEndTs } from '../../lib/format';
 import { api } from '../../lib/tauri';
-import type { AccountView, CreditPackDetail, QoderCreditsResult, WbCreditsResult } from '../../types';
+import type { AccountView, CreditPackDetail, QoderCreditsResult, TraeExpiredEntsResult, WbCreditsResult } from '../../types';
 import type { PlatformScope } from './KpiRow';
 
 /**
  * 积分到期 Tab（credits-dashboard-plan.md §6）：
  * ① 账号积分明细：Trae（store.accounts）+ Buddy（workbuddy_credits_fetch.accounts[]）+ Qoder（qoder_credits_fetch.accounts[]）合并表；
- * ② 积分到期日历：Trae 按积分包明细逐包展示（creditDetail 实时拉取，对齐 Buddy/Qoder 包级口径）
+ * ② 积分到期日历：Trae 按积分包明细逐包展示（creditDetail 实时拉取，对齐 Buddy/Qoder 包级口径；
+ *    issue #82 T5.1 并入 expired_ents 实时逐包条目补齐已过期包）
  *    + Buddy packages[] + Qoder 积分包/Plan 订阅重置，按平台维度联动过滤。
  *    Trae 包明细拉取失败时回退账号级汇总展示（对齐上游「老缓存回退」语义）。
  */
@@ -39,6 +40,7 @@ export default function ExpiryTab({
   accounts,
   wbCredits,
   qoderCredits,
+  expiredEnts,
 }: {
   scope: PlatformScope;
   /** Trae 账号列表（store） */
@@ -47,6 +49,8 @@ export default function ExpiryTab({
   wbCredits: WbCreditsResult | null;
   /** Qoder 积分查询结果（积分包 + Plan 订阅周期） */
   qoderCredits: QoderCreditsResult | null;
+  /** Trae 逐包到期实时查询（issue #82 T5.1：expired_ents，含已过期包；credit_packs 只含未过期可用包） */
+  expiredEnts: TraeExpiredEntsResult | null;
 }) {
   // Trae 积分包明细：creditDetail 为实时上游请求（对齐账号页 CreditCell 悬停口径），
   // Tab 挂载时按账号列表并发拉取一次；失败回退账号级汇总。依赖用 user_id 串
@@ -223,6 +227,26 @@ export default function ExpiryTab({
             note: a.pay_identity ? `套餐 ${a.pay_identity}` : null,
           });
         }
+        // expired_ents 逐包精确到期（issue #82 T5.1）：包明细只含「剩余>0 且
+        // 未过期」的包，本接口补齐已过期包（未刷新过积分的账号也由此获得逐包条目）。
+        // 与 creditDetail 已展示的包按「到期秒」去重——creditDetail.source 是归一化标签
+        // 而 expired_ents.name 是上游原始包名，两接口名字口径不同，按名字匹配必然落空
+        const packKeys = new Set(
+          (Array.isArray(packs) ? packs : []).filter((p) => p.remaining > 0).map((p) => p.expire_time),
+        );
+        const expiredList =
+          expiredEnts?.accounts.find((x) => x.user_id === a.user_id)?.expired ?? [];
+        expiredList.forEach((e, i) => {
+          const expireSec = Math.floor(e.expire_time_ms / 1000);
+          if (expireSec <= 0 || packKeys.has(expireSec)) return;
+          items.push({
+            key: `trae-${a.user_id}-expired-${i}-${expireSec}`,
+            label: `Trae · ${a.name} · ${e.name || '积分包'}`,
+            kind: '积分包',
+            expire_ts: expireSec,
+            note: `额度 ${fmtCredits(e.credits_limit)}（官网逐包到期）`,
+          });
+        });
       }
     }
     if (scope === 'buddy') {
@@ -281,7 +305,16 @@ export default function ExpiryTab({
       }
     }
     return items;
-  }, [scope, accounts, wbCredits, qoderCredits, traePacks]);
+  }, [scope, accounts, wbCredits, qoderCredits, traePacks, expiredEnts]);
+
+  // 到期明细查询失败/跳过的账号（issue #82 T5.1：单账号失败与无 JWT 跳过原先完全静默，
+  // 审查 P5——在日历上方集中提示，不影响账号表状态列语义）
+  const expiredEntsIssues = useMemo(() => {
+    if (scope !== 'trae' || !expiredEnts) return [];
+    return expiredEnts.accounts
+      .filter((x) => !x.ok)
+      .map((x) => ({ name: x.name || x.user_id, reason: x.error || '查询失败' }));
+  }, [scope, expiredEnts]);
 
   const fmtExpire = (ts: number | null) => {
     if (!ts) return '—';
@@ -364,6 +397,13 @@ export default function ExpiryTab({
               ))}
             </tbody>
           </table>
+        </div>
+      )}
+
+      {/* 到期明细不完整提示（审查 P5）：单账号失败/无 JWT 跳过不再静默 */}
+      {expiredEntsIssues.length > 0 && (
+        <div className="card border-amber-300 bg-amber-50 px-4 py-2.5 text-xs text-amber-700 dark:border-amber-700/40 dark:bg-amber-900/20 dark:text-amber-300">
+          到期明细未查询完整：{expiredEntsIssues.map((x) => `${x.name}（${x.reason}）`).join('；')}
         </div>
       )}
 

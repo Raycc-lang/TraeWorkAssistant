@@ -164,6 +164,28 @@ export default function Settings() {
           desc="服务端内置调度器每日自动执行，覆盖自动续期 / 自动签到 / 自动同步服务器数据（模型列表 + 积分看板）。推荐保持全部启用。"
         />
       </div>
+
+      {/* 看板展示（issue #82 T6.1）：会话明细概述开关 */}
+      <section className="card p-4">
+        <div className="mb-1 flex items-center gap-2">
+          <h3 className="font-medium">看板展示</h3>
+        </div>
+        <p className="mb-3 text-xs text-slate-400">用量看板「会话明细」的展示选项，改动后点击保存生效。</p>
+        <label className="flex items-start gap-2 text-sm">
+          <input
+            type="checkbox"
+            className="mt-1"
+            checked={form.sessions_preview_enabled}
+            onChange={(e) => update('sessions_preview_enabled', e.target.checked)}
+          />
+          <span>
+            会话明细显示首条消息概述
+            <span className="block text-xs text-slate-400">
+              显示「会话说明」列（首条消息截断 200 字符）；关闭仅隐藏展示，不删除缓存
+            </span>
+          </span>
+        </label>
+      </section>
     </div>
   );
 }

@@ -170,6 +170,8 @@ function defaultSettings(): Settings {
     theme: 'system',
     launch_minimized: false,
     silent_checkin: false,
+    /** issue #82 T6.1：会话明细概述显示开关（默认开） */
+    sessions_preview_enabled: true,
     auto_start_proxy: true,
     tray: true,
     language: 'zh-CN',
@@ -303,6 +305,14 @@ export const useAppStore = create<AppState>((set, get) => ({
       get().refreshSettings(),
       get().refreshCreditsDaily(),
     ]);
+    // 待取启动通知（一次性）：后端启动期消息（如分组统一迁移结果）toast 告知用户，
+    // 拉取即清不会重复弹出；失败静默（通知不阻塞启动）
+    try {
+      const notice = await api.misc.startupNoticeTake();
+      if (notice) get().pushToast('info', notice);
+    } catch {
+      /* 静默失败 */
+    }
     set({ ready: true });
   },
 
@@ -614,6 +624,11 @@ export const useAppStore = create<AppState>((set, get) => ({
     try {
       await api.groups.update(id, patch);
       await get().refreshGroups();
+      // 写操作可见反馈（对齐 createGroup/removeGroup）
+      get().pushToast(
+        'success',
+        patch.name ? `分组已重命名为「${patch.name}」` : '分组颜色已更新',
+      );
     } catch (err) {
       get().pushToast('error', `更新分组失败：${String(err)}`);
       throw err;

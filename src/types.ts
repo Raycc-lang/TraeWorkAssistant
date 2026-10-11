@@ -39,6 +39,8 @@ export interface AccountView {
   user_id: string;
   name: string;
   group_id: string | null;
+  /** 共享标签 tag id 列表（account_tags 表联表填充；老后端缺省 undefined） */
+  tags?: string[];
   jwt: string;
   jwt_exp_hours: number | null;
   jwt_exp_timestamp: number | null;
@@ -87,6 +89,10 @@ export interface ImportReport {
   skipped_names: string[];
   /** 新增分组数量 */
   groups_added: number;
+  /** 恢复的标签绑定条数（仅本机已存在的 tag id；老后端缺省 0） */
+  tags_restored?: number;
+  /** 导入文件中本机不存在的 tag id 数量（忽略不自动创建） */
+  tags_ignored?: number;
 }
 
 // ---- F-46 导入预览（按索引导入）----
@@ -138,6 +144,16 @@ export interface GroupView {
   order: number;
   count: number;
   /** 组内账号 uid 列表（账号池分组筛选实时预览用，T10） */
+  uids: string[];
+}
+
+/** 共享标签视图（跨池一张表；uids = 绑定该标签的账号 uid） */
+export interface TagView {
+  id: string;
+  name: string;
+  color: string;
+  order: number;
+  count: number;
   uids: string[];
 }
 
@@ -193,6 +209,8 @@ export interface Settings {
   api_default_model: string;
   /** F-74：WorkBuddy/CodeBuddy 切换账号时自动把当前账号会话迁移到目标账号（默认关） */
   buddy_switch_migrate_chats: boolean;
+  /** issue #82 T6.1：会话明细显示首条消息概述（默认开；关闭仅隐藏 UI 展示，不删存量缓存） */
+  sessions_preview_enabled: boolean;
   /** WebUI 免令牌访问（安全与管理页开关，默认关）：开启后打开页面即进主界面 */
   web_auth_disabled: boolean;
   // ── 侧边栏应用显示（仅 UI 偏好：隐藏不停功能、不删数据、不影响计划任务） ──
@@ -269,7 +287,7 @@ export interface SchedulerTaskView {
   name: string;
   /** 每日触发时刻 HH:MM；every6h 模式下为固定周期描述（如「每6小时」） */
   time: string;
-  /** 执行模式：daily（每日 HH:MM，默认）| hourly（每小时，仅看板同步类）| every6h（固定每 6 小时，时刻不可配）| off（已关闭） */
+  /** 执行模式：daily（每日 HH:MM）| hourly（每小时）| every_hours（每 N 小时，看板同步类默认）| every6h（固定每 6 小时，时刻不可配）| off（已关闭） */
   mode?: string;
   /** 当前是否启用（用户开关 + 既有设置语义合成） */
   enabled: boolean;
@@ -285,8 +303,10 @@ export interface SchedulerConfig {
   disabled_tasks: string[];
   /** 自定义触发时刻（key → HH:MM）；空对象 = 全部用默认时刻 */
   task_times?: Record<string, string>;
-  /** 执行模式（key → "daily" | "hourly"）；仅看板同步类任务可 hourly，缺省 = 每日 */
+  /** 执行模式（key → "daily" | "hourly" | "every_hours"）；仅看板同步类任务可 hourly/every_hours，缺省 = every_hours（每 2 小时） */
   task_modes?: Record<string, string>;
+  /** every_hours 间隔小时数（key → 1..24，缺省 2）；仅 every_hours 模式任务生效 */
+  task_hours?: Record<string, number>;
 }
 
 export interface CheckinOpts {
@@ -336,6 +356,9 @@ export interface CreditsDailySnapshot {
   total: number;
   earned: number;
   consumed: number;
+  /** 逐账号 earned 维度（uid → 当日获得积分；issue #82 问题4-1）；
+   * 缺失/空 = 老快照行无账号明细（账号筛选时该日不计入过滤后合计） */
+  accounts?: Record<string, number>;
 }
 
 // ---- 统一网关（unified-api-gateway-design §3.1/§8.1）----
@@ -500,8 +523,14 @@ export interface ApiPoolFile {
   qoder_strategy?: string;
   /** Qoder 池入池白名单（qd- 账号 id）；空 = fail-open 全部含凭证账号入池 */
   qoder_enabled_uids?: string[];
-  /** Qoder 池分组筛选（qoder_group_ids）：非空 = 仅所选分组的 Qoder 账号参与调度；空 = 不限分组 */
+  /** Qoder 池分组筛选（共享分组 id）；空 = 不限分组 */
   qoder_group_ids?: string[];
+  /** Trae 池标签筛选（共享标签 id）；空 = 不限。与分组筛选取交集（D5） */
+  trae_tag_ids?: string[];
+  /** Buddy 池标签筛选；空 = 不限 */
+  wb_tag_ids?: string[];
+  /** Qoder 池标签筛选；空 = 不限 */
+  qoder_tag_ids?: string[];
 }
 
 /** 用量统计计数（按模型/账号/Key 维度，T1） */
@@ -510,6 +539,8 @@ export interface UsageCounterView {
   requests: number;
   ok: number;
   errors: number;
+  /** 网关测量的累计消耗积分（issue #82 T2.4：仅 Qoder 桶 models 非零） */
+  credits: number;
 }
 
 /** 按 Key 的 token 用量 */
@@ -528,6 +559,10 @@ export interface UsageDayView {
   stream_requests: number;
   prompt_tokens: number;
   completion_tokens: number;
+  /** 网关测量的累计消耗积分（issue #82 T2：仅 Qoder 桶非零；上游未下发 usage 的请求不计入） */
+  credits: number;
+  /** 上游计费原值（original_credits，峰谷折扣前），用于对账 */
+  original_credits: number;
   avg_duration_ms: number;
   /** 总耗时 P50/P95/最大值（F-76；样本不足时缺省） */
   p50_duration_ms?: number;
@@ -579,8 +614,13 @@ export interface ApiKeyEntry {
    * 可带 `trae:`/`buddy:` 池前缀（专一锁定其归属池）
    */
   dedicated_account: string;
-  /** 资源池绑定（issue #25）："" = 跟随全局调度 | "trae" | "buddy" */
+  /** 资源池绑定（issue #25）："" = 跟随全局调度 | "trae" | "buddy" | "qoder" */
   bind_pool: string;
+  /** 共享分组 id 白名单（shg_ 前缀）；空 = 不通过该维度限制。运行时实时展开并入
+   * 白名单，与 allowed_tags 同时勾选时取交集（D5） */
+  allowed_groups?: string[];
+  /** 共享标签 id 白名单（tag_ 前缀）；空 = 不通过该维度限制 */
+  allowed_tags?: string[];
   /** 按日请求统计（升序，保留最近 90 天） */
   daily_stats: ApiKeyDailyStat[];
 }
@@ -633,6 +673,8 @@ export interface WorkBuddyAccountView {
   note: string;
   credits_balance: number | null;
   credits_fetched_at: string | null;
+  /** 共享标签 tag id 列表（老后端缺省 undefined） */
+  tags?: string[];
   /** 在线 = 本机 auth 文件当前生效账号 */
   is_current: boolean;
   has_credential: boolean;
@@ -790,6 +832,68 @@ export interface UsageHistoryResult {
   /** true = 拉取中有账号部分时段会话数超单块分页上限（该时段数据可能不完整） */
   truncated?: boolean;
   accounts: UsageHistoryAccount[];
+}
+
+// ---- Trae 逐包到期（issue #82 T5.1：expired_ents 实时查询，含已过期包；credit_packs 只含未过期可用包） ----
+export interface TraeExpiredEnt {
+  /** 包名（与 AccountView.credit_packs[].source 同源口径，前端按「包名+到期时间」去重） */
+  name: string;
+  /** 包总额度（credits_limit） */
+  credits_limit: number;
+  /** 过期时间（Unix 毫秒，上游原值） */
+  expire_time_ms: number;
+}
+
+export interface TraeExpiredEntsAccount {
+  user_id: string;
+  name: string;
+  ok: boolean;
+  /** 单账号查询失败原因（其余账号不受影响） */
+  error: string | null;
+  expired: TraeExpiredEnt[];
+}
+
+export interface TraeExpiredEntsResult {
+  fetched_at: number;
+  accounts: TraeExpiredEntsAccount[];
+}
+
+// ---- 会话明细（Trae query_user_usage_group_by_session 会话级行，issue #82 会话明细 Tab） ----
+export interface UsageSessionView {
+  user_id: string;
+  account_name: string;
+  session_id: string;
+  /** usage_time（Unix 秒） */
+  ts: number;
+  /** 本地自然日 YYYY-MM-DD */
+  date: string;
+  model: string;
+  /** 会话模式（agent/chat 等；上游缺失为空串） */
+  mode: string;
+  /** 消耗积分（credits_float，兜底 amount_float） */
+  credits: number;
+  /** 消耗金额（cost_money_float；上游缺失为 0） */
+  cost_money: number;
+  input_tokens: number;
+  output_tokens: number;
+  cache_read_tokens: number;
+  cache_write_tokens: number;
+  /** 会话说明（user_input_preview，后端已截断 200 字符） */
+  preview: string;
+}
+
+export interface UsageSessionsResult {
+  /** 缓存拉取时间（Unix 秒；0 = 从未成功拉取。Trae/Buddy 两来源已统一为秒） */
+  fetched_at: number;
+  /** 过滤后总行数（分页前） */
+  total: number;
+  /** 过滤后区间总积分（分页前） */
+  credits_total: number;
+  page: number;
+  page_size: number;
+  rows: UsageSessionView[];
+  /** 区间内出现过的模型清单（筛选下拉用） */
+  models: string[];
 }
 
 // ---- 本地 Token 统计（桌面版专属：扫描本机 WB/CodeBuddy 客户端会话；Web 版恒为 null）----
@@ -952,6 +1056,8 @@ export interface QoderAccountView {
   credits_balance: number | null;
   credits_fetched_at: string | null;
   has_credential: boolean;
+  /** 共享标签 tag id 列表（老后端缺省 undefined） */
+  tags?: string[];
   /** token 种类徽标：pat | client | unknown（脱敏） */
   token_kind: string;
   /** 设备指纹徽标（machine_id 前 8 位；null = 尚未回填） */
