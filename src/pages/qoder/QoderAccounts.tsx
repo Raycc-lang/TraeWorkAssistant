@@ -402,6 +402,19 @@ export default function QoderAccounts() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [oauthRunning]);
 
+  // 快照备份/恢复完成看门狗（对齐上方 OAuth 看门狗）：snapBusy 由 profile-done
+  // 事件收尾；事件异常缺失（后端 panic/桥挂死/事件丢失）时快照弹框与全部行内
+  // 保存/恢复按钮永久禁用，只能重启。120s 后解除等待并提示；迟到的 done 事件仍会正常收尾
+  useEffect(() => {
+    if (snapBusy == null) return;
+    const timer = setTimeout(() => {
+      setSnapBusy(null);
+      pushToast('warn', '快照操作超过 2 分钟未收到完成事件，已解除等待；结果请以快照列表为准');
+    }, 120_000);
+    return () => clearTimeout(timer);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [snapBusy]);
+
   const startOauth = async () => {
     setOauthRunning(true);
     setOauthCanceling(false);
@@ -916,7 +929,7 @@ export default function QoderAccounts() {
             <tbody>
               {loading ? (
                 <tr>
-                  <td colSpan={8} className="px-3 py-4 text-center text-xs text-slate-400">加载中…</td>
+                  <td colSpan={9} className="px-3 py-4 text-center text-xs text-slate-400">加载中…</td>
                 </tr>
               ) : (
                 filtered.map((a) => (
@@ -1700,7 +1713,7 @@ export default function QoderAccounts() {
             reloadGroups();
           } catch (err) {
             pushToast('error', `新建分组失败：${String(err)}`);
-            throw err;
+            throw err; // rethrow 供 GroupsModal 按失败处理（不清空表单/不关弹框）
           }
         }}
         onRename={async (id, name) => {
@@ -1745,7 +1758,7 @@ export default function QoderAccounts() {
             await api.tags.create(name, color);
           } catch (err) {
             pushToast('error', `创建标签失败：${String(err)}`);
-            return;
+            throw err; // rethrow 供 TagsModal 按失败处理
           }
           reloadTags();
         }}
@@ -1754,7 +1767,7 @@ export default function QoderAccounts() {
             await api.tags.update(id, { name });
           } catch (err) {
             pushToast('error', `重命名标签失败：${String(err)}`);
-            return;
+            throw err;
           }
           pushToast('success', `标签已重命名为「${name}」`);
           reloadTags();
@@ -1764,7 +1777,7 @@ export default function QoderAccounts() {
             await api.tags.update(id, { color });
           } catch (err) {
             pushToast('error', `修改颜色失败：${String(err)}`);
-            return;
+            throw err;
           }
           pushToast('success', '标签颜色已更新');
           reloadTags();
@@ -1774,7 +1787,7 @@ export default function QoderAccounts() {
             await api.tags.remove(id);
           } catch (err) {
             pushToast('error', `删除标签失败：${String(err)}`);
-            return;
+            throw err;
           }
           reloadTags();
           await refresh(); // 审查 No.15：绑定清理后账号列表标签徽标同步（对齐 Buddy 账号页）

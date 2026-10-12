@@ -172,7 +172,12 @@ interface AppState {
   profileBackup: (userId: string) => Promise<void>;
   profileRestore: (userId: string) => Promise<void>;
   profileDelete: (userId: string) => Promise<void>;
-  oauthLogin: (callbackUrl: string, accountName?: string, groupId?: string) => Promise<void>;
+  oauthLogin: (
+    callbackUrl: string,
+    accountName?: string,
+    groupId?: string,
+    expectUid?: string,
+  ) => Promise<void>;
 
   pushToast: (kind: ToastKind, msg: string) => void;
   dismissToast: (id: number) => void;
@@ -256,14 +261,20 @@ function defaultSettings(): Settings {
     pinned_app: 'trae',
     hidden_apps: [],
     app_icons: {},
-    // Qoder（F-80）：客户端路径与调度时刻/开关（默认 10:15 签到 / 23:40 快照）
+    // Qoder（F-80）：客户端路径与调度时刻/开关（默认 10:15 签到）；
+    // 积分数据同步与 Buddy/Trae 同款四模式（默认 every_hours 每2小时，daily 时刻 23:40）
     qoder_ide_path: null,
     qoderwork_path: null,
     qoder_checkin_hhmm: '10:15',
     qoder_credits_sync_hhmm: '23:40',
     qoder_credits_sync_enabled: true,
+    qoder_credits_sync_mode: 'every_hours',
+    qoder_credits_sync_hours: '2',
     qoder_token_renew_enabled: true,
     qoder_token_renew_interval_hours: 6,
+    qoder_sessions_compact_enabled: true,
+    qoder_sessions_compact_days: '3',
+    qoder_sessions_compact_hhmm: '04:30',
   };
 }
 
@@ -1152,9 +1163,9 @@ export const useAppStore = create<AppState>((set, get) => ({
       get().pushToast('error', `删除失败：${String(err)}`);
     }
   },
-  oauthLogin: async (callbackUrl, accountName, groupId) => {
+  oauthLogin: async (callbackUrl, accountName, groupId, expectUid) => {
     try {
-      const result = await api.oauth.login(callbackUrl, accountName, groupId);
+      const result = await api.oauth.login(callbackUrl, accountName, groupId, expectUid);
       await get().refreshAccounts();
       // 同 uid 合并场景如实提示「更新已有账号」而非「已添加」（issue #80）
       if (result.merged) {

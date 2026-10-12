@@ -303,13 +303,14 @@ pub fn accounts_import(
     content: String,
     only: Option<Vec<usize>>,
 ) -> Result<ImportReport, String> {
+    // 整函数持 group_defs_lock（对齐 account_move 模板）：分组合并、membership
+    // 变更与 groups+group_members 整删全写（groups_save）全程互斥，防与并发分组
+    // 增删/移动/导入互相覆盖丢更新。内部标签落库保持 raw account_tags_set 调用——
+    // 不得改走 account_tags_set_inner（其内部再取 group_defs_lock，同线程重入
+    // 死锁）；raw 调用仅嵌套 docs 层 org_defs_lock，锁序单向
+    let _defs_guard = state.group_defs_lock.lock().unwrap_or_else(|e| e.into_inner());
     let (accounts_arr, groups_arr) = parse_import_file(&content)?;
 
-    // 审查二轮 Major-1：group_defs_lock 罩住「分组定义合并 + membership 变更 +
-    // groups_save 整表覆写」全程（对齐 group_move B1 模板），防止导入期间的
-    // load→改→save 与 shared_groups/其余池导入的写路径交错、互相覆盖。
-    // 锁内仅做 docs 读写与 vault（无组织锁），下游 invalidate/reload 叶子级放锁后。
-    let _defs_guard = state.group_defs_lock.lock().unwrap_or_else(|e| e.into_inner());
     let mut accounts = crate::vault::load_accounts(&state);
     let mut groups: GroupsFile = crate::store::docs::groups_load(&crate::store::db(&state.data_dir));
 
@@ -366,6 +367,8 @@ pub fn accounts_import(
     // 等价 tags::account_tags_set_inner 的「持锁校验→落库」——不可改调 inner
     // （std Mutex 不可重入，外层已持同锁会自死锁）。
     let tag_defs = crate::store::docs::tags_load(&crate::store::db(&state.data_dir));
+    // 标签绑定暂存：循环内只收集，主体落库成功后统一批量写（见循环后）
+    let mut pending_tags: Vec<(String, Vec<String>)> = Vec::new();
     for (_, entry) in selected {
         // 兼容导出格式(userId/cloudIdeJwt/dcId)与原始格式(UserID/jwt/dc_id)
         let user_id = pick_str(entry, &["userId", "UserID", "user_id", "uid"]);
@@ -403,39 +406,13 @@ pub fn accounts_import(
             groups.membership.insert(uid.clone(), gid.clone());
         }
         // 标签绑定恢复（P2 需求③）：仅恢复本机已存在的 tag id，未知 id 忽略
-        // （不自动创建标签，避免导入方标签体系污染本机；忽略数量记 app_log）
-        let tags_in: Vec<String> = entry
-            .get("tags")
-            .and_then(|v| v.as_array())
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|t| t.as_str().map(String::from))
-                    .collect()
-            })
-            .unwrap_or_default();
-        if !tags_in.is_empty() {
-            let mut ignored = 0usize;
-            let valid: Vec<String> = tags_in
-                .into_iter()
-                .filter(|t| {
-                    if tag_defs.iter().any(|d| &d.id == t) {
-                        true
-                    } else {
-                        ignored += 1;
-                        false
-                    }
-                })
-                .collect();
-            if !valid.is_empty() {
-                crate::store::docs::account_tags_set(
-                    &crate::store::db(&state.data_dir),
-                    &uid,
-                    &valid,
-                )?;
-                report.tags_restored += valid.len();
-            }
-            report.tags_ignored += ignored;
-        }
+        // （不自动创建标签，避免导入方标签体系污染本机；忽略数量记 app_log）。
+        // 收集逻辑走 commands::tags 共享函数（原为内联同构实现，三池去重）。
+        // 只收集不落库：主体（账号+分组）落库成功后统一批量写（2026-10-12 审查
+        // 修复：原循环内写库带 ?，单条失败中断导入且部分绑定已落库成半成品）
+        let mut ignored = 0usize;
+        crate::commands::tags::collect_import_tags(entry, &uid, &tag_defs, &mut pending_tags, &mut ignored);
+        report.tags_ignored += ignored;
         accounts.accounts.push(RawAccount {
             name,
             user_id: Some(uid),
@@ -456,7 +433,28 @@ pub fn accounts_import(
     if report.added > 0 || report.groups_added > 0 {
         crate::vault::save_accounts(&state, &mut accounts)?;
         crate::store::docs::groups_save(&crate::store::db(&state.data_dir), &groups)?;
-        drop(_defs_guard);
+        // 标签绑定延迟批量写（主体已落库）：单条失败聚合进日志不中断导入，
+        // tags_restored 只计成功写入；失败绑定重新导入可补齐
+        let store = crate::store::db(&state.data_dir);
+        let mut tag_fail = 0usize;
+        for (tag_uid, valid) in &pending_tags {
+            match crate::store::docs::account_tags_set(&store, tag_uid, valid) {
+                Ok(()) => report.tags_restored += valid.len(),
+                Err(e) => {
+                    tag_fail += 1;
+                    fs_utils::app_log(
+                        &state.data_dir,
+                        &format!("导入账号: 标签绑定落库失败 uid={tag_uid}: {e}（重新导入可补齐）"),
+                    );
+                }
+            }
+        }
+        if tag_fail > 0 {
+            fs_utils::app_log(
+                &state.data_dir,
+                &format!("导入账号: 标签绑定落库失败 {} 条（账号已入池，重新导入可补齐）", tag_fail),
+            );
+        }
         fs_utils::app_log(
             &state.data_dir,
             &format!(
@@ -641,13 +639,14 @@ pub fn account_add_manual(
     });
     crate::vault::save_accounts(&state, &mut accounts)?;
     if let Some(g) = group_id {
-        // 审查二轮 Major-1：持 group_defs_lock 罩住 groups 读-改-写（对齐 group_move B1），
-        // invalidate 为叶子级取锁，drop 后再调用。
-        let _defs_guard = state.group_defs_lock.lock().unwrap_or_else(|e| e.into_inner());
+        // 持 group_defs_lock：membership RMW（load→改→save）与并发分组增删/导入
+        // 互斥防丢更新（groups_save 为 groups+group_members 整删全写）；
+        // invalidate 在锁 drop 后执行
+        let _defs = state.group_defs_lock.lock().unwrap_or_else(|e| e.into_inner());
         let mut groups: GroupsFile = crate::store::docs::groups_load(&crate::store::db(&state.data_dir));
         groups.membership.insert(uid, g);
         crate::store::docs::groups_save(&crate::store::db(&state.data_dir), &groups)?;
-        drop(_defs_guard);
+        drop(_defs);
         // 成员关系变更 → Key 组/标签展开索引失效（与其余全部写路径对齐）
         crate::api_server::org_index::invalidate(&state.data_dir);
     }
@@ -670,13 +669,14 @@ pub fn account_delete(
     // 同步清理 vault 中的凭据记录（失败仅记录日志，不阻断删除）
     crate::vault::remove_secret(&state, &user_id);
 
-    // 审查二轮 Major-1：membership.remove + groups_save 整表覆写持 group_defs_lock
-    // （对齐 group_move B1），防止与其他分组写路径交错覆盖。
-    let _defs_guard = state.group_defs_lock.lock().unwrap_or_else(|e| e.into_inner());
-    let mut groups: GroupsFile = crate::store::docs::groups_load(&crate::store::db(&state.data_dir));
-    groups.membership.remove(&user_id);
-    crate::store::docs::groups_save(&crate::store::db(&state.data_dir), &groups)?;
-    drop(_defs_guard);
+    // 持 group_defs_lock：membership RMW（load→改→save）与并发分组增删/导入
+    // 互斥防丢更新；invalidate 在锁 drop 后执行
+    {
+        let _defs = state.group_defs_lock.lock().unwrap_or_else(|e| e.into_inner());
+        let mut groups: GroupsFile = crate::store::docs::groups_load(&crate::store::db(&state.data_dir));
+        groups.membership.remove(&user_id);
+        crate::store::docs::groups_save(&crate::store::db(&state.data_dir), &groups)?;
+    }
 
     // 共享标签绑定清理（审查修复）：防幽灵绑定污染标签计数与 Key 组/标签展开；
     // 失败不阻断删除（数据卫生问题，落日志可重试）
@@ -833,12 +833,15 @@ pub fn group_move(
     user_id: String,
     group_id: Option<String>,
 ) -> Result<(), String> {
-    // B1: group_defs_lock 罩住 groups/group_members 读-改-写全程（groups_save 整表
-    // 覆写两表），防止与 shared_groups delete ①a/②′ 段回落行互覆复活已删定义。
-    // 下游 org_index::invalidate / reload_pools_if_running 均为叶子级取锁，锁序安全。
-    let _defs_guard = state.group_defs_lock.lock().unwrap_or_else(|e| e.into_inner());
-    // 目标分组校验（锁内复检）：group_id 传了非空值但共享分组已删除/不存在时直接拒绝，防幽灵分组
-    // （对齐 workbuddy_account_move / qoder_account_move 语义）
+    // 持 group_defs_lock：目标分组校验与 membership 写入同一临界区——
+    // ① 防 TOCTOU（校验通过后分组被并发 delete_inner 删除 → membership 指向
+    //   已删分组的幽灵绑定，对齐 workbuddy_account_move / qoder_account_move 的
+    //   「锁内复检」语义）；
+    // ② 防丢更新：membership「load→save」与持同一把锁的并发写方
+    //   （accounts_import / oauth_login / account_delete）整体互斥，
+    //   否则旧快照整文档覆盖会丢失他人刚写入的成员关系
+    let _guard = state.group_defs_lock.lock().unwrap_or_else(|e| e.into_inner());
+    // 目标分组校验：group_id 传了非空值但共享分组已删除/不存在时直接拒绝，防幽灵分组
     if let Some(gid) = group_id.as_deref().filter(|g| !g.is_empty()) {
         if !super::shared_groups::defs_load(&state).iter().any(|g| g.id == gid) {
             return Err(format!("目标分组不存在: {gid}"));
@@ -854,7 +857,8 @@ pub fn group_move(
         }
     }
     crate::store::docs::groups_save(&crate::store::db(&state.data_dir), &groups)?;
-    drop(_defs_guard);
+    // 先释放 defs 锁再做索引失效 / 热重载（锁序纪律：defs 为叶子锁，不跨 reload 持有）
+    drop(_guard);
     crate::api_server::org_index::invalidate(&state.data_dir);
     crate::commands::api_server::reload_pools_if_running(&state, runtime.inner());
     Ok(())
@@ -1787,7 +1791,7 @@ fn try_recover_from_local(state: &AppState, user_id: &str) -> bool {
         &state.data_dir,
         &format!(
             "refresh_token 已失效，但从 TRAE IDE 本地登录态恢复成功 [uid={}]（用户很可能已在 IDE 重新登录）",
-            &user_id[..user_id.len().min(8)]
+            user_id.chars().take(8).collect::<String>()
         ),
     );
     true

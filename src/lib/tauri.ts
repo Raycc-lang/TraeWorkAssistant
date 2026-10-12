@@ -76,6 +76,7 @@ import type {
   WbPoolImportResult,
   WbModelInfo,
   UsageHistoryResult,
+  UsageSessionView,
   UsageSessionsResult,
   TraeExpiredEntsResult,
   QoderAccountView,
@@ -621,6 +622,14 @@ export const api = {
         page: opts.page ?? null,
         pageSize: opts.pageSize ?? null,
       }),
+    /** Qoder 会话展开明细（按会话行代表键查请求级行；键口径 = session_id ∪ preview） */
+    sessionDetail: (opts: { date: string; uid: string; sessionId: string; preview: string }) =>
+      invoke<UsageSessionView[]>('qoder_session_detail_query', {
+        date: opts.date,
+        uid: opts.uid,
+        sessionId: opts.sessionId,
+        preview: opts.preview,
+      }),
     /**
      * 账号池导出（M4；includeCredentials=true 必须提供 password——凭证经 AES-256-GCM
      * 加密为 AIWQENC1 信封后才写入导出文件，后端对无密码含凭证导出直接拒绝）
@@ -645,14 +654,21 @@ export const api = {
     getLoginUrl: () => invoke<OAuthLoginUrl>('oauth_get_login_url'),
     parseCallback: (callbackUrl: string) =>
       invoke('oauth_parse_callback', { callbackUrl }),
-    login: (callbackUrl: string, accountName?: string, groupId?: string) =>
-      invoke<OAuthLoginResult>('oauth_login', { callbackUrl, accountName, groupId }),
+    login: (callbackUrl: string, accountName?: string, groupId?: string, expectUid?: string) =>
+      invoke<OAuthLoginResult>('oauth_login', {
+        callbackUrl,
+        accountName,
+        groupId,
+        // 重新登录模式：目标账号 uid，后端校验不一致则拒绝落库
+        expectUid: expectUid ?? null,
+      }),
     // F-78 批次 1：本机回环监听（127.0.0.1:17388），浏览器回调自动落库收尾；
     // startLoopback 端口被占用时后端返回明确错误，前端降级为手动粘贴兜底
-    startLoopback: (accountName?: string, groupId?: string) =>
+    startLoopback: (accountName?: string, groupId?: string, expectUid?: string) =>
       invoke<void>('oauth_start_loopback', {
         accountName: accountName ?? null,
         groupId: groupId ?? null,
+        expectUid: expectUid ?? null,
       }),
     stopLoopback: () => invoke<void>('oauth_stop_loopback'),
     // 登录完成事件：回环监听器自动落库后发出；ok=false 时提示改用手动粘贴兜底

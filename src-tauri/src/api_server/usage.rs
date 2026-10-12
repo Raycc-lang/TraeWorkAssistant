@@ -338,7 +338,28 @@ impl UsageFile {
         completion_tokens: u64,
         ttfb_ms: Option<u64>,
     ) {
-        let day = self.bucket_mut(bucket).entry(today_key()).or_default();
+        self.record_in_ttfb_on(bucket, &today_key(), model, uid, key_id, ok, is_stream, duration_ms, prompt_tokens, completion_tokens, ttfb_ms);
+    }
+
+    /// 指定日期入账版（审查修复清单 v1.4.9 G3）：`day` 由调用方取定——
+    /// record_usage_qoder 在入口处取定 day 后，积分/流水/请求统计（本函数）
+    /// 落同一日期行，杜绝请求处理跨零点时 ttfb 统计自行重取日期分裂到次日行
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_in_ttfb_on(
+        &mut self,
+        bucket: UsageBucket,
+        day: &str,
+        model: &str,
+        uid: &str,
+        key_id: &str,
+        ok: bool,
+        is_stream: bool,
+        duration_ms: u64,
+        prompt_tokens: u64,
+        completion_tokens: u64,
+        ttfb_ms: Option<u64>,
+    ) {
+        let day = self.bucket_mut(bucket).entry(day.to_string()).or_default();
         day.record(
             model, uid, key_id, ok, is_stream, duration_ms, prompt_tokens,
             completion_tokens, ttfb_ms,
@@ -387,16 +408,20 @@ pub fn today_key() -> String {
 pub struct QoderSessionCtx {
     pub request_id: String,
     pub session_id: String,
+    /// 轮键（信封 chat_record_id；同一段消息+模型+输出上限派生同值，
+    /// 「展开会话看各轮明细」分组用；失败占位恒空）
+    pub record_id: String,
     pub ts: i64,
     pub preview: String,
 }
 
 impl QoderSessionCtx {
-    /// 占位上下文（失败早退/无信封可解析时使用：新 uuid + 空 session_id）
+    /// 占位上下文（失败早退/无信封可解析时使用：新 uuid + 空 session_id/record_id）
     pub fn placeholder(preview: String) -> Self {
         Self {
             request_id: uuid::Uuid::new_v4().to_string(),
             session_id: String::new(),
+            record_id: String::new(),
             ts: chrono::Local::now().timestamp(),
             preview,
         }

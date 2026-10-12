@@ -62,7 +62,7 @@ pub fn run_cli_task(name: &str, state: &AppState) -> i32 {
     // setup 退出，若不在此补齐，升级后首次启动 GUI 前触发的计划任务会对着
     // store::db() 刚建的空库运行——账号/池/设置全为默认，任务静默空转，
     // 且窗口内写入的数据会被 GUI 首启迁移整表覆盖。
-    if let Some(summary) = crate::store::migrate::migrate_on_startup(&state.data_dir, &state.group_defs_lock) {
+    if let Some(summary) = crate::store::migrate::migrate_on_startup(&state.data_dir) {
         crate::fs_utils::app_log(&state.data_dir, &summary);
     }
     /// 打印除 done 外的 NDJSON 进度事件（done 由 run_cli_task 统一收尾输出）
@@ -177,6 +177,13 @@ pub fn run_cli_task(name: &str, state: &AppState) -> i32 {
                     .map(|r| serde_json::json!({ "ok": true, "accounts": r.accounts.len() }))
             }
         }
+        // Qoder 会话流水定时合并（调度器/CLI 共用；纯本地 SQLite 无网络，幂等）。
+        // 不注册 schtasks——本地任务无「应用未启动也要跑」诉求，CLI 入口仅供手工触发/排查
+        "qoder-sessions-compact" => crate::store::docs::qoder_sessions_compact(
+            &crate::store::db(&state.data_dir),
+            crate::store::docs::QODER_SESSIONS_COMPACT_AFTER_DAYS,
+        )
+        .map(|(merged, deleted)| serde_json::json!({ "ok": true, "merged": merged, "deleted": deleted })),
         other => {
             eprintln!("未知任务: {other}");
             println!("{}", serde_json::json!({"ok": false, "error": format!("未知任务: {other}")}));

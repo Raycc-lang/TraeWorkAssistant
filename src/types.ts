@@ -179,6 +179,8 @@ export interface UsageSessionView {
   cache_write_tokens: number;
   /** 会话说明（user_input_preview，后端已截断 200 字符） */
   preview: string;
+  /** 轮键（Qoder 展开明细行返回 chat_record_id；会话级行与 Trae/Buddy 为空） */
+  record_id?: string;
 }
 
 export interface UsageSessionsResult {
@@ -384,14 +386,24 @@ export interface Settings {
   qoderwork_path: string | null;
   /** Qoder 每日签到调度触发时刻 HH:MM（默认 10:15：单次覆盖 0 点签到与 10:00 登录奖励双活动） */
   qoder_checkin_hhmm: string;
-  /** Qoder 积分快照调度触发时刻 HH:MM（默认 23:40） */
+  /** Qoder 积分数据同步触发时刻 HH:MM（daily 模式生效，默认 23:40） */
   qoder_credits_sync_hhmm: string;
-  /** Qoder 积分快照调度开关（默认开） */
+  /** Qoder 积分数据同步旧开关（保留兼容；调度已改按 qoder_credits_sync_mode 判定） */
   qoder_credits_sync_enabled: boolean;
+  /** Qoder 积分数据同步模式：off（关闭）| hourly（每小时）| daily（每日 HH:MM）| every_hours（每N小时，默认） */
+  qoder_credits_sync_mode: string;
+  /** Qoder 积分数据同步间隔小时数（every_hours 模式生效，默认 2，1..24） */
+  qoder_credits_sync_hours: string;
   /** Qoder Token 定时续期开关（默认开：qoder-refresh 每 N 小时兜底刷新全部账号凭证） */
   qoder_token_renew_enabled: boolean;
   /** Qoder Token 续期间隔小时数（1~24，默认 6；客户端 token 惰性窗 7h，间隔 ≤7h 保证过期前续上） */
   qoder_token_renew_interval_hours: number;
+  /** Qoder 会话流水定时合并开关（默认开：qoder-sessions-compact 每 6 小时将早于保留窗的流水按会话合并为单行） */
+  qoder_sessions_compact_enabled: boolean;
+  /** Qoder 会话流水合并保留窗天数（默认 3，1..=90：近 N 天保留请求级明细，更早的合并） */
+  qoder_sessions_compact_days: string;
+  /** Qoder 会话流水合并触发时刻 HH:MM（保留兼容字段；调度已改每 6 小时档，不参与判定） */
+  qoder_sessions_compact_hhmm: string;
   /** Trae 每日签到调度触发时刻 HH:MM（默认 09:00，环境配置页可改；Windows 计划任务注册时间复用该值） */
   trae_checkin_hhmm: string;
   /** Trae 签到多账号间隔秒（默认 3s，环境配置页可改，0=关闭；防上游频控） */
@@ -586,6 +598,10 @@ export interface DispatchPolicy {
   per_model: Record<string, string[]>;
   /** 双源首选池不可用时按序回退 */
   fallback: boolean;
+  /** /v1/models 为多源同名模型附带池前缀别名条目（trae/xxx 等，issue #90 修复③a）；默认关 */
+  model_source_labels: boolean;
+  /** 账号保留剩余积分（issue #91）：剩余 ≤ 该值的账号暂停调度（0 = 关闭），默认 50 */
+  reserve_credits: number;
   updated_at: number;
 }
 

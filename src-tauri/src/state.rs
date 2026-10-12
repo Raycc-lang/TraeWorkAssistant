@@ -150,10 +150,12 @@ pub struct AppState {
     /// Doubao 账号池读-改-写互斥：同 wb_pool_lock，罩住命令/巡检任务/保活线程
     /// 与 vault 启动迁移的全部写点
     pub doubao_pool_lock: Arc<Mutex<()>>,
-    /// 共享分组定义读-改-写互斥（审查修复 B1）：分组定义统一存 groups 表且保存为
-    /// 全删全写，create/update/delete 与跨池导入合并（qoder data_io）等所有
-    /// 「defs_load→内存改→defs_save」写点持同一把锁，防并发 load→save 互相覆盖
-    /// （丢新分组/复活已删分组）。获取顺序固定「池锁 → 本锁」，持本锁不得再取池锁
+    /// 组织定义（groups / tags 行文档表）读-改-写互斥：shared_groups 的
+    /// create/update/delete、tags 的 create/update/delete、qoder 导入的 defs
+    /// 合并、account_tags_set 的校验+写入全部持锁执行，杜绝并发「load→save」
+    /// 互相覆盖（丢新分组/丢新标签/复活已删项）与「校验后删除」幽灵 TOCTOU。
+    /// 锁序固定「池锁 → defs锁」：需要双锁的路径（qoder 导入、账号 move 复检）
+    /// 先持池锁再持本锁；本锁之下只嵌套 store::docs 的 org_defs_lock（单向）
     pub group_defs_lock: Arc<Mutex<()>>,
 }
 
@@ -296,6 +298,19 @@ impl AppState {
             s.qoder_token_renew_interval_hours = 6;
         }
         s.qoder_token_renew_interval_hours = s.qoder_token_renew_interval_hours.min(24);
+        // Qoder 会话流水定时合并（qoder-sessions-compact）：同款零值回填
+        //（kv 完全缺失走派生 Default bool=false 会漏开；时刻为空视为从未配置，回填默认开）
+        if s.qoder_sessions_compact_hhmm.trim().is_empty() {
+            s.qoder_sessions_compact_enabled = true;
+            s.qoder_sessions_compact_hhmm = "04:30".into();
+        }
+        // Qoder 积分数据同步模式零值归一：mode 为空视为旧数据（只有 enabled 布尔），
+        // 按旧开关派生保持语义：true→every_hours（对齐 Buddy/Trae 默认）、false→off；
+        // 间隔小时数并入下方 clamp 循环
+        if s.qoder_credits_sync_mode.trim().is_empty() {
+            s.qoder_credits_sync_mode =
+                if s.qoder_credits_sync_enabled { "every_hours" } else { "off" }.into();
+        }
         // 模型目录每日同步（Buddy/Trae）：同款零值回填（默认开）；同步幂等且不消耗积分，
         // 无账号时调度器静默跳过，默认开安全
         if s.wb_catalog_sync_hhmm.trim().is_empty() {
@@ -316,7 +331,11 @@ impl AppState {
         if s.trae_credits_sync_mode.trim().is_empty() {
             s.trae_credits_sync_mode = "every_hours".into();
         }
-        for field in [&mut s.wb_credits_sync_hours, &mut s.trae_credits_sync_hours] {
+        for field in [
+            &mut s.wb_credits_sync_hours,
+            &mut s.trae_credits_sync_hours,
+            &mut s.qoder_credits_sync_hours,
+        ] {
             let v = field.trim().parse::<i64>().map(|h| h.clamp(1, 24)).unwrap_or(2);
             *field = v.to_string();
         }

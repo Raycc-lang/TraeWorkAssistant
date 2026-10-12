@@ -56,45 +56,56 @@ where
     v
 }
 
-/// 取缓存或加载（可失败版，审查修复 A1）：`load` 返回 None = 本次加载失败
-/// （如读库错误）——不回填缓存、保留旧快照兜底返回（陈旧但正确优于空数据：
-/// 空索引会让组/标签约束 Key 在 TTL 窗口内全量拒绝）；首次加载即失败
-/// （无旧快照）返回 None 由调用方兜底。成功路径与 get_or_load 完全一致。
-pub fn get_or_load_fallible<T>(
+/// 取缓存或加载（可失败版，org_index 等整库读场景专用）：
+/// - 未过期缓存命中 → 直接返回；
+/// - miss/过期 → 调用 `load`；成功则回填缓存并返回；
+/// - `load` 失败（如瞬时读库失败）→ **不缓存失败结果**，若注册表中存在旧快照
+///   （即使已过期）则沿用旧快照兜底并记日志——避免一次瞬时读库失败把空索引
+///   回填缓存、导致全库账号在 TTL 窗口内不可取号；
+/// - 首启无任何快照才调用 `fallback`（调用方通常回退空索引）。
+pub fn get_or_load_fallible<T, E>(
     data_dir: &Path,
     key: &'static str,
-    load: impl FnOnce() -> Option<T>,
-) -> Option<T>
+    load: impl FnOnce() -> Result<T, E>,
+    fallback: impl FnOnce() -> T,
+) -> T
 where
     T: serde::Serialize + serde::de::DeserializeOwned,
+    E: std::fmt::Display,
 {
     let cache_key = (data_dir.to_path_buf(), key);
+    // 未过期命中直接返回；过期条目暂存（快照引用），load 失败时兜底用
     let mut stale: Option<std::sync::Arc<serde_json::Value>> = None;
     {
         let reg = registry().lock().unwrap_or_else(|e| e.into_inner());
         if let Some(e) = reg.get(&cache_key) {
             if e.at.elapsed() < TTL {
                 if let Ok(v) = serde_json::from_value::<T>((*e.val).clone()) {
-                    return Some(v);
+                    return v;
                 }
+                // 类型不匹配（理论不可达）：视作脏条目，走下方重载
+            } else {
+                stale = Some(e.val.clone());
             }
-            // TTL 已过期（或类型不符）：留存旧值，加载失败时兜底返回
-            stale = Some(e.val.clone());
         }
     }
     match load() {
-        Some(v) => {
+        Ok(v) => {
             if let Ok(json) = serde_json::to_value(&v) {
                 let mut reg = registry().lock().unwrap_or_else(|e| e.into_inner());
-                reg.insert(
-                    cache_key,
-                    Entry { val: std::sync::Arc::new(json), at: Instant::now() },
-                );
+                reg.insert(cache_key, Entry { val: std::sync::Arc::new(json), at: Instant::now() });
             }
-            Some(v)
+            v
         }
-        // 加载失败：不污染缓存（下个请求自动重试加载），有过期旧快照则回退
-        None => stale.and_then(|v| serde_json::from_value::<T>((*v).clone()).ok()),
+        Err(err) => {
+            eprintln!("[config_cache] {key} 重载失败（沿用旧快照兜底）: {err}");
+            if let Some(json) = stale {
+                if let Ok(v) = serde_json::from_value::<T>((*json).clone()) {
+                    return v;
+                }
+            }
+            fallback()
+        }
     }
 }
 

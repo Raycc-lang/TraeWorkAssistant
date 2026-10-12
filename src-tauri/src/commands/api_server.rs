@@ -26,6 +26,14 @@ fn safe_lock<'a, T>(m: &'a Mutex<T>) -> std::sync::MutexGuard<'a, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// api_pool 整文档覆盖写互斥（审查修复清单 v1.4.9 B1，进程级叶子锁）：
+/// api_pool 为 kv 整文档「load→merge→kv_set」模型，3 个写点
+/// （pool_set / shared_groups delete ③段 / tags delete ③段）无互斥时并发互相
+/// 覆盖丢配置。纪律：写点读改写+落盘持锁、热重载放锁外；写点均在池/org 锁
+/// 释放后获取本锁，持锁期间严禁再取任何其他锁；启动迁移在 server bind 前执行
+/// 无并发窗口，不取锁
+pub(crate) static POOL_CFG_LOCK: Mutex<()> = Mutex::new(());
+
 // ==================== 启停命令 ====================
 
 /// 启动 API 服务核心逻辑（页面命令 / 托盘菜单共用）。
@@ -48,10 +56,6 @@ pub async fn do_start(
     // load 已将空 default_model 兜底为内置默认，无需再 trim 判空
     let gw = crate::api_server::gateway_settings::load(&state.data_dir);
     let port = gw.port;
-    // 审查二轮 Minor-3：监听 host 在此一次性读入并注入 ApiSharedState.listen_host，
-    // start_api_server 绑定与 auth.rs /health 环回豁免同用该运行值——改配置未重启
-    // 期间豁免方向不再错判（bind 与豁免不存在双源漂移）
-    let listen_host = gw.host;
 
     // 代理循环说明：ureq 2.12 未启用 proxy-from-env feature，构建 Agent 时
     // 既不读 HTTP(S)_PROXY/NO_PROXY 环境变量、也不读系统代理，Agent 未显式
@@ -183,6 +187,12 @@ pub async fn do_start(
     pool.set_strategy(strategy);
     let wb_pool = ApiPool::new();
     let qoder_pool = ApiPool::new();
+    // 账号保留剩余积分（issue #91）：调度策略统一配置，启动时三池应用
+    //（credits=0 时无过滤；Qoder 池 credits 恒 None 不受影响，保持口径一致仍设置）
+    let reserve_credits = crate::api_server::dispatch::load_policy(&state.data_dir).reserve_credits;
+    pool.set_reserve_credits(reserve_credits);
+    wb_pool.set_reserve_credits(reserve_credits);
+    qoder_pool.set_reserve_credits(reserve_credits);
     let (pool_count, wb_uids_len, wb_accounts_total, qoder_count) =
         apply_pool_snapshot(state, &pool, &wb_pool, &qoder_pool);
 
@@ -291,11 +301,11 @@ pub async fn do_start(
         wb_sticky: crate::api_server::wb_sticky::StickyStore::load(&state.data_dir),
         // Trae 池会话粘性存储（per-pool 批次新增）："t:" 命名空间与 wb/qoder 互不串绑
         trae_sticky: crate::api_server::wb_sticky::StickyStore::load_ns(&state.data_dir, "t:"),
+        listen_host: std::sync::Mutex::new("127.0.0.1".to_string()),
         pool_sticky: Mutex::new(std::collections::HashMap::new()),
         model_cooldowns: Mutex::new(std::collections::HashMap::new()),
         default_model,
         data_dir: state.data_dir.clone(),
-        listen_host,
         total_requests: std::sync::atomic::AtomicU64::new(0),
         inflight: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
         active_uid: Mutex::new(None),
@@ -409,6 +419,84 @@ pub async fn do_start(
         shared: shared.clone(),
         started_at: now,
     });
+
+    // 启动积分保鲜（issue #91 缓存问题；审查 C3）：池内存在陈旧/缺时间戳的
+    // 积分快照时后台刷新一次——reserve 过滤对陈旧快照 fail-open，刷新拨新后
+    // 自动恢复生效。三池口径：
+    //   Trae 池：refresh_remaining_credits_impl 逐账号刷新，经 push_credits 回写拨新；
+    //   WB 池：wb_credits_snapshot_task 快照后按 ok=true 账号经 update_credits 拨新
+    //     （只更新余额+时间戳，不触碰运行期健康状态；此前 WB 池无运行期拨新
+    //     路径，陈旧快照会一直 fail-open）；
+    //   Qoder 池：sync_from_qoder 恒 credits=None（倍率计费无余额概念），
+    //     reserve 对其结构性不生效，无保鲜需求（仅标注）。
+    // 静默失败不影响启动流程
+    {
+        let app2 = app.clone();
+        let st2 = state.clone();
+        std::thread::spawn(move || {
+            let rt_state = app2.state::<Mutex<Option<ApiServerRuntime>>>();
+            let Some(shared) = safe_lock(&rt_state).as_ref().map(|rt| rt.shared.clone()) else {
+                return; // runtime 未就绪（启动中途失败）
+            };
+            let trae_stale = shared.pool.has_stale_credits();
+            let wb_stale = shared.wb_pool.has_stale_credits();
+            if !trae_stale && !wb_stale {
+                return;
+            }
+            fs_utils::app_log(&st2.data_dir, "API服务启动-积分保鲜: 检测到陈旧积分快照, 后台刷新中");
+            if trae_stale {
+                match crate::commands::accounts::refresh_remaining_credits_impl(
+                    &st2,
+                    Some(rt_state.inner()),
+                ) {
+                    Ok(n) => fs_utils::app_log(
+                        &st2.data_dir,
+                        &format!("API服务启动-积分保鲜: Trae池刷新完成 accounts={}", n),
+                    ),
+                    Err(e) => fs_utils::app_log(
+                        &st2.data_dir,
+                        &format!("API服务启动-积分保鲜: Trae池刷新失败(不影响使用) {}", e),
+                    ),
+                }
+            }
+            if wb_stale {
+                match crate::commands::workbuddy::wb_credits_snapshot_task(&st2) {
+                    Ok(parsed) => {
+                        // 仅 ok=true 账号拨新，失败账号保留旧值防误清
+                        //（对齐 write_back_pool_balances 的到期回写口径）
+                        let mut m: std::collections::HashMap<String, f64> =
+                            std::collections::HashMap::new();
+                        if let Some(accounts) = parsed.get("accounts").and_then(|v| v.as_array()) {
+                            for acc in accounts {
+                                let ok = acc
+                                    .get("ok")
+                                    .and_then(serde_json::Value::as_bool)
+                                    .unwrap_or(true);
+                                if !ok {
+                                    continue;
+                                }
+                                if let (Some(uid), Some(bal)) = (
+                                    acc.get("user_id").and_then(|v| v.as_str()),
+                                    acc.get("balance").and_then(|v| v.as_f64()),
+                                ) {
+                                    m.insert(uid.to_string(), bal);
+                                }
+                            }
+                        }
+                        shared.wb_pool.update_credits(&m);
+                        fs_utils::app_log(
+                            &st2.data_dir,
+                            &format!("API服务启动-积分保鲜: WB池拨新完成 accounts={}", m.len()),
+                        );
+                    }
+                    Err(e) => fs_utils::app_log(
+                        &st2.data_dir,
+                        &format!("API服务启动-积分保鲜: WB池刷新失败(不影响使用) {}", e),
+                    ),
+                }
+            }
+        });
+    }
 
     // 同步托盘菜单文本 + 系统通知（账号数分池展示：Trae 池空 ≠ 无资源，Buddy 池可能正常服务）
     sync_tray_api_text(app, true);
@@ -639,6 +727,14 @@ fn apply_pool_snapshot(
     // 与分组筛选取交集（D5 池语义：组 ∩ 标签，均空 = 不限）
     let tag_map = crate::store::docs::account_tags_map(&crate::store::db(&state.data_dir));
     let trae_tag_filter = crate::api_server::org_index::tag_uid_set(&pool_file.trae_tag_ids, &tag_map);
+    // 积分快照文件级采集时间（issue #91 缓存保鲜）：rfc3339 → unix 秒。
+    // 一次刷新全量写入 credits 与 updated_at，文件级时间戳对全体条目生效；
+    // 池据此判断 reserve 过滤新鲜度（陈旧快照 fail-open，见 pool.rs）
+    let credits_fetched_at = credits_file
+        .updated_at
+        .as_deref()
+        .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+        .map(|t| t.timestamp());
     let trae_accounts: Vec<_> = match &trae_tag_filter {
         Some(set) => accounts
             .accounts
@@ -655,6 +751,7 @@ fn apply_pool_snapshot(
         &groups_file.membership,
         &cooldowns_file.cooldowns,
         &pool_credits,
+        credits_fetched_at,
         &merge_pool_expire_times(&credits_file),
         &device_map,
     );
@@ -941,6 +1038,11 @@ pub fn pool_set(
     wb_tag_ids: Option<Vec<String>>,
     qoder_tag_ids: Option<Vec<String>>,
 ) -> Result<(), String> {
+    // B1（审查修复清单 v1.4.9）：api_pool 整文档覆盖写互斥——3 个写点
+    // （本命令 / shared_groups ③段 / tags ③段）并发「load→merge→kv_set」互相
+    // 覆盖丢配置。进程级叶子锁：写点均在池/org 锁释放后获取，持锁期间不再取
+    // 其他锁（热重载在锁外）；启动迁移在 server bind 前无并发窗口，不取锁
+    let _cfg = POOL_CFG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let existing: ApiPoolFile = load_pool_file(&state.data_dir);
     let mut pool_file = merge_pool_set(
         &existing,
@@ -986,7 +1088,8 @@ pub fn pool_set(
         pool_file.qoder_tag_ids = v;
     }
     crate::store::db(&state.data_dir).kv_set("api_pool", &pool_file)?;
-    // 热应用：运行中即改内存池策略（Buddy 池空值沿用 Trae 池策略，与启动逻辑一致）
+    drop(_cfg);
+    // 热应用（配置锁外）：运行中即改内存池策略（Buddy 池空值沿用 Trae 池策略，与启动逻辑一致）
     if let Some(rt) = safe_lock(&runtime).as_ref() {
         rt.shared
             .pool
@@ -1333,6 +1436,7 @@ pub fn api_keys_list(
 #[tauri::command]
 pub fn api_keys_save(
     state: State<'_, AppState>,
+    runtime: State<'_, Mutex<Option<ApiServerRuntime>>>,
     keys: Vec<crate::api_server::api_keys::ApiKeyEntry>,
     auth_disabled: Option<bool>,
 ) -> Result<(), String> {
@@ -1342,7 +1446,22 @@ pub fn api_keys_save(
         auth_disabled: auth_disabled.unwrap_or(prev.auth_disabled),
     };
     // 非环回监听 + （新状态显式关闭鉴权 或 无任何启用 Key）→ 拒绝保存
-    let host = crate::api_server::gateway_settings::load(&state.data_dir).host;
+    // host 与运行时物理同源（对齐 auth.rs /health 豁免的 M3 修复）：服务运行中读
+    // rt.shared.listen_host（实际绑定值）——配置被改回 127.0.0.1 但服务仍监听
+    // 0.0.0.0 时按实际值判定，不出现「配置值 vs 实际监听值」分离导致的 fail-open；
+    // 未运行时读配置值（下次启动还有 ensure_bind_auth_policy 兜底）
+    let host = {
+        let guard = safe_lock(&runtime);
+        match guard.as_ref() {
+            Some(rt) => rt
+                .shared
+                .listen_host
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone(),
+            None => crate::api_server::gateway_settings::load(&state.data_dir).host,
+        }
+    };
     if !crate::api_server::server::is_loopback_host(&host)
         && (file.auth_disabled || !file.has_enabled())
     {
@@ -1363,7 +1482,7 @@ pub fn api_keys_org_preview(
     state: State<'_, AppState>,
     keys: Vec<crate::api_server::api_keys::ApiKeyEntry>,
 ) -> std::collections::HashMap<String, std::collections::HashMap<String, usize>> {
-    use crate::api_server::api_keys::split_pool_tagged;
+    use crate::api_server::api_keys::{parse_bind_pool, split_pool_tagged};
     use std::collections::HashMap;
     let idx = crate::api_server::org_index::get(&state.data_dir);
     let mut out: HashMap<String, HashMap<String, usize>> = HashMap::new();
@@ -1378,23 +1497,20 @@ pub fn api_keys_org_preview(
                 &idx,
             ));
         }
-        let mut counts: HashMap<String, usize> = HashMap::new();
-        // 审查修复 A3：与 KeyConstraint::is_mixed_whitelist 等价的静态判定——
-        // org 维度已配置或任一条目带池前缀 = 混合白名单
+        // 与运行时 pool_constraints 分池语义对齐（issue #30）：
+        // - 混合白名单（组/标签已配置 → 展开条目必带前缀；或精确白名单含前缀条目）
+        //   → 裸 uid 防御性归属 buddy（旧数据混入兜底，与运行时一致）
+        // - 非混合（全裸 uid 旧语义）→ 白名单整体作用于 bind_pool 所指池
+        //   （未绑定 = buddy，F-35 旧语义；bind=trae/buddy 各归其池）
         let mixed = !k.allowed_groups.is_empty()
             || !k.allowed_tags.is_empty()
-            || allowed.iter().any(|u| split_pool_tagged(u).0.is_some());
+            || k.allowed_accounts.iter().any(|u| split_pool_tagged(u).0.is_some());
+        let legacy_pool = parse_bind_pool(&k.bind_pool).unwrap_or("buddy");
+        let mut counts: HashMap<String, usize> = HashMap::new();
         for u in &allowed {
             let pool = match split_pool_tagged(u) {
                 (Some(p), _) => p,
-                // 非混合白名单：裸条目整体属于 bind_pool 所指账号体系
-                // （未绑定=buddy 旧语义，与运行时 pool_constraints 一致）
-                (None, _) if !mixed => {
-                    crate::api_server::api_keys::parse_bind_pool(&k.bind_pool)
-                        .unwrap_or("buddy")
-                }
-                // 混合白名单（部分条目带池前缀）才将裸条目防御性归 buddy
-                (None, _) => "buddy",
+                (None, _) => if mixed { "buddy" } else { legacy_pool },
             };
             *counts.entry(pool.to_string()).or_default() += 1;
         }
@@ -1479,9 +1595,19 @@ pub fn dispatch_policy_get(
 #[tauri::command]
 pub fn dispatch_policy_set(
     state: State<'_, AppState>,
+    runtime: State<'_, Mutex<Option<ApiServerRuntime>>>,
     policy: crate::api_server::dispatch::DispatchPolicy,
 ) -> Result<crate::api_server::dispatch::DispatchPolicy, String> {
     crate::api_server::dispatch::save_policy(&state.data_dir, &policy)?;
+    // 账号保留剩余积分（issue #91）热应用：保存后三池即时生效
+    //（配置锁外，与 pool_set 热应用同模式；负值由 set_reserve_credits 防御归零）
+    if let Some(rt) = safe_lock(&runtime).as_ref() {
+        rt.shared.pool.set_reserve_credits(policy.reserve_credits);
+        rt.shared.wb_pool.set_reserve_credits(policy.reserve_credits);
+        rt.shared
+            .qoder_pool
+            .set_reserve_credits(policy.reserve_credits);
+    }
     Ok(crate::api_server::dispatch::load_policy(&state.data_dir))
 }
 
@@ -1960,6 +2086,7 @@ mod pool_merge_tests {
             global_region: false,
             credits: None,
             credits_expire_at: None,
+            credits_fetched_at: None,
             needs_relogin: false,
             group_id: String::new(),
         };

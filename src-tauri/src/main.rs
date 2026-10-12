@@ -386,6 +386,7 @@ fn main() {
             commands::qoder::qoder_credits_fetch,
             commands::qoder::qoder_credits_history_list,
             commands::qoder::qoder_sessions_query,
+            commands::qoder::qoder_session_detail_query,
             commands::qoder::qoder_accounts_export,
             commands::qoder::qoder_accounts_import,
             commands::qoder::qoder_env_reset_items,
@@ -434,7 +435,7 @@ fn main() {
             // 首次启动读到全默认设置，trim_logs 会按默认保留期误裁日志。
             // 注意：必须先于 vault 迁移执行——JSON 中的明文凭据先入库，
             // 再由随后的 vault::migrate_on_startup 收敛进 Stronghold 并从库中占位化抹除。
-            if let Some(summary) = store::migrate::migrate_on_startup(&state.data_dir, &state.group_defs_lock) {
+            if let Some(summary) = store::migrate::migrate_on_startup(&state.data_dir) {
                 fs_utils::app_log(&state.data_dir, &summary);
             }
 

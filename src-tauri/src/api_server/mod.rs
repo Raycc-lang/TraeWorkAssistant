@@ -90,10 +90,6 @@ pub struct ApiSharedState {
     pub default_model: String,
     /// 数据目录（读取/持久化 api_models.json 的 function 自学习覆盖）
     pub data_dir: std::path::PathBuf,
-    /// 实际监听 host（审查二轮 Minor-3：服务启动时从 gateway_settings 读入一次，
-    /// 与 bind 地址同源）。/health 环回豁免以此为准——改配置未重启时豁免方向
-    /// 不再随「配置值 vs 运行值」分离而错判（fail-open 窗口关闭）。
-    pub listen_host: String,
     pub total_requests: AtomicU64,
     /// 当前并发数（统一网关 §4.5）：由 InflightGuard RAII 维护，覆盖全部业务端点。
     /// Arc 包装使 guard 可跨 spawn_blocking/流任务持有（'static + Send）
@@ -146,6 +142,11 @@ pub struct ApiSharedState {
     /// sticky_bindings 表，键命名空间 "t:" 隔离；会话→账号绑定供 Trae 取号粘住
     ///（显式 conversationId / 消息指纹双模式，TTL 经 trae_sticky_ttl_secs 配置）
     pub trae_sticky: wb_sticky::StickyStore,
+    /// 实际绑定的监听地址（2026-10-12 审查 M3）：服务启动时从 gateway 配置读入
+    /// 一次注入。auth 层的 /health 环回豁免判定改读本字段——与 server.rs 的 bind
+    /// 物理同源，改配置未重启时不再出现「配置值 vs 实际监听值」分离导致的
+    /// fail-open 误判（配置改非环回但服务仍绑环回时按实际值豁免，反之按实际值走鉴权）
+    pub listen_host: std::sync::Mutex<String>,
 }
 
 impl ApiSharedState {
@@ -245,7 +246,8 @@ impl ApiSharedState {
     /// `credits`/`original_credits`：上游 usage 中的积分测量（issue #82 T2），
     /// 上游未下发 usage 时传 (None, None) 不入账（不得伪造）
     /// `session`：请求级会话上下文（issue #82 问题5）——同步直写 qoder_sessions 流水
-    /// （INSERT OR IGNORE 幂等；写失败静默，不影响记账主路径）
+    /// （UPSERT：ON CONFLICT(request_id) DO UPDATE 且仅新 ts 覆盖旧行，幂等；
+    /// 写失败静默，不影响记账主路径）
     #[allow(clippy::too_many_arguments)]
     pub fn record_usage_qoder(
         &self,
@@ -270,8 +272,10 @@ impl ApiSharedState {
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         guard.record_credits_qoder(model, &day, credits, original_credits);
-        guard.record_in_ttfb(
+        // G3：ttfb 统计用入口取定的 day（与积分/流水同行），不自取 today 分裂日期行
+        guard.record_in_ttfb_on(
             usage::UsageBucket::Qoder,
+            &day,
             model, uid, key_id, ok, is_stream, duration_ms, prompt_tokens, completion_tokens,
             ttfb_ms,
         );
@@ -292,6 +296,7 @@ impl ApiSharedState {
             is_stream,
             ok,
             &session.preview,
+            &session.record_id,
         );
         self.usage_dirty
             .lock()
@@ -725,7 +730,6 @@ mod inflight_tests {
             model_cooldowns: Mutex::new(std::collections::HashMap::new()),
             default_model: String::new(),
             data_dir: dir.clone(),
-            listen_host: "127.0.0.1".into(),
             total_requests: AtomicU64::new(0),
             inflight: Arc::new(AtomicU64::new(0)),
             active_uid: Mutex::new(None),
@@ -745,6 +749,7 @@ mod inflight_tests {
             qoder_sticky_enabled: std::sync::atomic::AtomicBool::new(false),
             qoder_sticky: wb_sticky::StickyStore::default(),
             trae_sticky: wb_sticky::StickyStore::default(),
+            listen_host: std::sync::Mutex::new("127.0.0.1".to_string()),
         };
         {
             let _g = state.inflight_guard();
