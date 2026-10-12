@@ -792,7 +792,7 @@ fn run_qoder_stream(
                     // 竞速胜者行源（原始上游行）统一翻译后喂 stream_forward_ex
                     let ilines = translate_race_lines(race, err_slot.clone(), chat_id, model);
                     let (error_info, sent_any, failed_inline, usage) =
-                        wb_sse::stream_forward_ex(ilines, tx, proto, chat_id, model);
+                        wb_sse::stream_forward_ex(ilines, tx, proto, chat_id, model, false);
                     let duration_ms = start_ts.elapsed().as_millis() as u64;
                     let meta = err_slot
                         .lock()
@@ -1442,6 +1442,7 @@ pub async fn qoder_aggregate_chat(
                     &resp,
                     &format!("resp_{}", now_ts()),
                     &model_out,
+                    false,
                 ),
                 Protocol::OpenAi => resp,
             };

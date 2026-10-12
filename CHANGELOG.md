@@ -23,6 +23,15 @@
 - **杂项**：SchedulerTasksCard 补齐 every_hours 三档模式；`config_set` 整表携带任务时刻/模式/小时防清空；启动公告一次性取走；删除重复预览块、弹框失败重抛等小修。
 - 明示不修：Qoder 导入覆盖已存在账号的标签/分组绑定（导入文件为权威态，与 WB 语义一致）。
 
+### 修复与加固（issue #93 Responses namespace 工具组 + 审查修复批）
+
+- **issue #93**：`/v1/responses` 转换器此前静默丢弃 `type=="namespace"` 工具组（Codex 子代理 spawn_agent/wait_agent、MCP REPL 工具整体不可用）。现展平为内层 function，编码名 `<ns>__<inner>`（上游 chat 协议无 namespace 概念）；请求侧历史 function_call 按 `{name, namespace}` 双字段拼回编码名；流式/非流式响应侧还原为双字段。零穿线设计：拆分开关由转发 body 的 tools 是否含 `__` 编码名（`has_separated_tool_names`）自动判定，qoder/custom 上游不感知。
+- **审查修复 #2**：双重前缀守卫——历史 function_call 已带编码名 + namespace 时不重复拼接。
+- **审查修复 #3**：`tool_choice` 裸名命中 namespace 组内工具时拼回编码名，与 tools 声明一致。
+- **审查修复 #4**：编码名与顶层 function 重名时去重，保留先声明者。
+- **审查修复 #5**：组级 description 保留——内层为空回退组级，均非空组级在前拼接。
+- 新增回归测试 8 项（编码名守卫/tool_choice 解析/碰撞去重/组级描述/拆分开关判据/流式+非流式开关行为）。
+
 ### 跳过（桌面/OS 专属）
 
 - `workbuddy_stats` 本地 Token 统计、profile 槽位体积缓存、state sync_mode 零值归一、`refreshLocalEntitlement`。

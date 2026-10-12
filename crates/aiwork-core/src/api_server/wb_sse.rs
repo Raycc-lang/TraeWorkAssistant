@@ -232,6 +232,7 @@ pub fn stream_forward_ex(
     proto: crate::api_server::routes::Protocol,
     chat_id: &str,
     model: &str,
+    split_ns: bool,
 ) -> (Option<(i64, String)>, bool, bool, Option<Value>) {
     let mut parser = WbSseParser::new(lines);
     let mut sent_any = false;
@@ -391,9 +392,14 @@ pub fn stream_forward_ex(
                             tid.clone()
                         };
                         // 编码名 `<ns>__<name>` 还原为 Codex 可路由的 {name, namespace}
-                        // 双字段（issue #93，与 wb_responses 非流式路径对齐）
-                        let (nm, ns) =
-                            crate::api_server::wb_responses::split_namespaced(name);
+                        // 双字段（issue #93，与 wb_responses 非流式路径对齐）；
+                        // split_ns=false（请求无 namespace 组）时原样透传，
+                        // 恰好含 `__` 的普通名不误拆（issue #93 审查修复 #1）
+                        let (nm, ns) = if split_ns {
+                            crate::api_server::wb_responses::split_namespaced(name)
+                        } else {
+                            (name.clone(), None)
+                        };
                         let mut item = json!({
                             "id": item_id,
                             "type": "function_call",
@@ -740,9 +746,10 @@ pub fn stream_forward(
     proto: crate::api_server::routes::Protocol,
     chat_id: &str,
     model: &str,
+    split_ns: bool,
 ) -> (Option<(i64, String)>, bool, Option<Value>) {
     let (error_info, sent_any, _failed_inline, usage) =
-        stream_forward_ex(lines, tx, proto, chat_id, model);
+        stream_forward_ex(lines, tx, proto, chat_id, model, split_ns);
     (error_info, sent_any, usage)
 }
 
@@ -1009,7 +1016,7 @@ mod tests {
         let src = InterruptibleLines::from_iterator(Box::new(data.into_iter()));
         let start = std::time::Instant::now();
         let (_err, sent_any, _fi, _u) = stream_forward_ex(
-            src, &tx, crate::api_server::routes::Protocol::OpenAi, "c", "m",
+            src, &tx, crate::api_server::routes::Protocol::OpenAi, "c", "m", false,
         );
         assert!(!sent_any, "断连后不得有任何事件下发");
         assert!(
@@ -1119,7 +1126,7 @@ mod tests {
             "",
         ]);
         let (err, sent_any, usage) =
-            stream_forward(lines, &tx, crate::api_server::routes::Protocol::Responses, "resp_1", "glm-5.3");
+            stream_forward(lines, &tx, crate::api_server::routes::Protocol::Responses, "resp_1", "glm-5.3", false);
         assert!(err.is_none());
         assert!(sent_any);
         assert!(usage.is_some());
@@ -1154,7 +1161,7 @@ mod tests {
             "",
         ]);
         let (err, sent_any, failed_inline, _usage) =
-            stream_forward_ex(lines, &tx, crate::api_server::routes::Protocol::Responses, "resp_9", "m");
+            stream_forward_ex(lines, &tx, crate::api_server::routes::Protocol::Responses, "resp_9", "m", false);
         assert!(err.is_none(), "流内错误已就地下发，不得上抛触发换号重试");
         assert!(sent_any);
         assert!(failed_inline, "流内失败必须以 failed_inline 上报调用方");
@@ -1179,7 +1186,7 @@ mod tests {
             "",
         ]);
         let (err, sent_any, failed_inline, usage) =
-            stream_forward_ex(lines, &tx, crate::api_server::routes::Protocol::Responses, "resp_2", "m");
+            stream_forward_ex(lines, &tx, crate::api_server::routes::Protocol::Responses, "resp_2", "m", false);
         assert!(err.is_none());
         assert!(sent_any);
         assert!(!failed_inline);
@@ -1197,7 +1204,7 @@ mod tests {
             "",
         ]);
         let (err, _sent_any, failed_inline, _usage) =
-            stream_forward_ex(lines, &tx, crate::api_server::routes::Protocol::Anthropic, "msg_3", "m");
+            stream_forward_ex(lines, &tx, crate::api_server::routes::Protocol::Anthropic, "msg_3", "m", false);
         assert!(err.is_none());
         assert!(failed_inline);
         drop(tx);
@@ -1214,7 +1221,7 @@ mod tests {
         let (tx, _rx) = tokio::sync::mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(256);
         let lines = lines(&["data: {\"error\":{\"message\":\"boom\",\"code\":9}}", ""]);
         let (err, sent_any, failed_inline, _usage) =
-            stream_forward_ex(lines, &tx, crate::api_server::routes::Protocol::OpenAi, "c", "m");
+            stream_forward_ex(lines, &tx, crate::api_server::routes::Protocol::OpenAi, "c", "m", false);
         assert_eq!(err.unwrap(), (9, "boom".to_string()));
         assert!(!sent_any);
         assert!(!failed_inline);
@@ -1233,7 +1240,7 @@ mod tests {
             "",
         ]);
         let (err, sent_any, failed_inline, _u) =
-            stream_forward_ex(lines, &tx, crate::api_server::routes::Protocol::Anthropic, "msg_4", "m");
+            stream_forward_ex(lines, &tx, crate::api_server::routes::Protocol::Anthropic, "msg_4", "m", false);
         assert!(err.is_none() && sent_any && !failed_inline);
         drop(tx);
         let mut body = String::new();
@@ -1255,7 +1262,7 @@ mod tests {
             "data: [DONE]",
             "",
         ]);
-        let _ = stream_forward_ex(lines, &tx, crate::api_server::routes::Protocol::Anthropic, "msg_5", "m");
+        let _ = stream_forward_ex(lines, &tx, crate::api_server::routes::Protocol::Anthropic, "msg_5", "m", false);
         drop(tx);
         let mut body = String::new();
         while let Ok(frame) = rx.try_recv() {
@@ -1263,5 +1270,56 @@ mod tests {
         }
         let md = body.split("event: message_delta").nth(1).unwrap_or("");
         assert!(md.contains("\"input_tokens\":0"));
+    }
+
+    /// issue #93 审查修复 #1/#6：Responses 流式 function_call 的 namespace 还原
+    /// 由 split_ns 开关控制——true 时编码名 `mcp__node_repl__js` 拆回
+    /// {name:"js", namespace:"mcp__node_repl"}；false 时原样透传不拆
+    #[test]
+    fn stream_forward_responses_function_call_split_respects_flag() {
+        // split_ns=true：拆分还原
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(256);
+        let lines1 = lines(&[
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_js\",\"function\":{\"name\":\"mcp__node_repl__js\",\"arguments\":\"{\\\"code\\\":\\\"1\\\"\"}}]}}]}",
+            "",
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"}\"}}],\"finish_reason\":\"tool_calls\"}}]}",
+            "",
+            "data: [DONE]",
+            "",
+        ]);
+        let (err, sent_any, _fi, _u) =
+            stream_forward_ex(lines1, &tx, crate::api_server::routes::Protocol::Responses, "resp_ns", "m", true);
+        assert!(err.is_none());
+        assert!(sent_any);
+        drop(tx);
+        let mut body = String::new();
+        while let Ok(frame) = rx.try_recv() {
+            body.push_str(&String::from_utf8_lossy(&frame.unwrap()));
+        }
+        assert!(body.contains("\"type\":\"function_call\""));
+        assert!(body.contains("\"name\":\"js\""));
+        assert!(body.contains("\"namespace\":\"mcp__node_repl\""));
+        assert!(!body.contains("mcp__node_repl__js"), "拆分后不应残留编码名");
+
+        // split_ns=false：编码名原样透传，无 namespace 字段
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(256);
+        let lines2 = lines(&[
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_js\",\"function\":{\"name\":\"mcp__node_repl__js\",\"arguments\":\"{}\"}}]}}]}",
+            "",
+            "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}}]}",
+            "",
+            "data: [DONE]",
+            "",
+        ]);
+        let (err, _sent, _fi, _u) =
+            stream_forward_ex(lines2, &tx, crate::api_server::routes::Protocol::Responses, "resp_nosplit", "m", false);
+        assert!(err.is_none());
+        drop(tx);
+        let mut body = String::new();
+        while let Ok(frame) = rx.try_recv() {
+            body.push_str(&String::from_utf8_lossy(&frame.unwrap()));
+        }
+        assert!(body.contains("\"name\":\"mcp__node_repl__js\""));
+        assert!(!body.contains("\"namespace\""));
     }
 }

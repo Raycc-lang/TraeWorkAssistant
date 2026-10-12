@@ -509,6 +509,9 @@ fn run_wb_stream(
     let key_name = super::api_keys::key_name_for(&state.data_dir, key_id);
     let peek: Value = serde_json::from_slice(body_vec).unwrap_or(json!({}));
     let sticky_key = SessionKey::from_body(&peek);
+    // issue #93 审查修复 #1：请求 tools 含 namespace 展平的编码名（`__` 分隔）
+    // 时开启响应侧拆分还原；纯普通名（Codex 顶层工具不含 `__`）不拆
+    let split_ns = super::wb_responses::has_separated_tool_names(&peek);
     // F-76④ 上下文过大提示（仅日志标注，不做真裁剪）
     log_longctx_hint(state, &peek, model);
     let templates = load_templates(state);
@@ -700,7 +703,7 @@ fn run_wb_stream(
                         Box::new(win.lines) as Box<dyn Iterator<Item = String> + Send>,
                     );
                     let (error_info, sent_any, failed_inline, usage) =
-                        wb_sse::stream_forward_ex(win_lines, tx, proto, chat_id, model);
+                        wb_sse::stream_forward_ex(win_lines, tx, proto, chat_id, model, split_ns);
                     let duration_ms = start_ts.elapsed().as_millis() as u64;
                     {
                         let (pt, ct) = usage
@@ -897,6 +900,11 @@ pub async fn wb_aggregate_chat(
     guard: InflightGuard,
 ) -> Response {
     let model_out = model.clone();
+    // issue #93 审查修复 #1：开关须在 body_vec 被 move 进阻塞闭包前计算——
+    // 请求 tools 含 namespace 展平的编码名（`__` 分隔）时开启响应侧拆分还原
+    let split_ns = serde_json::from_slice::<Value>(&body_vec)
+        .map(|v| super::wb_responses::has_separated_tool_names(&v))
+        .unwrap_or(false);
     // P2 修复：聚合含分级重试（RetrySame 退避 std::thread::sleep 最长 60s×N），
     // 长阻塞占主池会饿死鉴权等短任务，迁入 stream_runtime 专用阻塞池
     let result = super::stream_runtime().spawn_blocking(move || {
@@ -1215,6 +1223,7 @@ pub async fn wb_aggregate_chat(
                     &resp,
                     &format!("resp_{}", now_ts()),
                     &model_out,
+                    split_ns,
                 ),
                 Protocol::OpenAi => resp,
             };
@@ -1275,6 +1284,9 @@ pub async fn wb_tool_exec_chat(
     guard: InflightGuard,
 ) -> Response {
     let model_inner = model.clone();
+    // issue #93 审查修复 #1：开关须在 chat_body 被 move 进阻塞闭包前计算——
+    // 请求 tools 含 namespace 展平的编码名（`__` 分隔）时开启响应侧拆分还原
+    let split_ns = super::wb_responses::has_separated_tool_names(&chat_body);
     // P2 修复：工具代执行多轮上游请求 + 重试退避（最长 60s×N），长阻塞占主池
     // 会饿死鉴权等短任务，与非流式聚合一并迁入 stream_runtime 专用阻塞池
     let result = super::stream_runtime().spawn_blocking(move || {
@@ -1623,7 +1635,7 @@ pub async fn wb_tool_exec_chat(
     };
 
     let resp_obj = {
-        let mut r = super::wb_responses::completion_to_responses(&final_completion, &resp_id, &model);
+        let mut r = super::wb_responses::completion_to_responses(&final_completion, &resp_id, &model, split_ns);
         if !ws_items.is_empty() {
             let mut output = ws_items;
             if let Some(old) = r.get("output").and_then(|o| o.as_array()).cloned() {

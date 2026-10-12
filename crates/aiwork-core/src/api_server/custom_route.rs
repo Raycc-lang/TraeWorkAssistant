@@ -180,7 +180,7 @@ pub fn custom_stream_chat(
             Ok(reader) => match wb_upstream::lines_with_first_byte_timeout_interruptible(reader) {
                 Ok(lines) => {
                     let (error_info, sent_any, up_usage) =
-                        wb_sse::stream_forward(lines, &tx, proto, &chat_id, &model);
+                        wb_sse::stream_forward(lines, &tx, proto, &chat_id, &model, false);
                     let duration_ms = start_ts.elapsed().as_millis() as u64;
                     {
                         let (pt, ct) = up_usage.as_ref().map(usage_pair).unwrap_or((0, 0));
@@ -342,6 +342,7 @@ pub async fn custom_aggregate_chat(
                     &resp,
                     &format!("resp_{}", now_ts()),
                     &model_outer,
+                    false,
                 ),
                 Protocol::OpenAi => resp,
             };

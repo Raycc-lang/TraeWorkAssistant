@@ -9,6 +9,7 @@
 //! 宽容解析红线：字段缺失不报错，只按规范降级（input 缺失 → 空消息列表）。
 
 use serde_json::{json, Map, Value};
+use std::collections::{HashMap, HashSet};
 
 /// Responses 请求 → OpenAI chat completions 内部格式
 ///
@@ -73,12 +74,17 @@ pub fn responses_to_chat(body: &Value) -> Result<Value, String> {
     // tools：function 直投影；namespace（Codex 注入的 multi_agent_v1 / mcp__* 等，
     // issue #93）展平为内层 function，编码名 `<ns>__<inner>`（上游 chat 协议无
     // namespace 概念），响应回程由 split_namespaced 还原为 {name, namespace}
+    let mut choice_inner_lookup: HashMap<String, String> = HashMap::new();
     if let Some(tools) = body.get("tools").and_then(|v| v.as_array()) {
+        // 编码名碰撞去重（审查修复 #4）：与顶层 function 或先展平项重名的编码名
+        // 跳过（保留先声明者），避免向上游重复声明同名工具
+        let mut seen: HashSet<String> = HashSet::new();
         let mut converted: Vec<Value> = tools
             .iter()
             .filter(|t| t.get("type").and_then(|v| v.as_str()) == Some("function"))
             .filter_map(|t| {
                 let name = t.get("name")?.as_str()?.to_string();
+                seen.insert(name.clone());
                 Some(json!({
                     "type": "function",
                     "function": {
@@ -104,6 +110,14 @@ pub fn responses_to_chat(body: &Value) -> Result<Value, String> {
             let Some(inner) = t.get("tools").and_then(|v| v.as_array()) else {
                 continue;
             };
+            // 组级 description 保留（审查修复 #5）：内层为空回退组级，
+            // 均非空则组级在前拼接
+            let ns_desc = t
+                .get("description")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .trim()
+                .to_string();
             for it in inner.iter() {
                 if it.get("type").and_then(|v| v.as_str()) != Some("function") {
                     continue;
@@ -115,11 +129,30 @@ pub fn responses_to_chat(body: &Value) -> Result<Value, String> {
                 else {
                     continue;
                 };
+                let encoded = format!("{}__{}", ns, iname);
+                // 裸名 → 编码名映射（审查修复 #3）：tool_choice 裸名命中组内
+                // 工具时拼回编码名，与 tools 声明一致
+                choice_inner_lookup
+                    .entry(iname.to_string())
+                    .or_insert_with(|| encoded.clone());
+                if !seen.insert(encoded.clone()) {
+                    continue;
+                }
+                let inner_desc = it.get("description").cloned().unwrap_or(json!(""));
+                let desc = if !ns_desc.is_empty() {
+                    match inner_desc.as_str() {
+                        Some(id) if id.trim().is_empty() => json!(ns_desc),
+                        Some(id) => json!(format!("{}\n\n{}", ns_desc, id)),
+                        None => inner_desc,
+                    }
+                } else {
+                    inner_desc
+                };
                 converted.push(json!({
                     "type": "function",
                     "function": {
-                        "name": format!("{}__{}", ns, iname),
-                        "description": it.get("description").cloned().unwrap_or(json!("")),
+                        "name": encoded,
+                        "description": desc,
                         "parameters": it.get("parameters").cloned().unwrap_or(json!({"type":"object","properties":{}})),
                         "strict": it.get("strict").cloned().unwrap_or(json!(false)),
                     },
@@ -137,9 +170,15 @@ pub fn responses_to_chat(body: &Value) -> Result<Value, String> {
             }
             Value::Object(o) if o.get("type").and_then(|v| v.as_str()) == Some("function") => {
                 if let Some(name) = o.get("name").and_then(|v| v.as_str()) {
+                    // 审查修复 #3：tool_choice 裸名命中 namespace 组内工具 →
+                    // 拼回编码名；已编码名/顶层名无命中，原样直传
+                    let resolved = choice_inner_lookup
+                        .get(name)
+                        .map(|s| s.as_str())
+                        .unwrap_or(name);
                     out.insert(
                         "tool_choice".to_string(),
-                        json!({"type": "function", "function": {"name": name}}),
+                        json!({"type": "function", "function": {"name": resolved}}),
                     );
                 }
             }
@@ -162,6 +201,23 @@ pub fn split_namespaced(name: &str) -> (String, Option<String>) {
         }
         _ => (name.to_string(), None),
     }
+}
+
+/// 判定转发 body 的 tools 中是否存在含 `__` 分隔符的 function 名。
+/// Responses 请求含 namespace 组时，展平编码名 `<ns>__<inner>` 必含 `__`；
+/// 响应侧（completion_to_responses / stream_forward_ex）据此决定是否拆分还原
+/// （issue #93 审查修复 #1）：无任何含 `__` 工具名时关闭拆分，恰好含 `__` 的
+/// 普通名不再被误拆出 namespace 字段。
+pub fn has_separated_tool_names(body: &Value) -> bool {
+    body.get("tools")
+        .and_then(|v| v.as_array())
+        .map_or(false, |tools| {
+            tools.iter().any(|t| {
+                t.pointer("/function/name")
+                    .and_then(|v| v.as_str())
+                    .map_or(false, |n| n.contains("__"))
+            })
+        })
 }
 
 /// input items → chat messages
@@ -209,9 +265,14 @@ fn convert_input_items(items: &[Value]) -> Vec<Value> {
                     });
                 let raw_name = item.get("name").and_then(|v| v.as_str()).unwrap_or("");
                 // Codex 回传历史时 function_call 带 {name, namespace} 双字段，
-                // 拼回请求侧 tools 声明用的编码名 `<ns>__<name>`（issue #93）
+                // 拼回请求侧 tools 声明用的编码名 `<ns>__<name>`（issue #93）；
+                // 审查修复 #2：name 已是编码名（以 `<ns>__` 开头，双重前缀）时
+                // 原样保留，不再拼出 `<ns>__<ns>__<name>`
                 let name = match item.get("namespace").and_then(|v| v.as_str()) {
-                    Some(ns) if !ns.is_empty() && !raw_name.is_empty() => {
+                    Some(ns) if !ns.is_empty()
+                        && !raw_name.is_empty()
+                        && !raw_name.starts_with(&format!("{}__", ns)) =>
+                    {
                         std::borrow::Cow::Owned(format!("{}__{}", ns, raw_name))
                     }
                     _ => std::borrow::Cow::Borrowed(raw_name),
@@ -404,7 +465,11 @@ fn content_text(content: Option<&Value>) -> String {
 }
 
 /// 内部 OpenAI completion → Responses 对象（非流式 /v1/responses）
-pub fn completion_to_responses(v: &Value, resp_id: &str, model: &str) -> Value {
+///
+/// `split_ns`（issue #93 审查修复 #1）：请求声明过含 `__` 的工具名
+/// （namespace 组展平编码名）时为 true，编码名拆回 {name, namespace}；
+/// false 时名字原样透传（请求无 namespace 工具，含 `__` 的普通名不误拆）。
+pub fn completion_to_responses(v: &Value, resp_id: &str, model: &str, split_ns: bool) -> Value {
     let message = v
         .pointer("/choices/0/message")
         .cloned()
@@ -436,12 +501,17 @@ pub fn completion_to_responses(v: &Value, resp_id: &str, model: &str) -> Value {
     if let Some(tcs) = message.get("tool_calls").and_then(|t| t.as_array()) {
         for (i, tc) in tcs.iter().enumerate() {
             // 编码名 `<ns>__<name>` 还原为 Codex 可路由的 {name, namespace} 双字段
-            // （issue #93：Codex router 只认双字段，namespace 拼进 name 会被判未知工具）
+            // （issue #93：Codex router 只认双字段，namespace 拼进 name 会被判未知工具）；
+            // 审查修复 #1：仅当请求声明过 namespace 组（split_ns）才拆分
             let raw = tc
                 .pointer("/function/name")
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
-            let (nm, ns) = split_namespaced(raw);
+            let (nm, ns) = if split_ns {
+                split_namespaced(raw)
+            } else {
+                (raw.to_string(), None)
+            };
             let mut item = json!({
                 "id": format!("fc_{}_{}", resp_id, i),
                 "type": "function_call",
@@ -562,7 +632,7 @@ mod tests {
                          "finish_reason": "stop"}],
             "usage": {"prompt_tokens": 7, "completion_tokens": 3},
         });
-        let resp = completion_to_responses(&v, "resp_1", "glm-5.3");
+        let resp = completion_to_responses(&v, "resp_1", "glm-5.3", false);
         assert_eq!(resp["object"], json!("response"));
         assert_eq!(resp["status"], json!("completed"));
         assert_eq!(resp["output"][0]["type"], json!("message"));
@@ -580,7 +650,7 @@ mod tests {
                                                      "function": {"name": "shell", "arguments": "{\"cmd\":\"ls\"}"}}]}}],
             "usage": {"prompt_tokens": 1, "completion_tokens": 1},
         });
-        let resp = completion_to_responses(&v, "resp_2", "m");
+        let resp = completion_to_responses(&v, "resp_2", "m", false);
         assert_eq!(resp["output"][0]["type"], json!("function_call"));
         assert_eq!(resp["output"][0]["call_id"], json!("call_x"));
         assert_eq!(resp["stop_reason"], json!("tool_use"));
@@ -593,13 +663,13 @@ mod tests {
             "choices": [{"index": 0, "finish_reason": "length",
                          "message": {"role": "assistant", "content": "truncat"}}],
         });
-        let resp = completion_to_responses(&v, "resp_3", "m");
+        let resp = completion_to_responses(&v, "resp_3", "m", false);
         assert_eq!(resp["status"], json!("incomplete"));
         assert_eq!(resp["incomplete_details"]["reason"], json!("max_output_tokens"));
         // 正常完成仍是 completed + incomplete_details=null
         let mut v2 = v.clone();
         v2["choices"][0]["finish_reason"] = json!("stop");
-        let resp2 = completion_to_responses(&v2, "resp_4", "m");
+        let resp2 = completion_to_responses(&v2, "resp_4", "m", false);
         assert_eq!(resp2["status"], json!("completed"));
         assert!(resp2["incomplete_details"].is_null());
     }
@@ -876,12 +946,142 @@ mod tests {
                                  ]}}],
             "usage": {"prompt_tokens": 1, "completion_tokens": 1},
         });
-        let resp = completion_to_responses(&v, "resp_ns", "m");
+        let resp = completion_to_responses(&v, "resp_ns", "m", true);
         let out = resp["output"].as_array().unwrap();
         assert_eq!(out[0]["type"], json!("function_call"));
         assert_eq!(out[0]["name"], json!("spawn_agent"));
         assert_eq!(out[0]["namespace"], json!("multi_agent_v1"));
         assert_eq!(out[1]["name"], json!("shell"));
         assert!(out[1].get("namespace").is_none());
+    }
+
+    /// 审查修复 #2：function_call 已带编码名 + namespace 双字段（双重前缀）时
+    /// 原样保留，不拼出 `<ns>__<ns>__<name>`
+    #[test]
+    fn namespaced_function_call_with_encoded_name_not_double_prefixed() {
+        let body = json!({
+            "model": "m",
+            "input": [
+                {"type": "function_call", "call_id": "c1",
+                 "name": "multi_agent_v1__spawn_agent", "namespace": "multi_agent_v1",
+                 "arguments": "{}"},
+            ],
+        });
+        let chat = responses_to_chat(&body).unwrap();
+        assert_eq!(
+            chat["messages"][0]["tool_calls"][0]["function"]["name"],
+            json!("multi_agent_v1__spawn_agent")
+        );
+    }
+
+    /// 审查修复 #3：tool_choice 裸名命中 namespace 组内工具 → 拼回编码名；
+    /// 顶层 function 名无命中 → 原样直传
+    #[test]
+    fn tool_choice_bare_name_resolves_to_encoded_name() {
+        let body = json!({
+            "model": "m",
+            "input": "hi",
+            "tools": [
+                {"type": "function", "name": "shell"},
+                {"type": "namespace", "name": "multi_agent_v1",
+                 "tools": [{"type": "function", "name": "spawn_agent",
+                            "parameters": {"type": "object"}}]},
+            ],
+            "tool_choice": {"type": "function", "name": "spawn_agent"},
+        });
+        let chat = responses_to_chat(&body).unwrap();
+        assert_eq!(
+            chat["tool_choice"]["function"]["name"],
+            json!("multi_agent_v1__spawn_agent")
+        );
+        let body2 = json!({
+            "model": "m",
+            "input": "hi",
+            "tools": [{"type": "function", "name": "shell"}],
+            "tool_choice": {"type": "function", "name": "shell"},
+        });
+        let chat2 = responses_to_chat(&body2).unwrap();
+        assert_eq!(chat2["tool_choice"]["function"]["name"], json!("shell"));
+    }
+
+    /// 审查修复 #4：namespace 组内编码名与顶层 function 重名 → 去重保留先声明者
+    #[test]
+    fn encoded_name_collision_keeps_first_declared() {
+        let body = json!({
+            "model": "m",
+            "input": "hi",
+            "tools": [
+                {"type": "function", "name": "mcp__node_repl__js", "description": "top"},
+                {"type": "namespace", "name": "mcp__node_repl",
+                 "tools": [{"type": "function", "name": "js", "description": "inner"}]},
+            ],
+        });
+        let chat = responses_to_chat(&body).unwrap();
+        let tools = chat["tools"].as_array().unwrap();
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0]["function"]["name"], json!("mcp__node_repl__js"));
+        assert_eq!(tools[0]["function"]["description"], json!("top"));
+    }
+
+    /// 审查修复 #5：组级 description 保留——内层为空/缺失回退组级，
+    /// 均非空则组级在前拼接
+    #[test]
+    fn namespace_group_description_is_preserved() {
+        let body = json!({
+            "model": "m",
+            "input": "hi",
+            "tools": [
+                {"type": "namespace", "name": "multi_agent_v1",
+                 "description": "Codex multi-agent toolset.",
+                 "tools": [
+                     {"type": "function", "name": "spawn_agent", "description": "Spawn a sub agent."},
+                     {"type": "function", "name": "wait_agent", "description": ""},
+                     {"type": "function", "name": "list_agents"},
+                 ]},
+            ],
+        });
+        let chat = responses_to_chat(&body).unwrap();
+        let tools = chat["tools"].as_array().unwrap();
+        assert_eq!(
+            tools[0]["function"]["description"],
+            json!("Codex multi-agent toolset.\n\nSpawn a sub agent.")
+        );
+        assert_eq!(
+            tools[1]["function"]["description"],
+            json!("Codex multi-agent toolset.")
+        );
+        assert_eq!(
+            tools[2]["function"]["description"],
+            json!("Codex multi-agent toolset.")
+        );
+    }
+
+    /// 审查修复 #1：has_separated_tool_names 判据——tools 含 `__` 编码名即
+    /// 开启拆分；纯普通名/无 tools 关闭
+    #[test]
+    fn has_separated_tool_names_detects_encoded_tools() {
+        assert!(has_separated_tool_names(&json!({
+            "tools": [{"type": "function", "function": {"name": "mcp__node_repl__js"}}]
+        })));
+        assert!(!has_separated_tool_names(&json!({
+            "tools": [{"type": "function", "function": {"name": "shell"}}]
+        })));
+        assert!(!has_separated_tool_names(&json!({"model": "m"})));
+    }
+
+    /// 审查修复 #1：split_ns=false 时编码名原样透传，不拆分出 namespace
+    #[test]
+    fn completion_without_split_flag_keeps_encoded_name() {
+        let v = json!({
+            "choices": [{"index": 0, "finish_reason": "tool_calls",
+                         "message": {"role": "assistant", "content": null,
+                                     "tool_calls": [{"id": "call_a", "type": "function",
+                                      "function": {"name": "mcp__node_repl__js", "arguments": "{}"}}]}}],
+        });
+        let resp = completion_to_responses(&v, "resp_nosplit", "m", false);
+        let out = resp["output"].as_array().unwrap();
+        assert_eq!(out[0]["type"], json!("function_call"));
+        assert_eq!(out[0]["name"], json!("mcp__node_repl__js"));
+        assert!(out[0].get("namespace").is_none());
     }
 }
