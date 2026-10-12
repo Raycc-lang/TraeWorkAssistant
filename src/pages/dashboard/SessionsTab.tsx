@@ -307,19 +307,19 @@ export default function SessionsTab({
           {/* 分页 */}
           <div className="flex items-center justify-between border-t border-slate-100 px-5 py-2.5 dark:border-zinc-800">
             <span className="text-xs text-slate-400">
-              第 {data?.page ?? 1} / {totalPages} 页 · 每页 {PAGE_SIZE} 条
+              第 {page} / {totalPages} 页 · 每页 {PAGE_SIZE} 条
             </span>
             <div className="flex gap-2">
               <button
                 className="btn-outline !px-2.5 !py-1 text-xs"
-                disabled={loading || (data?.page ?? 1) <= 1}
+                disabled={loading || page <= 1}
                 onClick={() => setPage((p) => Math.max(1, p - 1))}
               >
                 上一页
               </button>
               <button
                 className="btn-outline !px-2.5 !py-1 text-xs"
-                disabled={loading || !data || data.page >= totalPages}
+                disabled={loading || page >= totalPages}
                 onClick={() => setPage((p) => p + 1)}
               >
                 下一页

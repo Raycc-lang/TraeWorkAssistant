@@ -13,9 +13,9 @@ use super::ApiSharedState;
 /// API Key 鉴权中间件：
 /// - /healthz 跳过鉴权（审查 P2-8：响应仅 status/solo_available/wb_available 布尔，
 ///   无账号数/模型/密钥等敏感信息，供定位探活/看门狗直接探测）
-/// - /health 免鉴权为历史行为（**响应含 total_credits/active_uid/last_error/池账号数**，
-///   暴露面大于 /healthz；listen 127.0.0.1 下仅本机可达，非环回监听由强制鉴权
-///   防线兜底）——后续如收敛暴露面需同步更新探活方
+/// - /health 免鉴权仅限**环回监听**（审查修复：响应含 total_credits/active_uid/
+///   last_error/池账号数，暴露面大于 /healthz；非环回监听时不再豁免，须带 Key，
+///   与 ensure_bind_auth_policy「非环回必须有启用 Key」的启动门禁口径一致）
 /// - Key 注册表存 vault（加密），内存权威副本 + flusher 落盘（批次 E），
 ///   支持 Authorization: Bearer <key>（OpenAI 风格）或 x-api-key: <key>（Anthropic 风格）
 /// - 存在启用 Key 时必须鉴权；无任何启用 Key 时：auth_disabled=true（显式关闭鉴权）放行记 anonymous，
@@ -29,9 +29,19 @@ pub async fn bearer_auth(
     mut request: Request,
     next: Next,
 ) -> Response {
-    // 健康探针路径免鉴权（/healthz 仅布尔；/health 历史行为见上）
-    if matches!(request.uri().path(), "/health" | "/healthz") {
-        return next.run(request).await;
+    // 健康探针路径免鉴权（/healthz 仅布尔；/health 环回监听下豁免，见上）
+    match request.uri().path() {
+        "/healthz" => return next.run(request).await,
+        "/health" => {
+            // 审查二轮 Minor-3：环回判定以**实际监听 host**（state.listen_host，
+            // 启动时与 bind 同源注入）为准，不再读配置缓存——用户改 gateway host
+            // 但未重启服务时，豁免方向不再与实际暴露面错判（原 127.0.0.1→0.0.0.0
+            // 场景为 fail-open）。零 IO，直接内存读。
+            if super::server::is_loopback_host(&state.listen_host) {
+                return next.run(request).await;
+            }
+        }
+        _ => {}
     }
 
     // 请求体预检（issue #21）：Content-Length 超过网关上限时在 body 提取器之前

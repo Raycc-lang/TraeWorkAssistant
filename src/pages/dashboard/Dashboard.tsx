@@ -819,6 +819,14 @@ export default function CreditsDashboard({ platform }: { platform: 'trae' | 'bud
               该数据源不支持账号级筛选
             </span>
           )}
+          {filtersActive && tab === 'sessions' && (
+            <span
+              className="inline-flex items-center rounded-full bg-sky-100 px-2.5 py-0.5 text-[11px] font-medium text-sky-700 dark:bg-sky-900/40 dark:text-sky-300"
+              title="会话明细查询不直接跟随顶部筛选：筛选仅收窄下方「账号」下拉候选，请在下拉中选择具体账号后查询，否则结果为全部账号"
+            >
+              筛选仅收窄账号候选，请在下方下拉选择账号
+            </span>
+          )}
           <button className="btn-outline" onClick={() => void refresh(true)} disabled={loading}>
             <RefreshCw size={15} className={loading ? 'animate-spin' : ''} /> 刷新数据
           </button>

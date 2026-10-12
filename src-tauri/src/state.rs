@@ -150,6 +150,11 @@ pub struct AppState {
     /// Doubao 账号池读-改-写互斥：同 wb_pool_lock，罩住命令/巡检任务/保活线程
     /// 与 vault 启动迁移的全部写点
     pub doubao_pool_lock: Arc<Mutex<()>>,
+    /// 共享分组定义读-改-写互斥（审查修复 B1）：分组定义统一存 groups 表且保存为
+    /// 全删全写，create/update/delete 与跨池导入合并（qoder data_io）等所有
+    /// 「defs_load→内存改→defs_save」写点持同一把锁，防并发 load→save 互相覆盖
+    /// （丢新分组/复活已删分组）。获取顺序固定「池锁 → 本锁」，持本锁不得再取池锁
+    pub group_defs_lock: Arc<Mutex<()>>,
 }
 
 /// 配置文件名列表（路由到 conf/ 目录）
@@ -178,6 +183,7 @@ impl AppState {
             qoder_pool_lock: Arc::new(Mutex::new(())),
             wb_pool_lock: Arc::new(Mutex::new(())),
             doubao_pool_lock: Arc::new(Mutex::new(())),
+            group_defs_lock: Arc::new(Mutex::new(())),
         })
     }
 
@@ -400,6 +406,7 @@ mod tests {
             qoder_pool_lock: Arc::new(Mutex::new(())),
             wb_pool_lock: Arc::new(Mutex::new(())),
             doubao_pool_lock: Arc::new(Mutex::new(())),
+            group_defs_lock: Arc::new(Mutex::new(())),
         }
     }
 

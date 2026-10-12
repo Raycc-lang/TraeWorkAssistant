@@ -787,6 +787,15 @@ pub fn workbuddy_accounts_import(state: State<AppState>, payload: serde_json::Va
     // 标签绑定恢复（P2 需求③）：读入文件中的 tags，循环结束后按最终账号 id
     // 落 account_tags 表（仅本机已存在的 tag id，未知 id 忽略不自动创建）
     let tag_defs = crate::store::docs::tags_load(&crate::store::db(&state.data_dir));
+    // 幽灵分组防御（审查修复 B2）：预载共享分组定义，新增条目的 group_id 仅在
+    // 本机定义中存在时才采纳，否则回落「未分组」（对齐 qoder data_io 导入语义；
+    // 原位更新路径不覆盖 group_id，无需处理）
+    // 审查二轮 Minor-2：defs 读取持 group_defs_lock 与 shared_groups 写方互斥，
+    // 防读到合并中的撕裂快照（锁序「池锁→定义锁」合规，同 qoder data_io B1 先例）
+    let group_defs = {
+        let _defs_guard = state.group_defs_lock.lock().unwrap_or_else(|e| e.into_inner());
+        crate::store::docs::group_defs_load(&crate::store::db(&state.data_dir))
+    };
     let mut tag_bindings: Vec<(String, Vec<String>)> = Vec::new();
     let mut tags_ignored = 0usize;
     for a in accounts {
@@ -848,7 +857,14 @@ pub fn workbuddy_accounts_import(state: State<AppState>, payload: serde_json::Va
             edition_type: a.get("edition_type").and_then(|v| v.as_str()).unwrap_or_default().to_string(),
             access_token_expires_at: a.get("access_token_expires_at").and_then(|v| v.as_i64()),
             refresh_token_expires_at: a.get("refresh_token_expires_at").and_then(|v| v.as_i64()),
-            group_id: a.get("group_id").and_then(|v| v.as_str()).unwrap_or_default().to_string(),
+            group_id: {
+                let gid = a.get("group_id").and_then(|v| v.as_str()).unwrap_or_default();
+                if gid.is_empty() || group_defs.iter().any(|g| g.id == gid) {
+                    gid.to_string()
+                } else {
+                    String::new()
+                }
+            },
             note: a.get("note").and_then(|v| v.as_str()).unwrap_or_default().to_string(),
             auth_saved_at: Some(chrono::Utc::now().timestamp()),
             ..Default::default()
@@ -864,9 +880,14 @@ pub fn workbuddy_accounts_import(state: State<AppState>, payload: serde_json::Va
     }
     save_pool(&state, &pool)?;
     // 标签绑定落 account_tags 表（uid 键跨池通用；池锁仍持有——账号与标签同批恢复）
-    let store = crate::store::db(&state.data_dir);
+    // 审查二轮 Minor-2：改走 tags::account_tags_set_inner「持定义锁校验→落绑定」，
+    // 关闭 tag_defs 预载与落库间竞态窗口（池锁→定义锁锁序合规）；
+    // 期间被并发删除的标签按「未知标签忽略」语义计入 tags_ignored，不失败整批导入
     for (uid, ids) in &tag_bindings {
-        crate::store::docs::account_tags_set(&store, uid, ids)?;
+        if let Err(e) = crate::commands::tags::account_tags_set_inner(&state, uid, ids) {
+            fs_utils::app_log(&state.data_dir, &format!("workbuddy: 导入标签绑定忽略: {e}"));
+            tags_ignored += 1;
+        }
     }
     fs_utils::app_log(
         &state.data_dir,

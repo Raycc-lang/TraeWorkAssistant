@@ -305,6 +305,11 @@ pub fn accounts_import(
 ) -> Result<ImportReport, String> {
     let (accounts_arr, groups_arr) = parse_import_file(&content)?;
 
+    // 审查二轮 Major-1：group_defs_lock 罩住「分组定义合并 + membership 变更 +
+    // groups_save 整表覆写」全程（对齐 group_move B1 模板），防止导入期间的
+    // load→改→save 与 shared_groups/其余池导入的写路径交错、互相覆盖。
+    // 锁内仅做 docs 读写与 vault（无组织锁），下游 invalidate/reload 叶子级放锁后。
+    let _defs_guard = state.group_defs_lock.lock().unwrap_or_else(|e| e.into_inner());
     let mut accounts = crate::vault::load_accounts(&state);
     let mut groups: GroupsFile = crate::store::docs::groups_load(&crate::store::db(&state.data_dir));
 
@@ -356,7 +361,10 @@ pub fn accounts_import(
         tags_ignored: 0,
     };
 
-    // 标签定义循环外一次加载（校验 tag id 存在用；导入过程不修改 tags 表，语义等价）
+    // 标签定义循环外一次加载（校验 tag id 存在用；导入过程不修改 tags 表，语义等价）。
+    // 注：本读取与下方 account_tags_set 落绑定均在同一 group_defs_lock 锁段内，
+    // 等价 tags::account_tags_set_inner 的「持锁校验→落库」——不可改调 inner
+    // （std Mutex 不可重入，外层已持同锁会自死锁）。
     let tag_defs = crate::store::docs::tags_load(&crate::store::db(&state.data_dir));
     for (_, entry) in selected {
         // 兼容导出格式(userId/cloudIdeJwt/dcId)与原始格式(UserID/jwt/dc_id)
@@ -448,6 +456,7 @@ pub fn accounts_import(
     if report.added > 0 || report.groups_added > 0 {
         crate::vault::save_accounts(&state, &mut accounts)?;
         crate::store::docs::groups_save(&crate::store::db(&state.data_dir), &groups)?;
+        drop(_defs_guard);
         fs_utils::app_log(
             &state.data_dir,
             &format!(
@@ -632,9 +641,13 @@ pub fn account_add_manual(
     });
     crate::vault::save_accounts(&state, &mut accounts)?;
     if let Some(g) = group_id {
+        // 审查二轮 Major-1：持 group_defs_lock 罩住 groups 读-改-写（对齐 group_move B1），
+        // invalidate 为叶子级取锁，drop 后再调用。
+        let _defs_guard = state.group_defs_lock.lock().unwrap_or_else(|e| e.into_inner());
         let mut groups: GroupsFile = crate::store::docs::groups_load(&crate::store::db(&state.data_dir));
         groups.membership.insert(uid, g);
         crate::store::docs::groups_save(&crate::store::db(&state.data_dir), &groups)?;
+        drop(_defs_guard);
         // 成员关系变更 → Key 组/标签展开索引失效（与其余全部写路径对齐）
         crate::api_server::org_index::invalidate(&state.data_dir);
     }
@@ -657,9 +670,13 @@ pub fn account_delete(
     // 同步清理 vault 中的凭据记录（失败仅记录日志，不阻断删除）
     crate::vault::remove_secret(&state, &user_id);
 
+    // 审查二轮 Major-1：membership.remove + groups_save 整表覆写持 group_defs_lock
+    // （对齐 group_move B1），防止与其他分组写路径交错覆盖。
+    let _defs_guard = state.group_defs_lock.lock().unwrap_or_else(|e| e.into_inner());
     let mut groups: GroupsFile = crate::store::docs::groups_load(&crate::store::db(&state.data_dir));
     groups.membership.remove(&user_id);
     crate::store::docs::groups_save(&crate::store::db(&state.data_dir), &groups)?;
+    drop(_defs_guard);
 
     // 共享标签绑定清理（审查修复）：防幽灵绑定污染标签计数与 Key 组/标签展开；
     // 失败不阻断删除（数据卫生问题，落日志可重试）
@@ -816,7 +833,11 @@ pub fn group_move(
     user_id: String,
     group_id: Option<String>,
 ) -> Result<(), String> {
-    // 目标分组校验：group_id 传了非空值但共享分组已删除/不存在时直接拒绝，防幽灵分组
+    // B1: group_defs_lock 罩住 groups/group_members 读-改-写全程（groups_save 整表
+    // 覆写两表），防止与 shared_groups delete ①a/②′ 段回落行互覆复活已删定义。
+    // 下游 org_index::invalidate / reload_pools_if_running 均为叶子级取锁，锁序安全。
+    let _defs_guard = state.group_defs_lock.lock().unwrap_or_else(|e| e.into_inner());
+    // 目标分组校验（锁内复检）：group_id 传了非空值但共享分组已删除/不存在时直接拒绝，防幽灵分组
     // （对齐 workbuddy_account_move / qoder_account_move 语义）
     if let Some(gid) = group_id.as_deref().filter(|g| !g.is_empty()) {
         if !super::shared_groups::defs_load(&state).iter().any(|g| g.id == gid) {
@@ -833,6 +854,7 @@ pub fn group_move(
         }
     }
     crate::store::docs::groups_save(&crate::store::db(&state.data_dir), &groups)?;
+    drop(_defs_guard);
     crate::api_server::org_index::invalidate(&state.data_dir);
     crate::commands::api_server::reload_pools_if_running(&state, runtime.inner());
     Ok(())
@@ -2582,6 +2604,7 @@ mod tests {
             qoder_pool_lock: std::sync::Arc::new(std::sync::Mutex::new(())),
             wb_pool_lock: std::sync::Arc::new(std::sync::Mutex::new(())),
             doubao_pool_lock: std::sync::Arc::new(std::sync::Mutex::new(())),
+            group_defs_lock: std::sync::Arc::new(std::sync::Mutex::new(())),
         };
         let now = chrono::Utc::now().timestamp();
         let acc = |name: &str, uid: Option<&str>, exp: i64, rt: Option<&str>, invalid: bool| {

@@ -1081,7 +1081,16 @@ pub(crate) fn workbuddy_token_stats_impl(state: &AppState, fresh: bool) -> Value
             let back = std::time::Duration::from_secs(stale_secs.min(RESULT_TTL_SECS));
             if let Ok(mut guard) = RESULT_CACHE.lock() {
                 if let Some(at) = Instant::now().checked_sub(back) {
-                    *guard = Some((at, payload.clone()));
+                    // 审查修复：仅当内存无条目或现存条目比水合条目更旧时才覆盖——
+                    // 并发后台重扫刚写入的新鲜结果不得被这份落盘旧值回写盖掉
+                    // （否则后续 TTL 窗口内所有轮询都返回陈旧数据）。
+                    // 内存有条目且更新 ⟹ 首轮缓存检查未命中（锁中毒/瞬时空）的罕见态，
+                    // 保留内存条目，本次请求仍按原口径返回落盘值。
+                    let fresher_in_memory =
+                        guard.as_ref().map_or(false, |(at0, _)| *at0 >= at);
+                    if !fresher_in_memory {
+                        *guard = Some((at, payload.clone()));
+                    }
                 }
             }
             if stale_secs < RESULT_TTL_SECS {

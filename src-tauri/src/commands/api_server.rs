@@ -48,6 +48,10 @@ pub async fn do_start(
     // load 已将空 default_model 兜底为内置默认，无需再 trim 判空
     let gw = crate::api_server::gateway_settings::load(&state.data_dir);
     let port = gw.port;
+    // 审查二轮 Minor-3：监听 host 在此一次性读入并注入 ApiSharedState.listen_host，
+    // start_api_server 绑定与 auth.rs /health 环回豁免同用该运行值——改配置未重启
+    // 期间豁免方向不再错判（bind 与豁免不存在双源漂移）
+    let listen_host = gw.host;
 
     // 代理循环说明：ureq 2.12 未启用 proxy-from-env feature，构建 Agent 时
     // 既不读 HTTP(S)_PROXY/NO_PROXY 环境变量、也不读系统代理，Agent 未显式
@@ -291,6 +295,7 @@ pub async fn do_start(
         model_cooldowns: Mutex::new(std::collections::HashMap::new()),
         default_model,
         data_dir: state.data_dir.clone(),
+        listen_host,
         total_requests: std::sync::atomic::AtomicU64::new(0),
         inflight: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
         active_uid: Mutex::new(None),
@@ -1120,6 +1125,7 @@ pub async fn qoder_catalog_sync(state: State<'_, AppState>) -> Result<usize, Str
         qoder_pool_lock: state.inner().qoder_pool_lock.clone(),
         wb_pool_lock: state.inner().wb_pool_lock.clone(),
         doubao_pool_lock: state.inner().doubao_pool_lock.clone(),
+        group_defs_lock: state.inner().group_defs_lock.clone(),
     };
     tauri::async_runtime::spawn_blocking(move || {
         // run_task 返回 json：{ok:true, models:n} 或 {ok:true, skipped:...}
@@ -1373,10 +1379,21 @@ pub fn api_keys_org_preview(
             ));
         }
         let mut counts: HashMap<String, usize> = HashMap::new();
+        // 审查修复 A3：与 KeyConstraint::is_mixed_whitelist 等价的静态判定——
+        // org 维度已配置或任一条目带池前缀 = 混合白名单
+        let mixed = !k.allowed_groups.is_empty()
+            || !k.allowed_tags.is_empty()
+            || allowed.iter().any(|u| split_pool_tagged(u).0.is_some());
         for u in &allowed {
             let pool = match split_pool_tagged(u) {
                 (Some(p), _) => p,
-                // 裸条目防御性归属 buddy（与 pool_constraints 白名单分池语义一致）
+                // 非混合白名单：裸条目整体属于 bind_pool 所指账号体系
+                // （未绑定=buddy 旧语义，与运行时 pool_constraints 一致）
+                (None, _) if !mixed => {
+                    crate::api_server::api_keys::parse_bind_pool(&k.bind_pool)
+                        .unwrap_or("buddy")
+                }
+                // 混合白名单（部分条目带池前缀）才将裸条目防御性归 buddy
                 (None, _) => "buddy",
             };
             *counts.entry(pool.to_string()).or_default() += 1;

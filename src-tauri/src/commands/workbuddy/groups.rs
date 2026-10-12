@@ -69,6 +69,15 @@ pub fn workbuddy_account_move(
     }
     // 读-改-写互斥：罩住 load→改→save 段防旧副本整文档覆盖
     let _guard = state.wb_pool_lock.lock().unwrap_or_else(|e| e.into_inner());
+    // 目标分组复检持 group_defs_lock（审查修复，对齐 qoder_account_move）：锁外预检
+    // 与 shared_groups_delete 并发存在 TOCTOU，可挂上已删分组的幽灵 group_id；
+    // 锁序池锁→定义锁合规，配合 delete ②′ 尾部补偿重扫双向闭合
+    if let Some(gid) = group_id.as_deref().filter(|g| !g.is_empty()) {
+        let _defs_guard = state.group_defs_lock.lock().unwrap_or_else(|e| e.into_inner());
+        if !super::super::shared_groups::defs_load(&state).iter().any(|g| g.id == gid) {
+            return Err(format!("目标分组不存在: {gid}"));
+        }
+    }
     let mut pool = load_pool(&state);
     let acct = pool
         .accounts

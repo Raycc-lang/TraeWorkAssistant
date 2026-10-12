@@ -78,8 +78,10 @@ pub fn qoder_account_move(
             .ok_or_else(|| format!("账号不在池中: {user_id}"))?;
         // 目标分组校验移入锁内（2026-10-05 审查修复）：与 qoder_groups_remove 并发时
         // 锁外校验存在 TOCTOU，可把账号挂上已删除分组的幽灵 group_id（网关分组
-        // 筛选下沉默退出调度）；校验与 remove 的回落/删定义同持池锁，完全串行化
+        // 筛选下沉默退出调度）；复检持 group_defs_lock 与 remove ② 删定义串行
+        // （锁序池锁→定义锁合规），复检不过即拒绝，配合 remove ②′ 尾部补偿重扫双向闭合
         if let Some(gid) = group_id.as_deref().filter(|g| !g.is_empty()) {
+            let _defs_guard = state.group_defs_lock.lock().unwrap_or_else(|e| e.into_inner());
             if !super::super::shared_groups::defs_load(&state).iter().any(|g| g.id == gid) {
                 return Err(format!("目标分组不存在: {gid}"));
             }

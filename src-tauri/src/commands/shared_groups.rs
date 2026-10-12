@@ -124,6 +124,9 @@ pub(crate) fn list_for_pool(
 
 /// 创建共享分组（shg_ 前缀 + 全局重名校验）
 pub(crate) fn create_inner(state: &AppState, name: String, color: String) -> Result<String, String> {
+    // 审查修复 B1：defs 读改写全程持 group_defs_lock（与 update/delete/导入合并
+    // 同一互斥），防并发 load→save 互相覆盖（重名校验失效/丢新分组）
+    let _defs_guard = state.group_defs_lock.lock().unwrap_or_else(|e| e.into_inner());
     let mut defs = defs_load(state);
     let name = validate_name(&defs, &name, None)?;
     let rand = uuid::Uuid::new_v4().simple().to_string();
@@ -146,6 +149,8 @@ pub(crate) fn update_inner(
     color: Option<String>,
     order: Option<i32>,
 ) -> Result<(), String> {
+    // 审查修复 B1：同 create_inner，读改写全程持 group_defs_lock 防互相覆盖
+    let _defs_guard = state.group_defs_lock.lock().unwrap_or_else(|e| e.into_inner());
     let mut defs = defs_load(state);
     // 先校验后可变借用（规避 iter_mut 与校验读借用冲突，对齐 qoder 实现）
     let new_name = match name.as_deref() {
@@ -176,9 +181,50 @@ pub fn shared_groups_update(
     update_inner(&state, id, name, color, order)
 }
 
+/// WB 池成员回落（审查修复：抽函数供 ① 段与尾部补偿重扫复用）。
+/// 读-改-写罩池锁防旧副本整文档覆盖（Value 语义保留未知字段），返回是否有改动。
+fn fallback_wb(state: &AppState, id: &str) -> Result<bool, String> {
+    let store = crate::store::db(&state.data_dir);
+    let _guard = state.wb_pool_lock.lock().unwrap_or_else(|e| e.into_inner());
+    let mut pool = crate::store::docs::wb_pool_load(&store);
+    let mut changed = false;
+    if let Some(arr) = pool.get_mut("accounts").and_then(serde_json::Value::as_array_mut) {
+        for a in arr.iter_mut() {
+            if a.get("group_id").and_then(|v| v.as_str()) == Some(id) {
+                a["group_id"] = serde_json::json!("");
+                changed = true;
+            }
+        }
+    }
+    if changed {
+        crate::store::docs::wb_pool_save(&store, &pool)?;
+    }
+    Ok(changed)
+}
+
+/// Qoder 池成员回落（同 fallback_wb；qoder::common 为私有模块，此处与 WB 侧同构实现）
+fn fallback_qoder(state: &AppState, id: &str) -> Result<bool, String> {
+    let store = crate::store::db(&state.data_dir);
+    let _guard = state.qoder_pool_lock.lock().unwrap_or_else(|e| e.into_inner());
+    let mut pool = crate::store::docs::qoder_pool_load(&store);
+    let mut changed = false;
+    if let Some(arr) = pool.get_mut("accounts").and_then(serde_json::Value::as_array_mut) {
+        for a in arr.iter_mut() {
+            if a.get("group_id").and_then(|v| v.as_str()) == Some(id) {
+                a["group_id"] = serde_json::json!("");
+                changed = true;
+            }
+        }
+    }
+    if changed {
+        crate::store::docs::qoder_pool_save(&store, &pool)?;
+    }
+    Ok(changed)
+}
+
 /// 删除共享分组（顺序敏感，见模块注释）：
-/// ① 三池成员回落「未分组」→ ② 删定义 → ③ 清 api_pool / api_keys.allowed_groups
-/// 引用 → ④ 有成员或引用变更时热重载 + org 索引失效。
+/// ① 三池成员回落「未分组」→ ② 删定义 → ②′ 尾部补偿重扫 → ③ 清 api_pool /
+/// api_keys.allowed_groups 引用 → ④ 有成员或引用变更时热重载 + org 索引失效。
 pub(crate) fn delete_inner(
     state: &AppState,
     runtime: &std::sync::Mutex<Option<crate::commands::api_server::ApiServerRuntime>>,
@@ -191,44 +237,26 @@ pub(crate) fn delete_inner(
         Ok(())
     })?;
     // ①b Buddy 成员回落（读-改-写互斥：罩住池段防旧副本整文档覆盖）
+    let mut member_changed = fallback_wb(state, id)?;
+    // ①c Qoder 成员回落
+    member_changed |= fallback_qoder(state, id)?;
+    // ② 删定义（审查修复 B1：defs 读改写段持 group_defs_lock，与 create/update/
+    // 导入合并互斥——此前锁外裸奔，并发 load 旧快照保存会复活已删分组）
     {
-        let _guard = state.wb_pool_lock.lock().unwrap_or_else(|e| e.into_inner());
-        let mut pool = crate::store::docs::wb_pool_load(&store);
-        let mut changed = false;
-        if let Some(arr) = pool.get_mut("accounts").and_then(serde_json::Value::as_array_mut) {
-            for a in arr.iter_mut() {
-                if a.get("group_id").and_then(|v| v.as_str()) == Some(id) {
-                    a["group_id"] = serde_json::json!("");
-                    changed = true;
-                }
-            }
-        }
-        if changed {
-            crate::store::docs::wb_pool_save(&store, &pool)?;
-        }
+        let _defs_guard = state.group_defs_lock.lock().unwrap_or_else(|e| e.into_inner());
+        let mut defs = defs_load(state);
+        defs.retain(|g| g.id != id);
+        defs_save(state, &defs)?;
     }
-    // ①c Qoder 成员回落（Value 语义直改保留未知字段，持 qoder_pool_lock——
-    // qoder::common 为私有模块，此处与 WB 侧同构实现）
-    {
-        let _guard = state.qoder_pool_lock.lock().unwrap_or_else(|e| e.into_inner());
-        let mut pool = crate::store::docs::qoder_pool_load(&store);
-        let mut changed = false;
-        if let Some(arr) = pool.get_mut("accounts").and_then(serde_json::Value::as_array_mut) {
-            for a in arr.iter_mut() {
-                if a.get("group_id").and_then(|v| v.as_str()) == Some(id) {
-                    a["group_id"] = serde_json::json!("");
-                    changed = true;
-                }
-            }
-        }
-        if changed {
-            crate::store::docs::qoder_pool_save(&store, &pool)?;
-        }
-    }
-    // ② 删定义
-    let mut defs = defs_load(state);
-    defs.retain(|g| g.id != id);
-    defs_save(state, &defs)?;
+    // ②′ 尾部补偿重扫（审查修复）：① 与 ② 分两段释放锁，并发 account_move/group_move
+    // 若恰好插在其间（复检时定义尚未删除）会把账号挂上已删分组；定义删除后再扫一遍
+    // 回落残留挂靠。配合 move 侧「持定义锁复检」，幽灵分组挂靠双向闭合。
+    store.with_conn(|c| {
+        c.execute("DELETE FROM group_members WHERE group_id = ?1", [id])?;
+        Ok(())
+    })?;
+    member_changed |= fallback_wb(state, id)?;
+    member_changed |= fallback_qoder(state, id)?;
     // ③ 清引用：api_pool 三池分组筛选 + api_keys.allowed_groups
     let mut refs_changed = false;
     let mut pool_file = crate::commands::api_server::load_pool_file(&state.data_dir);
@@ -257,7 +285,7 @@ pub(crate) fn delete_inner(
         }
         changed
     });    // ④ 联动：成员回落 / 池筛选变更都影响调度池；Key 约束展开索引失效
-    if refs_changed {
+    if refs_changed || member_changed {
         crate::commands::api_server::reload_pools_if_running(state, runtime);
     }
     crate::api_server::org_index::invalidate(&state.data_dir);
@@ -288,6 +316,7 @@ mod tests {
             qoder_pool_lock: std::sync::Arc::new(std::sync::Mutex::new(())),
             wb_pool_lock: std::sync::Arc::new(std::sync::Mutex::new(())),
             doubao_pool_lock: std::sync::Arc::new(std::sync::Mutex::new(())),
+            group_defs_lock: std::sync::Arc::new(std::sync::Mutex::new(())),
         };
         (d, state)
     }

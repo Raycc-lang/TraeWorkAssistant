@@ -458,23 +458,30 @@ fn qoder_accounts_import_impl(
     // P0 需求①：分组定义统一读共享 groups 表；导出载荷携带的 groups（旧版无此
     // 字段则跳过）按 id 幂等合并进共享定义——本地已有同 id 分组保留本地定义
     //（用户可能已改名），仅补缺失。持池锁执行防读改写竞争。
-    let mut defs: Vec<crate::models::Group> = crate::store::docs::group_defs_load(&store);
-    if let Some(groups) = payload.get("groups").and_then(Value::as_array) {
-        let mut defs_changed = false;
-        for g in groups {
-            let Ok(def) = serde_json::from_value::<crate::models::Group>(g.clone()) else {
-                continue;
-            };
-            if def.id.is_empty() || defs.iter().any(|x| x.id == def.id) {
-                continue;
+    // 审查修复 B1：defs 读改写段加持 group_defs_lock（与 shared_groups
+    // create/update/delete 同一互斥——此前仅持池锁，与分组命令无共同互斥，
+    // 并发下导入合并会覆盖删除、或被旧快照覆盖丢新分组）。锁序固定「池锁→本锁」
+    let defs: Vec<crate::models::Group> = {
+        let _defs_guard = state.group_defs_lock.lock().unwrap_or_else(|e| e.into_inner());
+        let mut defs: Vec<crate::models::Group> = crate::store::docs::group_defs_load(&store);
+        if let Some(groups) = payload.get("groups").and_then(Value::as_array) {
+            let mut defs_changed = false;
+            for g in groups {
+                let Ok(def) = serde_json::from_value::<crate::models::Group>(g.clone()) else {
+                    continue;
+                };
+                if def.id.is_empty() || defs.iter().any(|x| x.id == def.id) {
+                    continue;
+                }
+                defs.push(def);
+                defs_changed = true;
             }
-            defs.push(def);
-            defs_changed = true;
+            if defs_changed {
+                crate::store::docs::group_defs_save(&store, &defs)?;
+            }
         }
-        if defs_changed {
-            crate::store::docs::group_defs_save(&store, &defs)?;
-        }
-    }
+        defs
+    };
     let valid_group_ids: std::collections::HashSet<String> =
         defs.iter().map(|g| g.id.clone()).collect();
     // 凭证写入先收集、落池成功后再执行（审查修复）：原实现循环内先落凭证
@@ -522,8 +529,17 @@ fn qoder_accounts_import_impl(
     }
     save_pool(state, &pool)?;
     // 标签绑定落 account_tags 表（uid 键跨池通用）
+    // 审查二轮 Minor-2：改走 tags::account_tags_set_inner「持定义锁校验→落绑定」，
+    // 关闭 tag_defs 预载与落库间竞态窗口（池锁→定义锁锁序合规）；
+    // 期间被并发删除的标签按「未知标签忽略」语义计入 tags_ignored，不失败整批导入
     for (uid, ids) in &tag_bindings {
-        crate::store::docs::account_tags_set(&store, uid, ids)?;
+        if let Err(e) = crate::commands::tags::account_tags_set_inner(state, uid, ids) {
+            fs_utils::app_log(
+                &state.data_dir,
+                &format!("qoder: 导入标签绑定忽略: {e}"),
+            );
+            tags_ignored += 1;
+        }
     }
     crate::api_server::org_index::invalidate(&state.data_dir);
     for (final_id, creds) in cred_writes {
@@ -543,7 +559,7 @@ fn qoder_accounts_import_impl(
     fs_utils::app_log(
         &state.data_dir,
         &format!(
-            "qoder: 账号池导入 新增 {added} / 更新 {updated} / 带凭证 {with_cred} / 拒绝 {}{}",
+            "qoder: 账号池导入 新增 {added} / 更新 {updated} / 带凭证 {with_cred} / 拒绝 {} / 标签忽略 {tags_ignored}{}",
             rejected.len(),
             if plaintext_credentials { " / 明文凭证文件（迁移提示）" } else { "" },
         ),

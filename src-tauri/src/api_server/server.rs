@@ -86,7 +86,10 @@ pub async fn start_api_server(
     port: u16,
     state: Arc<ApiSharedState>,
 ) -> Result<ApiServerHandle, String> {
-    let host = super::gateway_settings::load(&state.data_dir).host;
+    // 审查二轮 Minor-3：绑定地址取 state.listen_host（do_start 一次性读入的运行值），
+    // 不再重复 load gateway_settings——与 auth.rs /health 环回豁免同一数据源，
+    // 消除「配置值 vs 实际监听值」双源漂移窗口
+    let host = state.listen_host.clone();
     ensure_bind_auth_policy(&host, &super::api_keys::load(&state.data_dir))?;
     let addr = format!("{host}:{port}");
     let listener = TcpListener::bind(&addr).await.map_err(|e| {

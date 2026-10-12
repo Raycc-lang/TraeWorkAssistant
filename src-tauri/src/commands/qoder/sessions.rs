@@ -31,11 +31,13 @@ pub fn qoder_sessions_query(
     let model_filter = model.as_deref().map(str::trim).filter(|m| !m.is_empty());
     let uid_filter = user_id.as_deref().map(str::trim).filter(|u| !u.is_empty());
 
-    // 账号展示名以账号池为准（uid → nickname）；拷入闭包所有权（with_conn 要求 'static 闭包）
+    // 账号展示名以账号池为准（流水 uid → nickname）。注意：网关流水的 uid 列写入的是
+    // 池记录 id（"qd-"+hash，见 api_server 同步侧 `uid: a.id`），而非全家桶 uid——
+    // 映射键必须用 a.id，用 a.uid 会错位（PAT 导入账号 uid 还可空），昵称恒缺失。
     let name_of: std::collections::HashMap<String, String> = super::common::load_pool(&state)
         .into_iter()
-        .filter(|a| !a.uid.is_empty())
-        .map(|a| (a.uid.clone(), a.nickname.clone()))
+        .filter(|a| !a.id.is_empty())
+        .map(|a| (a.id.clone(), a.nickname.clone()))
         .collect();
 
     let raw = crate::store::db(&state.data_dir).with_conn(move |c| {
@@ -97,7 +99,9 @@ pub fn qoder_sessions_query(
     });
     let total = rows.len() as u64;
     let credits_total = rows.iter().map(|r| r.1.credits).sum();
-    let begin = ((page - 1) * page_size) as usize;
+    // 审查修复 C2：u32 乘法在 page/page_size 极大时溢出（debug panic / release 回绕
+    // 成小值导致分页错乱）；改 u64 饱和后再转 usize（32 位平台也安全）
+    let begin = ((page as u64 - 1) * page_size as u64).min(usize::MAX as u64) as usize;
     let rows: Vec<UsageSessionView> = rows
         .into_iter()
         .skip(begin)

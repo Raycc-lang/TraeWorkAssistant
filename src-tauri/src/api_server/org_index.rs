@@ -21,7 +21,7 @@ pub struct OrgIndex {
     pub account_tags: HashMap<String, Vec<String>>,
 }
 
-fn load_index(data_dir: &Path) -> OrgIndex {
+fn load_index(data_dir: &Path) -> Option<OrgIndex> {
     let store = crate::store::db(data_dir);
     // 单次 with_conn 读齐全部源表：同一把连接锁持有期内完成，杜绝
     // 「分组读迁移前、标签读迁移后」的撕裂快照（此前分 4 次加锁，写路径
@@ -31,7 +31,7 @@ fn load_index(data_dir: &Path) -> OrgIndex {
         Vec<(String, String)>,
         Vec<(String, String)>,
         Vec<(String, String)>,
-    ) = store
+    ) = match store
         .with_conn(|c| {
             let read_pairs = |sql: &str| -> rusqlite::Result<Vec<(String, String)>> {
                 let mut stmt = c.prepare(sql)?;
@@ -47,8 +47,16 @@ fn load_index(data_dir: &Path) -> OrgIndex {
             let qoder = read_pairs("SELECT pk, data FROM qoder_accounts")?;
             let tags = read_pairs("SELECT pk, data FROM account_tags")?;
             Ok((members, [wb, qoder].concat(), tags))
-        })
-        .unwrap_or_default();
+        }) {
+        Ok(v) => v,
+        // 审查修复 A1：读库失败不得静默降级为空索引——空索引经缓存后组/标签
+        // 约束 Key 在窗口内全量拒绝（no_healthy_account）且全链路无日志。
+        // 记日志并返回 None：get() 经 get_or_load_fallible 保留旧快照不缓存空值
+        Err(e) => {
+            eprintln!("[org_index] 读库失败，本次跳过刷新（保留旧快照）: {e}");
+            return None;
+        }
+    };
     let mut idx = OrgIndex::default();
     // Trae 成员：group_members 表
     for (uid, gid) in member_rows {
@@ -77,12 +85,15 @@ fn load_index(data_dir: &Path) -> OrgIndex {
             Some((uid, ids))
         })
         .collect();
-    idx
+    Some(idx)
 }
 
-/// 取索引（缓存优先；写路径 invalidate + TTL 5s 兜底）
+/// 取索引（缓存优先；写路径 invalidate + TTL 5s 兜底）。
+/// 审查修复 A1：加载失败时保留旧快照（get_or_load_fallible），首次加载即失败
+/// （无旧快照，如启动库损坏）才回退空索引——已由 load_index 记日志。
 pub fn get(data_dir: &Path) -> OrgIndex {
-    super::config_cache::get_or_load(data_dir, "org_index", || load_index(data_dir))
+    super::config_cache::get_or_load_fallible(data_dir, "org_index", || load_index(data_dir))
+        .unwrap_or_default()
 }
 
 /// 写路径显式失效（分组定义/成员/标签任何变更后调用，改动即时生效）

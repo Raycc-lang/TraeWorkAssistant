@@ -56,6 +56,48 @@ where
     v
 }
 
+/// 取缓存或加载（可失败版，审查修复 A1）：`load` 返回 None = 本次加载失败
+/// （如读库错误）——不回填缓存、保留旧快照兜底返回（陈旧但正确优于空数据：
+/// 空索引会让组/标签约束 Key 在 TTL 窗口内全量拒绝）；首次加载即失败
+/// （无旧快照）返回 None 由调用方兜底。成功路径与 get_or_load 完全一致。
+pub fn get_or_load_fallible<T>(
+    data_dir: &Path,
+    key: &'static str,
+    load: impl FnOnce() -> Option<T>,
+) -> Option<T>
+where
+    T: serde::Serialize + serde::de::DeserializeOwned,
+{
+    let cache_key = (data_dir.to_path_buf(), key);
+    let mut stale: Option<std::sync::Arc<serde_json::Value>> = None;
+    {
+        let reg = registry().lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(e) = reg.get(&cache_key) {
+            if e.at.elapsed() < TTL {
+                if let Ok(v) = serde_json::from_value::<T>((*e.val).clone()) {
+                    return Some(v);
+                }
+            }
+            // TTL 已过期（或类型不符）：留存旧值，加载失败时兜底返回
+            stale = Some(e.val.clone());
+        }
+    }
+    match load() {
+        Some(v) => {
+            if let Ok(json) = serde_json::to_value(&v) {
+                let mut reg = registry().lock().unwrap_or_else(|e| e.into_inner());
+                reg.insert(
+                    cache_key,
+                    Entry { val: std::sync::Arc::new(json), at: Instant::now() },
+                );
+            }
+            Some(v)
+        }
+        // 加载失败：不污染缓存（下个请求自动重试加载），有过期旧快照则回退
+        None => stale.and_then(|v| serde_json::from_value::<T>((*v).clone()).ok()),
+    }
+}
+
 /// 写路径显式失效（保存函数写库后调用，配置改动即时生效）
 pub fn invalidate(data_dir: &Path, key: &'static str) {
     let mut reg = registry().lock().unwrap_or_else(|e| e.into_inner());

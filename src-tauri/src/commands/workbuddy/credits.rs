@@ -1253,7 +1253,9 @@ pub fn workbuddy_sessions_query(
     rows.sort_by(|a, b| b.ts.cmp(&a.ts).then_with(|| b.session_id.cmp(&a.session_id)));
     let total = rows.len() as u64;
     let credits_total = rows.iter().map(|r| r.credits).sum();
-    let begin = ((page - 1) * page_size) as usize;
+    // 审查修复 C2：u32 乘法在 page/page_size 极大时溢出（debug panic / release 回绕
+    // 成小值导致分页错乱）；改 u64 饱和后再转 usize（32 位平台也安全）
+    let begin = ((page as u64 - 1) * page_size as u64).min(usize::MAX as u64) as usize;
     let rows: Vec<UsageSessionView> = rows
         .into_iter()
         .skip(begin)

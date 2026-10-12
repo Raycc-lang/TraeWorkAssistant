@@ -1517,10 +1517,14 @@ pub fn oauth_login(
     // 所选分组统一在账号落库后应用（新增/合并路径对齐）：用户在登录界面明确选择分组时
     // 同步写入 membership（合并路径此前静默丢弃所选分组）；未选分组时保持原分组不变。
     if let Some(g) = group_id {
+        // 审查二轮 Major-1：membership.insert + groups_save 整表覆写持 group_defs_lock
+        // （对齐 group_move B1），防止与其他分组写路径交错覆盖；invalidate 叶子级放锁后。
+        let _defs_guard = state.group_defs_lock.lock().unwrap_or_else(|e| e.into_inner());
         let mut groups: crate::models::GroupsFile =
             crate::store::docs::groups_load(&crate::store::db(&state.data_dir));
         groups.membership.insert(user_id.clone(), g);
         crate::store::docs::groups_save(&crate::store::db(&state.data_dir), &groups)?;
+        drop(_defs_guard);
         // 成员关系变更 → Key 组/标签展开索引失效（与其余全部写路径对齐，
         // 不依赖 TTL 5s 兜底）
         crate::api_server::org_index::invalidate(&state.data_dir);

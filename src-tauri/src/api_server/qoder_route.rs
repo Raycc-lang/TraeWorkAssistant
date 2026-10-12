@@ -129,23 +129,6 @@ fn sleep_interruptible(
     true
 }
 
-/// resolve 命中条目是否 Global 专属（审查修复：v1 恒 CN 网关执行，Global
-/// 专属条目调度 resolve 双区兜底判活、执行必死，需在执行入口明确拒绝）。
-///
-/// qoder_upstream 未暴露分区分目录/兜底表的查询接口（他人文件不可改），判定
-/// 基于两路**确定性证据**，不依赖旧实现「resolve(Global) 结果与命中条目 Value
-/// 全等 ⟹ 两区同名条目声明必有差异」的脆弱值假设（同名同值场景会误判）：
-/// ① list() 并集按 id 去重、Global 侧先注册：标注 "cn" ⟺ Global 侧（远程目录
-///    + 静态兜底表）完全无此 id → CN resolve 的命中必来自 CN 侧 → 必非专属；
-/// ② 标注 "global" 时借 resolve 双区优先序差异取第二证据：resolve(Global) 序
-///    = [Global 目录, CN 目录, CN 兜底, Global 兜底]，resolve(Cn) 序 = [CN 目录,
-///    Global 目录, Global 兜底, CN 兜底]。两路命中**不同**条目时可逐源证明
-///    CN 侧必有此 id（CN 远程目录或 CN 兜底表至少其一声明）→ 必非专属；
-/// ③ 两路命中全等：既有 pub 接口无法区分「仅 Global 独持」与「两区同名同值」
-///    （后者仅可能来自远程目录动态刷新；静态兜底表两区同名条目倍率/档位全
-///    不同）。按 v1 恒 CN 执行的 fail-closed 策略判 Global 专属：Global 侧
-///    声明了此 id 而 CN 侧无任何确定性可得证据，放行只会把请求送进 CN 网关
-///    收上游诡异报错，拒绝则走明确的 404 提示通道。
 /// 从上游 usage JSON 提取 Qoder 积分测量（issue #82 T2）：
 /// 返回 (credits, original_credits)。credits 复数字段优先——单数 `credit` 是旧版
 /// 字段，读它恒为 0（qoder2api-hub issue #22 命门）；两字段均非负时与 Python
@@ -187,19 +170,12 @@ fn session_preview(peek: &Value) -> String {
     text.chars().take(200).collect()
 }
 
-/// issue #82 问题5：记账会话上下文。成功路径从上游信封（prepare_qoder_body 产物）
-/// 顶层反解析 request_id/session_id；信封缺失或解析失败退化为 uuid 占位
-/// （request_id 仅幂等用途，占位不影响正确性）。
-fn session_ctx(peek: &Value, converted: Option<&[u8]>) -> super::usage::QoderSessionCtx {
-    match converted.and_then(extract_envelope_ids) {
-        Some((rid, sid)) => super::usage::QoderSessionCtx {
-            request_id: rid,
-            session_id: sid,
-            ts: chrono::Local::now().timestamp(),
-            preview: session_preview(peek),
-        },
-        None => super::usage::QoderSessionCtx::placeholder(session_preview(peek)),
-    }
+/// issue #82 问题5：记账会话上下文（审查修复 A2：仅失败路径使用，恒为 uuid 占位）。
+/// 成功路径的 request_id/session_id 由 session_ctx_from_ids 从预解析信封 id 提供；
+/// 本函数不再接收 converted 参数——历史 converted 分支为死代码（两处调用均传
+/// None，且失败路径本无信封可解析），删除以消除假象。
+fn session_ctx(peek: &Value) -> super::usage::QoderSessionCtx {
+    super::usage::QoderSessionCtx::placeholder(session_preview(peek))
 }
 
 /// issue #82 审查修复 K：信封顶层 request_id/session_id 提取。信封含完整对话历史
@@ -233,6 +209,23 @@ fn session_ctx_from_ids(
     }
 }
 
+/// resolve 命中条目是否 Global 专属（审查修复：v1 恒 CN 网关执行，Global
+/// 专属条目调度 resolve 双区兜底判活、执行必死，需在执行入口明确拒绝）。
+///
+/// qoder_upstream 未暴露分区分目录/兜底表的查询接口（他人文件不可改），判定
+/// 基于两路**确定性证据**，不依赖旧实现「resolve(Global) 结果与命中条目 Value
+/// 全等 ⟹ 两区同名条目声明必有差异」的脆弱值假设（同名同值场景会误判）：
+/// ① list() 并集按 id 去重、Global 侧先注册：标注 "cn" ⟺ Global 侧（远程目录
+///    + 静态兜底表）完全无此 id → CN resolve 的命中必来自 CN 侧 → 必非专属；
+/// ② 标注 "global" 时借 resolve 双区优先序差异取第二证据：resolve(Global) 序
+///    = [Global 目录, CN 目录, CN 兜底, Global 兜底]，resolve(Cn) 序 = [CN 目录,
+///    Global 目录, Global 兜底, CN 兜底]。两路命中**不同**条目时可逐源证明
+///    CN 侧必有此 id（CN 远程目录或 CN 兜底表至少其一声明）→ 必非专属；
+/// ③ 两路命中全等：既有 pub 接口无法区分「仅 Global 独持」与「两区同名同值」
+///    （后者仅可能来自远程目录动态刷新；静态兜底表两区同名条目倍率/档位全
+///    不同）。按 v1 恒 CN 执行的 fail-closed 策略判 Global 专属：Global 侧
+///    声明了此 id 而 CN 侧无任何确定性可得证据，放行只会把请求送进 CN 网关
+///    收上游诡异报错，拒绝则走明确的 404 提示通道。
 fn entry_is_global_only(model: &str, entry: &Value) -> bool {
     let id = entry.get("id").and_then(Value::as_str).unwrap_or("");
     if id.is_empty() {
@@ -601,7 +594,7 @@ fn run_qoder_stream(
                 }
                 None => {
                     let duration_ms = start_ts.elapsed().as_millis() as u64;
-                    state.record_usage_qoder(model, "none", key_id, false, true, duration_ms, 0, 0, None, None, None, &session_ctx(&peek, None));
+                    state.record_usage_qoder(model, "none", key_id, false, true, duration_ms, 0, 0, None, None, None, &session_ctx(&peek));
                     // 审查 P2：轮换耗尽收尾对齐 routes.rs（issue #57 可观测）——
                     // 空完成主导 → 明示渠道指纹拦截语义（账号/模型无关，提示打开
                     // Qoder 客户端重建设备信任），否则维持无健康账号文案；
@@ -1119,7 +1112,7 @@ pub async fn qoder_aggregate_chat(
                             None,
                             None,
                             None,
-                            &session_ctx(&peek, None),
+                            &session_ctx(&peek),
                         );
                         // 审查 P2：轮换耗尽收尾对齐 routes.rs——空完成主导 → 指纹拦截语义
                         let (healthy_total, _) = state.qoder_pool.selectable_stats_in(None);

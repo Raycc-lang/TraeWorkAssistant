@@ -84,7 +84,12 @@ enum ImportStatus {
 }
 
 /// 迁移入口。返回 None = 无需迁移（库已是最新）；Some = 摘要（调用方写 app_log）。
-pub fn migrate_on_startup(data_dir: &Path) -> Option<String> {
+/// `group_defs_lock`：与 AppState 同一把共享分组定义锁（审查修复 B1/P4）——
+/// v3→v4 统一分组对 groups 表整表全删全写，须与并发分组写点互斥。
+pub fn migrate_on_startup(
+    data_dir: &Path,
+    group_defs_lock: &std::sync::Arc<std::sync::Mutex<()>>,
+) -> Option<String> {
     let store = db(data_dir);
     let current = store
         .with_conn(|c| Ok(schema::user_version(c)))
@@ -206,7 +211,7 @@ pub fn migrate_on_startup(data_dir: &Path) -> Option<String> {
     if failed == 0 {
         // v3→v4 增量：三套独立分组定义统一为共享分组（shg_ 新 ID + id_map 全量重定向）；
         // kv 标记幂等，全新安装空转
-        match migrate_unified_groups(&store) {
+        match migrate_unified_groups(&store, group_defs_lock) {
             Ok(n) if n > 0 => {
                 items.push(json!({"file": "<unified_groups>", "result": "imported", "detail": format!("统一分组 {n} 条")}));
                 imported += 1;
@@ -338,6 +343,10 @@ fn import_device_map(store: &Store, path: &Path) -> ImportStatus {
     })
 }
 
+/// 遗留 groups.json → SQLite 整表导入。
+/// 审查二轮观察项：本函数的 `groups_save` 不持 `group_defs_lock`——迁移仅在应用
+/// 启动期（setup 阶段、单线程一次性执行）运行，早于任何分组写命令与 API 服务
+/// 请求路径，不存在并发覆写窗口；若未来迁移改为运行期触发，须补持该锁。
 fn import_groups(store: &Store, path: &Path) -> ImportStatus {
     match std::fs::read_to_string(path) {
         Ok(text) => match serde_json::from_str::<crate::models::GroupsFile>(&text) {
@@ -520,11 +529,19 @@ fn import_wb_credits_history_value(store: &Store, v: &Value) -> Result<(), Strin
 /// 容错（审查修复）：中途失败重试时，① 快照不覆盖（只写一次保原始备份）；
 /// ② 复用 groups 表已残留的 shg_ 定义 id，重定向引用不悬空。
 /// 返回统一后的分组条数（0 = 幂等跳过）。
-fn migrate_unified_groups(store: &Store) -> Result<usize, String> {
+fn migrate_unified_groups(
+    store: &Store,
+    group_defs_lock: &std::sync::Arc<std::sync::Mutex<()>>,
+) -> Result<usize, String> {
     use crate::models::Group;
     if store.kv_get::<bool>("unified_groups_migrated") {
         return Ok(0);
     }
+    // B1: 与全部共享分组写点（shared_groups/tags/三池 account_move）互斥——
+    // 本函数读三处 defs→重定向→groups 表整表全删全写，锁外裸奔会与并发
+    // move/delete 互覆（复活已删定义/丢失新落库的成员行）。持锁期间仅触
+    // kv/SQL（叶子级），不取池锁，不违反「池锁 → 定义锁」锁序约定。
+    let _defs_guard = group_defs_lock.lock().unwrap_or_else(|e| e.into_inner());
     // 1. 读三处 defs + Trae membership，整体快照备份（可回滚）。
     //    快照只写一次（审查修复）：中途失败重试时若覆盖快照，备份会被
     //    「已部分重定向」的状态污染，恰在回滚最需要时失效。
@@ -759,6 +776,11 @@ mod tests {
         std::fs::write(path, content).unwrap();
     }
 
+    /// 测试用共享分组定义锁（与 AppState.group_defs_lock 同类型）
+    fn test_defs_lock() -> std::sync::Arc<std::sync::Mutex<()>> {
+        std::sync::Arc::new(std::sync::Mutex::new(()))
+    }
+
     #[test]
     fn migrate_imports_moves_and_is_idempotent() {
         let dir = tmp_dir("full");
@@ -779,7 +801,7 @@ mod tests {
         // 遗留根路径兜底
         write(&dir.join("workbuddy_token_store.json"), r#"{"version":1,"tokens":{"a2":{"access_token":"t2"}}}"#);
 
-        let summary = migrate_on_startup(&dir).expect("首次应触发迁移");
+        let summary = migrate_on_startup(&dir, &test_defs_lock()).expect("首次应触发迁移");
         assert!(summary.contains("导入"), "摘要应含导入数: {summary}");
         assert!(summary.contains("损坏"), "摘要应含损坏计数: {summary}");
         assert!(!summary.contains("失败 1"), "不应有失败项: {summary}");
@@ -814,17 +836,17 @@ mod tests {
         assert!(tokens["tokens"].get("a2").is_none());
 
         // 幂等：二次迁移不执行
-        assert!(migrate_on_startup(&dir).is_none());
+        assert!(migrate_on_startup(&dir, &test_defs_lock()).is_none());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn empty_dir_first_boot_creates_empty_db() {
         let dir = tmp_dir("empty");
-        let summary = migrate_on_startup(&dir).expect("空目录也应完成建库");
+        let summary = migrate_on_startup(&dir, &test_defs_lock()).expect("空目录也应完成建库");
         assert!(summary.contains("导入 0"));
         assert!(dir.join("data/aiwork.sqlite").exists());
-        assert!(migrate_on_startup(&dir).is_none());
+        assert!(migrate_on_startup(&dir, &test_defs_lock()).is_none());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -840,7 +862,7 @@ mod tests {
                 {"name":"b","UserID":"u1","jwt":"j2"},
                 {"name":"c","jwt":""}]}"#,
         );
-        let summary = migrate_on_startup(&dir).expect("迁移应完成");
+        let summary = migrate_on_startup(&dir, &test_defs_lock()).expect("迁移应完成");
         assert!(!summary.contains("失败 1"), "重复 uid 不得计为失败: {summary}");
         let store = db(&dir);
         let acc = docs::accounts_load(&store);
@@ -865,7 +887,7 @@ mod tests {
         );
 
         // ① store 迁移（main.rs 顺序：先于 vault）
-        migrate_on_startup(&dir);
+        migrate_on_startup(&dir, &test_defs_lock());
         // 入库后此刻仍为明文（待 vault 收敛）
         let store = db(&dir);
         let mid = super::super::docs::accounts_load(&store);
@@ -878,6 +900,7 @@ mod tests {
             qoder_pool_lock: std::sync::Arc::new(std::sync::Mutex::new(())),
             wb_pool_lock: std::sync::Arc::new(std::sync::Mutex::new(())),
             doubao_pool_lock: std::sync::Arc::new(std::sync::Mutex::new(())),
+            group_defs_lock: std::sync::Arc::new(std::sync::Mutex::new(())),
         };
         crate::vault::migrate_on_startup(&state);
 
@@ -944,7 +967,7 @@ mod tests {
             .unwrap();
 
         // 执行迁移
-        let n = migrate_unified_groups(&store).unwrap();
+        let n = migrate_unified_groups(&store, &test_defs_lock()).unwrap();
         assert_eq!(n, 2, "同名「主号」合并 → 主号 + 备用 两条");
 
         // defs 全部 shg_ 前缀；私有 kv 清除
@@ -989,7 +1012,7 @@ mod tests {
         assert_eq!(pool["qoder_group_ids"], json!([alt_new]));
 
         // 幂等：二次调用跳过
-        assert_eq!(migrate_unified_groups(&store).unwrap(), 0);
+        assert_eq!(migrate_unified_groups(&store, &test_defs_lock()).unwrap(), 0);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1024,7 +1047,7 @@ mod tests {
             .unwrap();
 
         // 重试迁移：应复用 shg_A（同名对齐），不生成新 id
-        let n = migrate_unified_groups(&store).unwrap();
+        let n = migrate_unified_groups(&store, &test_defs_lock()).unwrap();
         assert_eq!(n, 1, "残留 shg_ 定义 + 同名旧定义合并 → 仍 1 条");
         let defs = docs::group_defs_load(&store);
         assert_eq!(defs.len(), 1);
@@ -1045,7 +1068,7 @@ mod tests {
         assert!(store.kv_get_raw("workbuddy_groups").is_none());
 
         // 幂等：二次调用跳过
-        assert_eq!(migrate_unified_groups(&store).unwrap(), 0);
+        assert_eq!(migrate_unified_groups(&store, &test_defs_lock()).unwrap(), 0);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -68,6 +68,9 @@ pub fn tags_list(state: State<AppState>) -> Vec<TagView> {
 }
 
 fn create_inner(state: &AppState, name: String, color: String) -> Result<String, String> {
+    // 读-改-写互斥（对齐 shared_groups B1）：tags_save 为整表全删全写，
+    // 并发 create/update/delete 锁外取旧快照保存会互相覆盖丢标签
+    let _defs_guard = state.group_defs_lock.lock().unwrap_or_else(|e| e.into_inner());
     let mut defs = defs_load(state);
     let name = validate_name(&defs, &name, None)?;
     let rand = uuid::Uuid::new_v4().simple().to_string();
@@ -90,6 +93,8 @@ fn update_inner(
     color: Option<String>,
     order: Option<i32>,
 ) -> Result<(), String> {
+    // 读-改-写互斥（同 create_inner）
+    let _defs_guard = state.group_defs_lock.lock().unwrap_or_else(|e| e.into_inner());
     let mut defs = defs_load(state);
     let new_name = match name.as_deref() {
         Some(n) => Some(validate_name(&defs, n, Some(&id))?),
@@ -130,10 +135,14 @@ fn delete_inner(
     let store = crate::store::db(&state.data_dir);
     // ① 清绑定
     crate::store::docs::account_tags_remove_tag(&store, id)?;
-    // ② 删定义
-    let mut defs = defs_load(state);
-    defs.retain(|t| t.id != id);
-    defs_save(state, &defs)?;
+    // ② 删定义（读-改-写互斥：与 create/update 并发时防旧快照复活已删标签；
+    // ①③ 段只动绑定表/api_keys/api_pool，取锁均为叶子级，不违反锁序约定）
+    {
+        let _defs_guard = state.group_defs_lock.lock().unwrap_or_else(|e| e.into_inner());
+        let mut defs = defs_load(state);
+        defs.retain(|t| t.id != id);
+        defs_save(state, &defs)?;
+    }
     // ③ 清引用：api_keys.allowed_tags + api_pool 三池标签筛选
     // Key 引用清理走锁内原子修改（防与并发 UI 保存互覆约束字段）
     crate::api_server::api_keys::modify(&state.data_dir, |keys_file| {
@@ -180,9 +189,13 @@ pub fn tags_delete(
 /// 校验 tag_id 存在；uid 跨池全局唯一（Trae 数字 / wb- / qd- 前缀）。
 /// uid 存在性由调用方负责（前端仅从各池账号列表取值）；账号删除路径经
 /// account_tags_remove_account 清理绑定，不会产生孤儿行。
-fn account_tags_set_inner(state: &AppState, uid: &str, tag_ids: &[String]) -> Result<(), String> {
+/// pub(crate)：三池导入路径（Buddy/WB/Qoder）恢复标签绑定统一走本函数，
+/// 持锁「校验 → 落绑定」防并发删标签留下悬空绑定（审查二轮 Minor-2）。
+pub(crate) fn account_tags_set_inner(state: &AppState, uid: &str, tag_ids: &[String]) -> Result<(), String> {
     let store = crate::store::db(&state.data_dir);
-    // tag_id 必须存在（防幽灵标签）
+    // tag_id 必须存在（防幽灵标签）；持定义锁罩住「校验 → 落绑定」，
+    // 防并发 delete 在校验通过后删标签留下悬空绑定
+    let _defs_guard = state.group_defs_lock.lock().unwrap_or_else(|e| e.into_inner());
     let defs = defs_load(state);
     for t in tag_ids {
         if !defs.iter().any(|d| &d.id == t) {
@@ -190,6 +203,7 @@ fn account_tags_set_inner(state: &AppState, uid: &str, tag_ids: &[String]) -> Re
         }
     }
     crate::store::docs::account_tags_set(&store, uid, tag_ids)?;
+    drop(_defs_guard);
     // 联动：账号标签变化影响调度池标签筛选（api_pool.*_tag_ids）与 Key 约束展开
     crate::api_server::org_index::invalidate(&state.data_dir);
     Ok(())
@@ -228,6 +242,7 @@ mod tests {
             qoder_pool_lock: std::sync::Arc::new(std::sync::Mutex::new(())),
             wb_pool_lock: std::sync::Arc::new(std::sync::Mutex::new(())),
             doubao_pool_lock: std::sync::Arc::new(std::sync::Mutex::new(())),
+            group_defs_lock: std::sync::Arc::new(std::sync::Mutex::new(())),
         };
         (d, state)
     }
