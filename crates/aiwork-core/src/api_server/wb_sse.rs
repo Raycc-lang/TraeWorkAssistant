@@ -390,14 +390,21 @@ pub fn stream_forward_ex(
                         } else {
                             tid.clone()
                         };
-                        let item = json!({
+                        // 编码名 `<ns>__<name>` 还原为 Codex 可路由的 {name, namespace}
+                        // 双字段（issue #93，与 wb_responses 非流式路径对齐）
+                        let (nm, ns) =
+                            crate::api_server::wb_responses::split_namespaced(name);
+                        let mut item = json!({
                             "id": item_id,
                             "type": "function_call",
                             "status": "completed",
                             "call_id": if tid.is_empty() { format!("call_{}_{}", chat_id, i) } else { tid.clone() },
-                            "name": name,
+                            "name": nm,
                             "arguments": args,
                         });
+                        if let Some(ns) = ns {
+                            item["namespace"] = json!(ns);
+                        }
                         let mut added = item.clone();
                         added["status"] = json!("in_progress");
                         added["arguments"] = json!("");

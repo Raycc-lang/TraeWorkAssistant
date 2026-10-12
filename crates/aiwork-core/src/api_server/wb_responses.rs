@@ -70,9 +70,11 @@ pub fn responses_to_chat(body: &Value) -> Result<Value, String> {
         }
     }
 
-    // tools：Responses 平铺 → chat 包裹（仅 function；其余类型丢弃）
+    // tools：function 直投影；namespace（Codex 注入的 multi_agent_v1 / mcp__* 等，
+    // issue #93）展平为内层 function，编码名 `<ns>__<inner>`（上游 chat 协议无
+    // namespace 概念），响应回程由 split_namespaced 还原为 {name, namespace}
     if let Some(tools) = body.get("tools").and_then(|v| v.as_array()) {
-        let converted: Vec<Value> = tools
+        let mut converted: Vec<Value> = tools
             .iter()
             .filter(|t| t.get("type").and_then(|v| v.as_str()) == Some("function"))
             .filter_map(|t| {
@@ -88,6 +90,42 @@ pub fn responses_to_chat(body: &Value) -> Result<Value, String> {
                 }))
             })
             .collect();
+        for t in tools
+            .iter()
+            .filter(|t| t.get("type").and_then(|v| v.as_str()) == Some("namespace"))
+        {
+            let Some(ns) = t
+                .get("name")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+            else {
+                continue;
+            };
+            let Some(inner) = t.get("tools").and_then(|v| v.as_array()) else {
+                continue;
+            };
+            for it in inner.iter() {
+                if it.get("type").and_then(|v| v.as_str()) != Some("function") {
+                    continue;
+                }
+                let Some(iname) = it
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.is_empty())
+                else {
+                    continue;
+                };
+                converted.push(json!({
+                    "type": "function",
+                    "function": {
+                        "name": format!("{}__{}", ns, iname),
+                        "description": it.get("description").cloned().unwrap_or(json!("")),
+                        "parameters": it.get("parameters").cloned().unwrap_or(json!({"type":"object","properties":{}})),
+                        "strict": it.get("strict").cloned().unwrap_or(json!(false)),
+                    },
+                }));
+            }
+        }
         if !converted.is_empty() {
             out.insert("tools".to_string(), json!(converted));
         }
@@ -111,6 +149,19 @@ pub fn responses_to_chat(body: &Value) -> Result<Value, String> {
 
     // tool_choice string 化（F-30）与 effort 改写由 wb_payload::prepare_wb_chat_body 统一处理
     Ok(Value::Object(out))
+}
+
+/// 编码名 `<ns>__<inner>` 还原为 (name, namespace)；无分隔符则不拆。
+/// 按**最后一个** `__` 切分：namespace 自身可含 `__`（如 `mcp__node_repl` 的工具
+/// 编码为 `mcp__node_repl__js`，应拆出 ns=`mcp__node_repl`、name=`js`）。
+/// 供流式响应（wb_sse）复用（issue #93）。
+pub fn split_namespaced(name: &str) -> (String, Option<String>) {
+    match name.rfind("__") {
+        Some(i) if i > 0 && i + 2 < name.len() => {
+            (name[i + 2..].to_string(), Some(name[..i].to_string()))
+        }
+        _ => (name.to_string(), None),
+    }
 }
 
 /// input items → chat messages
@@ -156,7 +207,15 @@ fn convert_input_items(items: &[Value]) -> Vec<Value> {
                         seq += 1;
                         format!("call_{}", seq)
                     });
-                let name = item.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                let raw_name = item.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                // Codex 回传历史时 function_call 带 {name, namespace} 双字段，
+                // 拼回请求侧 tools 声明用的编码名 `<ns>__<name>`（issue #93）
+                let name = match item.get("namespace").and_then(|v| v.as_str()) {
+                    Some(ns) if !ns.is_empty() && !raw_name.is_empty() => {
+                        std::borrow::Cow::Owned(format!("{}__{}", ns, raw_name))
+                    }
+                    _ => std::borrow::Cow::Borrowed(raw_name),
+                };
                 let args = item.get("arguments").and_then(|v| v.as_str()).unwrap_or("{}");
                 // 连续多个 function_call 合并进同一条 assistant，避免拆成多条
                 let idx = match open_assistant {
@@ -376,14 +435,25 @@ pub fn completion_to_responses(v: &Value, resp_id: &str, model: &str) -> Value {
     }
     if let Some(tcs) = message.get("tool_calls").and_then(|t| t.as_array()) {
         for (i, tc) in tcs.iter().enumerate() {
-            output.push(json!({
+            // 编码名 `<ns>__<name>` 还原为 Codex 可路由的 {name, namespace} 双字段
+            // （issue #93：Codex router 只认双字段，namespace 拼进 name 会被判未知工具）
+            let raw = tc
+                .pointer("/function/name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let (nm, ns) = split_namespaced(raw);
+            let mut item = json!({
                 "id": format!("fc_{}_{}", resp_id, i),
                 "type": "function_call",
                 "status": "completed",
                 "call_id": tc.get("id").cloned().unwrap_or(json!(format!("call_{}", i))),
-                "name": tc.pointer("/function/name").cloned().unwrap_or(json!("")),
+                "name": nm,
                 "arguments": tc.pointer("/function/arguments").cloned().unwrap_or(json!("{}")),
-            }));
+            });
+            if let Some(ns) = ns {
+                item["namespace"] = json!(ns);
+            }
+            output.push(item);
         }
     }
     let (it, ot) = v.get("usage").map(u64_pair).unwrap_or((0, 0));
@@ -712,5 +782,106 @@ mod tests {
         assert_eq!(msgs[0]["tool_calls"][0]["id"], json!("call_1"));
         assert_eq!(msgs[1]["tool_call_id"], json!("call_1"));
         assert_eq!(msgs[1]["content"], json!("r"));
+    }
+
+    /// issue #93：namespace 工具（Codex multi_agent_v1 / mcp__* 等）不再被静默
+    /// 丢弃，展平为编码名 `<ns>__<inner>` 的 function 送达上游
+    #[test]
+    fn namespace_tools_are_flattened_to_encoded_functions() {
+        let body = json!({
+            "model": "m",
+            "input": "hi",
+            "tools": [
+                {"type": "function", "name": "shell", "description": "run", "parameters": {"type": "object"}},
+                {
+                    "type": "namespace",
+                    "name": "multi_agent_v1",
+                    "description": "Tools for spawning and managing sub-agents.",
+                    "tools": [
+                        {"type": "function", "name": "spawn_agent", "description": "spawn", "parameters": {"type": "object"}},
+                        {"type": "function", "name": "wait_agent", "description": "wait", "parameters": {"type": "object"}},
+                    ],
+                },
+                {
+                    "type": "namespace",
+                    "name": "mcp__node_repl",
+                    "tools": [{"type": "function", "name": "js", "parameters": {"type": "object"}}],
+                },
+            ],
+        });
+        let chat = responses_to_chat(&body).unwrap();
+        let tools = chat["tools"].as_array().unwrap();
+        assert_eq!(tools.len(), 4);
+        assert_eq!(tools[0]["function"]["name"], json!("shell"));
+        assert_eq!(tools[1]["function"]["name"], json!("multi_agent_v1__spawn_agent"));
+        assert_eq!(tools[2]["function"]["name"], json!("multi_agent_v1__wait_agent"));
+        assert_eq!(tools[3]["function"]["name"], json!("mcp__node_repl__js"));
+    }
+
+    /// issue #93：split_namespaced 按最后一个 `__` 切分（namespace 自身可含 `__`），
+    /// 无分隔符或分隔符在边界时不拆
+    #[test]
+    fn split_namespaced_handles_nested_and_plain_names() {
+        let (nm, ns) = split_namespaced("mcp__node_repl__js");
+        assert_eq!(nm, "js");
+        assert_eq!(ns.as_deref(), Some("mcp__node_repl"));
+        let (nm, ns) = split_namespaced("multi_agent_v1__spawn_agent");
+        assert_eq!(nm, "spawn_agent");
+        assert_eq!(ns.as_deref(), Some("multi_agent_v1"));
+        // 无分隔符：原样返回（既有扁平工具回归）
+        let (nm, ns) = split_namespaced("exec_command");
+        assert_eq!(nm, "exec_command");
+        assert!(ns.is_none());
+        // 边界：分隔符在开头/结尾不拆
+        let (nm, ns) = split_namespaced("__spawn");
+        assert_eq!(nm, "__spawn");
+        assert!(ns.is_none());
+        let (nm, ns) = split_namespaced("ns__");
+        assert_eq!(nm, "ns__");
+        assert!(ns.is_none());
+    }
+
+    /// issue #93：Codex 回传历史 function_call 带 {name, namespace} 双字段，
+    /// 拼回与 tools 声明一致的编码名
+    #[test]
+    fn namespaced_function_call_history_recombines_encoded_name() {
+        let body = json!({
+            "model": "m",
+            "input": [
+                {"type": "function_call", "call_id": "c1", "name": "spawn_agent",
+                 "namespace": "multi_agent_v1", "arguments": "{}"},
+                {"type": "function_call_output", "call_id": "c1", "output": "ok"},
+            ],
+        });
+        let chat = responses_to_chat(&body).unwrap();
+        let msgs = chat["messages"].as_array().unwrap();
+        assert_eq!(
+            msgs[0]["tool_calls"][0]["function"]["name"],
+            json!("multi_agent_v1__spawn_agent")
+        );
+    }
+
+    /// issue #93：非流式响应把编码名还原为 {name, namespace} 双字段；
+    /// 扁平工具输出无 namespace 字段（行为与旧实现一致）
+    #[test]
+    fn completion_restores_namespace_from_encoded_name() {
+        let v = json!({
+            "choices": [{"index": 0, "finish_reason": "tool_calls",
+                         "message": {"role": "assistant", "content": null,
+                                     "tool_calls": [
+                                     {"id": "call_a", "type": "function",
+                                      "function": {"name": "multi_agent_v1__spawn_agent", "arguments": "{}"}},
+                                     {"id": "call_b", "type": "function",
+                                      "function": {"name": "shell", "arguments": "{}"}},
+                                 ]}}],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1},
+        });
+        let resp = completion_to_responses(&v, "resp_ns", "m");
+        let out = resp["output"].as_array().unwrap();
+        assert_eq!(out[0]["type"], json!("function_call"));
+        assert_eq!(out[0]["name"], json!("spawn_agent"));
+        assert_eq!(out[0]["namespace"], json!("multi_agent_v1"));
+        assert_eq!(out[1]["name"], json!("shell"));
+        assert!(out[1].get("namespace").is_none());
     }
 }
