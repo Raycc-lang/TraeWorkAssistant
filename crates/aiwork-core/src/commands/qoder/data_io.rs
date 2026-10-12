@@ -262,35 +262,8 @@ pub fn qoder_accounts_export(
 /// 单账号合并结果：Ok((生效 id, 是否新增))；Err = 拒绝原因。
 type MergeResult = Result<(String, bool), String>;
 
-/// 导入条目的 tags 字段收集（P2 需求③）：仅保留本机已存在的 tag id（未知 id
-/// 计入 ignored，不自动创建标签）；final_id = 原位更新保留的原 id 或新增 id
-fn collect_import_tags(
-    entry: &Value,
-    final_id: &str,
-    tag_defs: &[crate::models::Tag],
-    out: &mut Vec<(String, Vec<String>)>,
-    ignored: &mut usize,
-) {
-    let Some(arr) = entry.get("tags").and_then(Value::as_array) else {
-        return;
-    };
-    let valid: Vec<String> = arr
-        .iter()
-        .filter_map(|t| t.as_str())
-        .filter(|t| {
-            if tag_defs.iter().any(|d| d.id == **t) {
-                true
-            } else {
-                *ignored += 1;
-                false
-            }
-        })
-        .map(String::from)
-        .collect();
-    if !valid.is_empty() {
-        out.push((final_id.to_string(), valid));
-    }
-}
+// 导入条目的 tags 字段收集下沉共享：crate::commands::tags::collect_import_tags
+// （qoder/workbuddy/Trae 三处同款实现，审查 P7 去重）
 
 /// 单账号幂等合并（纯函数，可单测）：uid 优先 id 兜底原位更新，保留原 id
 /// （换 token / 异机 id 的同账号不再产生重复条目，分组引用不悬空）。
@@ -475,7 +448,7 @@ pub fn qoder_accounts_import(
                 } else {
                     updated += 1;
                 }
-                collect_import_tags(a, &final_id, &tag_defs, &mut tag_bindings, &mut tags_ignored);
+                crate::commands::tags::collect_import_tags(a, &final_id, &tag_defs, &mut tag_bindings, &mut tags_ignored);
                 // 凭证副本回写（导出时含凭证才有效）：至少有作业令牌或 PAT 才落库
                 if let Some(cred) = a.get("credential").filter(|c| c.is_object()) {
                     // §5.10 红线纵深：入库前剥离设备字段（指纹只存账号池 device_profile，
@@ -502,9 +475,18 @@ pub fn qoder_accounts_import(
         }
     }
     save_pool(state, &pool)?;
-    // 标签绑定落 account_tags 表（uid 键跨池通用）
+    // 标签绑定落 account_tags 表（uid 键跨池通用）。审查 P1：单条失败聚合进
+    // rejected 不中断——原实现 `?` 中断会跳过后续凭证回写 + invalidate + reload，
+    // 账号已入池而成半成品状态；tags_restored 只计成功写入，失败条目重新导入可补齐
+    let mut tags_restored = 0usize;
     for (uid, ids) in &tag_bindings {
-        crate::store::docs::account_tags_set(&store, uid, ids)?;
+        match crate::store::docs::account_tags_set(&store, uid, ids) {
+            Ok(()) => tags_restored += 1,
+            Err(e) => rejected.push(serde_json::json!({
+                "id": uid,
+                "reason": format!("账号已入池，但标签绑定恢复失败：{e}（重新导入可补齐）"),
+            })),
+        }
     }
     crate::api_server::org_index::invalidate(&state.data_dir);
     for (final_id, creds) in cred_writes {
@@ -523,7 +505,7 @@ pub fn qoder_accounts_import(
     fs_utils::app_log(
         &state.data_dir,
         &format!(
-            "qoder: 账号池导入 新增 {added} / 更新 {updated} / 带凭证 {with_cred} / 拒绝 {}{}",
+            "qoder: 账号池导入 新增 {added} / 更新 {updated} / 带凭证 {with_cred} / 标签绑定恢复 {tags_restored}（未知标签忽略 {tags_ignored}）/ 拒绝 {}{}",
             rejected.len(),
             if plaintext_credentials { " / 明文凭证文件（迁移提示）" } else { "" },
         ),
@@ -533,6 +515,9 @@ pub fn qoder_accounts_import(
         "updated": updated,
         "skipped": 0,
         "with_credentials": with_cred,
+        // 标签恢复统计（审查 P6 补齐：与 workbuddy/Trae 导入返回口径对齐）
+        "tags_restored": tags_restored,
+        "tags_ignored": tags_ignored,
         "rejected": rejected,
         // F-80-余 v2 迁移提示：true = 历史明文含凭证文件，前端提醒重新加密导出归档
         "plaintext_credentials": plaintext_credentials,

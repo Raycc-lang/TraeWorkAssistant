@@ -500,7 +500,8 @@ pub fn scheduler_config_set(st: &AppState, cfg: Value) -> Result<Value, String> 
             "[调度器] 任务配置已更新：{} 项停用，{} 项自定义时刻，{} 项每小时模式",
             disabled.len(),
             times.len(),
-            modes.iter().filter(|(_, v)| v.as_str() != "daily").count()
+            // 审查 P10：精确匹配每小时模式（原 != "daily" 会把无效值也计入）
+            modes.iter().filter(|(_, v)| v.as_str() == "every_hours").count()
         ),
     );
     Ok(scheduler_config_get(st))

@@ -147,10 +147,12 @@ fn sleep_interruptible(
 ///    声明了此 id 而 CN 侧无任何确定性可得证据，放行只会把请求送进 CN 网关
 ///    收上游诡异报错，拒绝则走明确的 404 提示通道。
 /// 从上游 usage JSON 提取 Qoder 积分测量（issue #82 T2）：
-/// 返回 (credits, original_credits)。credits 复数字段优先——单数 `credit` 是旧版
-/// 字段，读它恒为 0（qoder2api-hub issue #22 命门）；两字段均非负时与 Python
-/// `or` 链回退语义等价。usage 缺失或计费字段都取不到 → None（调用方传 None
-/// 不入账，与「上游未下发 usage 不得伪造」口径一致）
+/// 返回 (credits, original_credits)。实现取两字段非负值中的 max（保守记账）。
+/// 与 Python `or` 链的等价性仅在「上游保证单数 credit 恒为 0 或缺失」前提下成立
+/// （qoder2api-hub issue #22：复数 `credits` 为现行字段，单数为旧版）——该前提下
+/// 两者都命中复数字段；若上游双字段同现且不等，or 链取先出现的复数字段而本实现
+/// 取 max，按保守口径有意为之。usage 缺失或计费字段都取不到 → None（调用方传
+/// None 不入账，与「上游未下发 usage 不得伪造」口径一致）
 fn extract_billing(usage: Option<&Value>) -> (Option<f64>, Option<f64>) {
     let Some(u) = usage else {
         return (None, None);

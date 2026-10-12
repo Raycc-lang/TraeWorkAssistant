@@ -48,7 +48,15 @@ fn load_index(data_dir: &Path) -> OrgIndex {
             let tags = read_pairs("SELECT pk, data FROM account_tags")?;
             Ok((members, [wb, qoder].concat(), tags))
         })
-        .unwrap_or_default();
+        .unwrap_or_else(|e| {
+            // 审查 P4：读库失败原先静默降级为空索引（约束型 Key 全拒绝，fail-closed
+            // 安全向）但零日志无从排障；记错误日志保留降级语义，5s TTL 后重试
+            crate::fs_utils::app_log(
+                data_dir,
+                &format!("org_index: 读库失败，本次降级为空索引（约束型 Key 拒绝，5s 后重试）: {e}"),
+            );
+            Default::default()
+        });
     let mut idx = OrgIndex::default();
     // Trae 成员：group_members 表
     for (uid, gid) in member_rows {

@@ -376,34 +376,17 @@ pub fn accounts_import(
             groups.membership.insert(uid.clone(), gid.clone());
         }
         // 标签绑定恢复（P2 需求③）：仅恢复本机已存在的 tag id，未知 id 忽略
-        // （不自动创建标签，避免导入方标签体系污染本机；忽略数量记 app_log）
-        let tags_in: Vec<String> = entry
-            .get("tags")
-            .and_then(|v| v.as_array())
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|t| t.as_str().map(String::from))
-                    .collect()
-            })
-            .unwrap_or_default();
-        if !tags_in.is_empty() {
-            let mut ignored = 0usize;
-            let valid: Vec<String> = tags_in
-                .into_iter()
-                .filter(|t| {
-                    if tag_defs.iter().any(|d| &d.id == t) {
-                        true
-                    } else {
-                        ignored += 1;
-                        false
-                    }
-                })
-                .collect();
-            if !valid.is_empty() {
-                tag_bindings.push((uid.clone(), valid));
-            }
-            report.tags_ignored += ignored;
-        }
+        // （不自动创建标签，避免导入方标签体系污染本机；忽略数量记 app_log）。
+        // 收集逻辑下沉共享（审查 P7）：与 qoder/workbuddy 导入同款实现
+        let mut ignored = 0usize;
+        crate::commands::tags::collect_import_tags(
+            entry,
+            &uid,
+            &tag_defs,
+            &mut tag_bindings,
+            &mut ignored,
+        );
+        report.tags_ignored += ignored;
         accounts.accounts.push(RawAccount {
             name,
             user_id: Some(uid),

@@ -50,12 +50,73 @@ fn validate_name(defs: &[Tag], name: &str, exclude_id: Option<&str>) -> Result<S
     Ok(name)
 }
 
+/// 孤儿绑定检测的存活 uid 全集（审查 P5）：Trae 凭证库 user_id + WB/Qoder 池
+/// 账号 id（行文档 data JSON）。任一源表读失败时返回 None，调用方跳过本轮自愈
+/// （避免读库故障时把全部绑定误当孤儿清理）
+fn known_uids(state: &AppState) -> Option<std::collections::HashSet<String>> {
+    let mut known = std::collections::HashSet::new();
+    for a in &crate::vault::load_accounts(state).accounts {
+        if let Some(uid) = &a.user_id {
+            known.insert(uid.clone());
+        }
+    }
+    let store = crate::store::db(&state.data_dir);
+    for table in ["wb_accounts", "qoder_accounts"] {
+        match store.rows_all(table) {
+            Ok(rows) => {
+                for (_pk, data) in rows {
+                    if let Some(id) = data.get("id").and_then(|v| v.as_str()) {
+                        known.insert(id.to_string());
+                    }
+                }
+            }
+            Err(_) => return None,
+        }
+    }
+    Some(known)
+}
+
 pub fn tags_list(state: &AppState) -> Vec<TagView> {
     let store = crate::store::db(&state.data_dir);
     let mut uid_by_tag: HashMap<String, Vec<String>> = HashMap::new();
     for (uid, ids) in crate::store::docs::account_tags_map(&store) {
         for t in ids {
             uid_by_tag.entry(t).or_default().push(uid.clone());
+        }
+    }
+    // 孤儿绑定自愈（审查 P5）：指向已不存在账号的绑定行顺带清理 + 记日志
+    // （账号删除路径理论上会清绑定，历史数据/并发窗口内可能残留）。源表读失败
+    // 时跳过本轮自愈；单条清理失败仅记日志不影响列表；无孤儿时零写开销
+    if let Some(known) = known_uids(state) {
+        let orphans: Vec<String> = uid_by_tag
+            .values()
+            .flatten()
+            .cloned()
+            .collect::<std::collections::HashSet<_>>()
+            .into_iter()
+            .filter(|uid| !known.contains(uid))
+            .collect();
+        let mut removed = 0usize;
+        for uid in &orphans {
+            match crate::store::docs::account_tags_remove_account(&store, uid) {
+                Ok(()) => {
+                    removed += 1;
+                    crate::fs_utils::app_log(
+                        &state.data_dir,
+                        &format!("tags_list: 清理孤儿标签绑定（账号已不存在）: {uid}"),
+                    );
+                    for uids in uid_by_tag.values_mut() {
+                        uids.retain(|u| u != uid);
+                    }
+                }
+                Err(e) => crate::fs_utils::app_log(
+                    &state.data_dir,
+                    &format!("tags_list: 孤儿标签绑定清理失败（不影响列表）: {uid}: {e}"),
+                ),
+            }
+        }
+        if removed > 0 {
+            crate::api_server::org_index::invalidate(&state.data_dir);
         }
     }
     defs_load(state)
@@ -206,6 +267,38 @@ pub fn account_tags_set(
 /// 一次返回全量 uid → tag_ids 映射（各池账号列表组装联表用，避免 N+1 invoke）
 pub fn account_tags_map(state: &AppState) -> HashMap<String, Vec<String>> {
     crate::store::docs::account_tags_map(&crate::store::db(&state.data_dir))
+}
+
+/// 导入条目的 tags 字段收集（P2 需求③，qoder/workbuddy/Trae 三处导入共享）：
+/// 仅保留本机已存在的 tag id（未知 id 计入 ignored，不自动创建标签，避免导入方
+/// 标签体系污染本机）；final_id = 原位更新保留的原 id 或新增 id。
+/// 纯内存过滤不触库：调用方在主体落库成功后统一写 account_tags 表
+pub fn collect_import_tags(
+    entry: &serde_json::Value,
+    final_id: &str,
+    tag_defs: &[crate::models::Tag],
+    out: &mut Vec<(String, Vec<String>)>,
+    ignored: &mut usize,
+) {
+    let Some(arr) = entry.get("tags").and_then(serde_json::Value::as_array) else {
+        return;
+    };
+    let valid: Vec<String> = arr
+        .iter()
+        .filter_map(|t| t.as_str())
+        .filter(|t| {
+            if tag_defs.iter().any(|d| d.id == **t) {
+                true
+            } else {
+                *ignored += 1;
+                false
+            }
+        })
+        .map(String::from)
+        .collect();
+    if !valid.is_empty() {
+        out.push((final_id.to_string(), valid));
+    }
 }
 
 #[cfg(test)]

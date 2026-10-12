@@ -395,6 +395,27 @@ fn append_credits_snapshot(state: &AppState, parsed: &Value) {
             None => checkin_reward,
         }
     };
+    // 审查 P3：旧格式快照升级窗口提示。上一快照无账号明细（旧格式，fingerprint
+    // 为 None 维持既有可比行为不触发 set_changed 守卫）时，当日失败账号无前值可
+    // carry（balance 记 Null，不进 total），差分偏低且无任何痕迹；此为一次性窗口，
+    // 次日快照携带完整明细后自愈，记日志避免 earned 莫名偏低无从排查
+    let prev_has_accounts = prev_snapshot
+        .map(|s| {
+            s.get("accounts")
+                .and_then(Value::as_array)
+                .map(|a| !a.is_empty())
+                .unwrap_or(false)
+        })
+        .unwrap_or(false);
+    let has_missing = accounts
+        .iter()
+        .any(|a| a.get("balance").map(Value::is_null).unwrap_or(false));
+    if prev_snapshot.is_some() && !prev_has_accounts && has_missing && !set_changed {
+        fs_utils::app_log(
+            &state.data_dir,
+            "workbuddy: 上一快照为旧格式（无账号明细），当日失败账号无法补前值，earned 差分偏低（次日自愈）",
+        );
+    }
     let snap = serde_json::json!({
         "date": today,
         "ts": chrono::Utc::now().timestamp_millis(),

@@ -38,6 +38,12 @@
 - 前端/杂项：ApiService 删除重复预览块（保留含空集警示的超集预览）；QoderAccounts 弹框回调失败改重抛（保留输入便于重试）；SchedulerTasksCard 补 `trae-usage-sync` 条目与文案；scheduler 注释修正（缺省恒 `every_hours`，行为无变化）。
 - 明示不修：Qoder 导入覆盖已存在账号的标签/分组绑定（与 WB 导入语义一致，导入文件为权威态）。
 
+### 二轮复核修复（导入容错与口径对齐）
+
+- 导入容错：WB/Qoder 导入的凭证回写与标签绑定改为主体落库后统一执行，单条失败聚合进 `rejected` 不再中断（避免「账号已入池但凭证/标签缺失」半成品，重新导入可补齐）；Qoder 导入响应补 `tags_restored` / `tags_ignored`（三平台口径对齐）；导入标签收集逻辑下沉共享 `tags::collect_import_tags`。
+- 孤儿绑定自愈：`tags_list` 顺带清理指向已不存在账号的绑定行并记日志（源表读失败跳过本轮，防读库故障时误清全部绑定）。
+- 可观测与杂项：`org_index` 读库失败降级空索引补错误日志（fail-closed 语义不变）；WB 积分快照遇旧格式上一快照（无账号明细）记日志提示 earned 差分偏低（次日自愈）；调度日志每小时模式计数改精确匹配 `every_hours`；`extract_billing` 文档注释修正（max 保守记账与 `or` 链的语义边界）。
+
 ### 验证
 
 - `cargo test --workspace` 621 通过（7 忽略）· `tsc` 0 错误 · `vitest` 61 通过。
