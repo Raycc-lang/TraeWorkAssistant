@@ -783,7 +783,7 @@ impl ApiPool {
                     action = Some("action=disabled".to_string());
                 }
                 ErrKind::HardCredit => {
-                    // 积分耗尽：冷却到次日 04:00，到期自动恢复探测（F-29 v1.2）
+                    // 积分耗尽：冷却到下个 04:00（凌晨窗口内为当天），到期自动恢复探测（F-29 v1.2）
                     let until = next_0400(now_ts());
                     e.hard_until = until;
                     e.reason = "hard_credit".to_string();
