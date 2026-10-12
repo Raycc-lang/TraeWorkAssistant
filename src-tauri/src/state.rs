@@ -288,8 +288,9 @@ impl AppState {
         if s.qoder_checkin_hhmm.trim().is_empty() {
             s.qoder_checkin_hhmm = "10:15".into();
         }
+        // 注意：此处仅回填时刻，不改 enabled——开关的派生权威在下方 mode 归一
+        //（若此处强行置 true，旧 kv 显式 enabled=false + 空 hhmm 会被错误拉起为 every_hours）
         if s.qoder_credits_sync_hhmm.trim().is_empty() {
-            s.qoder_credits_sync_enabled = true;
             s.qoder_credits_sync_hhmm = "23:40".into();
         }
         // Qoder Token 续期间隔：零值回填默认 6 + 域钳制 1~24（serde default 已给 6，

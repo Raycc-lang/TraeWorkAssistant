@@ -293,10 +293,11 @@ fn spawn_wb_health_probe(state: Arc<ApiSharedState>) {
     let weak = Arc::downgrade(&state);
     drop(state);
     std::thread::spawn(move || {
-        // 升级成功仅证明共享状态仍存活（强引用在下方替换段内短暂持有）
-        let Some(_state) = weak.upgrade() else {
+        // 升级失败 = 共享状态已释放（服务停止且状态回收），线程退出；
+        // 不绑定具名变量——强引用若持有到线程结束会使下方 Weak 退出设计失效
+        if weak.upgrade().is_none() {
             return;
-        };
+        }
         // T5.1/F-37：启动即做一次上游目录动态替换（best effort，失败不影响启动——
         // 本地静态兜底目录保持不动）；取任一健康 WB 账号的凭证拉取。
         // 强引用仅在本次替换内短暂持有

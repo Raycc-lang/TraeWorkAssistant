@@ -777,12 +777,18 @@ pub fn workbuddy_accounts_import(
     };
     // 幽灵分组防御（对齐 qoder 导入侧）：预载共享分组定义，新增条目的 group_id
     // 指向不存在分组（异机导入未随载荷携带定义/本地已删分组）时回落「未分组」——
-    // 聚合落空的幽灵引用不如显式未分组。池锁已持有，与并发 defs 写方读隔离
-    let valid_group_ids: std::collections::HashSet<String> =
+    // 聚合落空的幽灵引用不如显式未分组。短锁内读取（同 tag_defs）：与并发
+    // shared_groups 写方的 RMW 快照一致（写方仅持 group_defs_lock，不持池锁）
+    let valid_group_ids: std::collections::HashSet<String> = {
+        let _defs = state
+            .group_defs_lock
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         crate::store::docs::group_defs_load(&crate::store::db(&state.data_dir))
             .into_iter()
             .map(|g| g.id)
-            .collect();
+            .collect()
+    };
     let mut tag_bindings: Vec<(String, Vec<String>)> = Vec::new();
     let mut tags_ignored = 0usize;
     // 凭证先收集、save_pool 成功后统一落库逐条聚合（对齐 qoder 先例）：原实现

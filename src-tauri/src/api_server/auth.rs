@@ -11,8 +11,8 @@ use super::usage::KeyId;
 use super::ApiSharedState;
 
 /// API Key 鉴权中间件：
-/// - /healthz 跳过鉴权（审查 P2-8：响应仅 status/solo_available/wb_available 布尔，
-///   无账号数/模型/密钥等敏感信息，供定位探活/看门狗直接探测）
+/// - /healthz 跳过鉴权（审查 P2-8：响应仅 status/solo_available/wb_available 布尔
+///   + 通用 reason 字符串，无账号数/模型/密钥等敏感信息，供定位探活/看门狗直接探测）
 /// - /health 跳过鉴权仅限**环回监听**（响应已收敏为 status/running 存活布尔，
 ///   完整诊断在需鉴权的 /status；非环回监听时不豁免，与其他端点一致走 Key 鉴权，
 ///   与 ensure_bind_auth_policy「非环回必须有启用 Key」的启动门禁口径一致）

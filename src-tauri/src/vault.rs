@@ -515,7 +515,10 @@ pub fn migrate_on_startup(state: &AppState) {
         ),
         Err(e) => fs_utils::app_log(
             &state.data_dir,
-            &format!("启动迁移: 写入 vault 失败（已仅保留占位信息，禁止明文落盘）: {e}"),
+            &format!(
+                "启动迁移: 写入 vault 失败（已仅保留占位信息，禁止明文落盘）: {e}；\
+                 本次升级迁入的原始明文凭据仍完整保留于 data/backup/ 下的 JSON 文件，可排查 vault 故障后重启重试"
+            ),
         ),
     }
 }
