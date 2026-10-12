@@ -127,13 +127,32 @@ async fn spawn_fake_upstream(backend_port: u16) -> FakeUpstream {
     FakeUpstream { port, seen, dead }
 }
 
-/// 占用临时端口后立即释放（供代理监听用；轻微竞态可接受）
+/// 探测一个当前空闲的端口（供代理监听用）。
+///
+/// 注意 bind 后立即释放存在 TOCTOU 窗口，调用方必须配合 [`start_proxy_retry`]
+/// 的换端口重试，不要直接 `expect` 单次绑定结果。
 fn free_port() -> u16 {
     std::net::TcpListener::bind("127.0.0.1:0")
         .unwrap()
         .local_addr()
         .unwrap()
         .port()
+}
+
+/// 有限重试启动代理：`free_port` 探测端口后立即释放，在高负载 runner（macOS
+/// arm64 容量受限）上可能被其他进程抢占，导致 `ProxyServer::start` 绑定失败。
+/// 原写法单次 `expect("proxy start")` 直接 panic，是 CI step 8 偶发 exit 101 的
+/// 首要根因。失败即换一个空闲端口重试；`ensure_ca` 幂等，重试不会残留脏状态。
+async fn start_proxy_retry(make_cfg: impl Fn(u16) -> ProxyConfig) -> ProxyServer {
+    const ATTEMPTS: usize = 5;
+    let mut last_err = String::from("未执行");
+    for _ in 0..ATTEMPTS {
+        match ProxyServer::start(make_cfg(free_port()), None).await {
+            Ok(server) => return server,
+            Err(e) => last_err = e,
+        }
+    }
+    panic!("proxy start（重试 {ATTEMPTS} 次仍失败）: {last_err}");
 }
 
 fn temp_dir(tag: &str) -> std::path::PathBuf {
@@ -145,24 +164,26 @@ fn temp_dir(tag: &str) -> std::path::PathBuf {
 
 async fn start_proxy(tag: &str, targets: Vec<String>, upstream: Option<UpstreamProxy>) -> ProxyServer {
     let dir = temp_dir(tag);
-    let cfg = ProxyConfig {
-        port: free_port(),
-        targets,
+    start_proxy_retry(move |port| ProxyConfig {
+        port,
+        targets: targets.clone(),
         auto_capture_jwt: false,
         data_dir: dir.clone(),
         certs_dir: dir.join("certs"),
         log_path: dir.join("proxy.log"),
         req_log_dir: dir.join("reqlogs"),
-        upstream,
-    };
-    ProxyServer::start(cfg, None).await.expect("proxy start")
+        upstream: upstream.clone(),
+    })
+    .await
 }
 
-/// 读到完整 HTTP 头（\r\n\r\n）并返回头部字节，限时兜底防挂死
+/// 读到完整 HTTP 头（\r\n\r\n）并返回头部字节，限时兜底防挂死。
+/// 本地回环链路正常毫秒级完成；30s 是给高负载 runner（CI arm64 容量受限、
+/// CPU 抢占严重）留的裕量，过紧会在非挂死场景偶发误报。
 async fn read_head(io: &mut TcpStream) -> Vec<u8> {
     let mut buf = Vec::new();
     let mut chunk = [0u8; 1024];
-    tokio::time::timeout(Duration::from_secs(10), async {
+    tokio::time::timeout(Duration::from_secs(30), async {
         loop {
             let n = match io.read(&mut chunk).await {
                 Ok(0) | Err(_) => break,
@@ -186,7 +207,7 @@ async fn read_head_and_body(io: &mut TcpStream, marker: &[u8]) -> Vec<u8> {
     if buf.windows(marker.len()).any(|w| w == marker) {
         return buf;
     }
-    let _ = tokio::time::timeout(Duration::from_millis(2000), async {
+    let _ = tokio::time::timeout(Duration::from_millis(5000), async {
         let mut chunk = [0u8; 1024];
         while let Ok(n) = io.read(&mut chunk).await {
             if n == 0 {
@@ -354,17 +375,18 @@ async fn live_mitm_case(tag: &str, upstream: Option<UpstreamProxy>) {
     use tokio_rustls::rustls::pki_types::ServerName;
 
     let dir = temp_dir(tag);
-    let cfg = ProxyConfig {
-        port: free_port(),
+    let cfg_dir = dir.clone();
+    let server = start_proxy_retry(move |port| ProxyConfig {
+        port,
         targets: vec![], // 默认白名单含 doubao.com
         auto_capture_jwt: false,
-        data_dir: dir.clone(),
-        certs_dir: dir.join("certs"),
-        log_path: dir.join("proxy.log"),
-        req_log_dir: dir.join("reqlogs"),
-        upstream,
-    };
-    let server = ProxyServer::start(cfg, None).await.expect("proxy start");
+        data_dir: cfg_dir.clone(),
+        certs_dir: cfg_dir.join("certs"),
+        log_path: cfg_dir.join("proxy.log"),
+        req_log_dir: cfg_dir.join("reqlogs"),
+        upstream: upstream.clone(),
+    })
+    .await;
 
     // 客户端信任代理 CA（ensure_ca 已写 ca.cer DER）
     let ca_der = std::fs::read(dir.join("certs").join("ca.cer")).expect("ca.cer");
