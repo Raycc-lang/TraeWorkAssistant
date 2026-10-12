@@ -588,15 +588,21 @@ fn run_renewal(state: &AppState, renew_url: &str, probe_url: &str) -> Value {
                     if let Err(e) = crate::commands::doubao::save_pool(state, &file) {
                         crate::fs_utils::app_log(
                             &state.data_dir,
-                            &format!("doubao 巡检回写落池失败（{merged} 处变更丢失，下轮巡检重试）: {e}"),
+                            &format!(
+                                "doubao 巡检回写落池失败（{merged} 处变更丢失，下轮巡检重试）: {e}"
+                            ),
                         );
                     }
                 }
-                // 反序列化失败同样落日志：静默丢变更会让巡检结果看似成功实则丢失
-                Err(e) => crate::fs_utils::app_log(
-                    &state.data_dir,
-                    &format!("doubao 巡检回写池反序列化失败（{merged} 处变更未回写）: {e}"),
-                ),
+                Err(e) => {
+                    // 反序列化失败同样丢弃 {merged} 处变更，不静默（下轮巡检重试）
+                    crate::fs_utils::app_log(
+                        &state.data_dir,
+                        &format!(
+                            "doubao 巡检回写反序列化失败（{merged} 处变更丢失，下轮巡检重试）: {e}"
+                        ),
+                    );
+                }
             }
         }
     }
