@@ -242,6 +242,20 @@ pub fn stream_forward_ex(
     chat_id: &str,
     model: &str,
 ) -> (Option<(i64, String)>, bool, bool, Option<Value>, bool) {
+    stream_forward_ex_ns(lines, tx, proto, chat_id, model, &std::collections::HashSet::new())
+}
+
+/// 同 stream_forward_ex，带 Responses 请求侧展平编码名集合（审查 #4）：
+/// `proto == Protocol::Responses` 时仅对集合命中者还原 {name, namespace} 双字段，
+/// 原生含 `__` 的扁平 function 名（如 MCP mcp__server__tool）保持单 name 字段
+pub fn stream_forward_ex_ns(
+    lines: InterruptibleLines,
+    tx: &Sender,
+    proto: crate::api_server::routes::Protocol,
+    chat_id: &str,
+    model: &str,
+    ns_encoded: &std::collections::HashSet<String>,
+) -> (Option<(i64, String)>, bool, bool, Option<Value>, bool) {
     let mut parser = WbSseParser::new(lines);
     let mut sent_any = false;
     let mut failed_inline = false;
@@ -411,15 +425,20 @@ pub fn stream_forward_ex(
                             "arguments": args,
                         });
                         // 编码名还原为 Codex 只接受的 {name, namespace} 双字段；
-                        // 扁平 function 工具保持单 name 字段（issue #93）
-                        match crate::api_server::wb_responses::split_namespaced(name) {
-                            Some((ns, inner)) => {
-                                item["name"] = json!(inner);
-                                item["namespace"] = json!(ns);
+                        // 仅请求侧展平编码名集合命中者拆分——原生含 `__` 的扁平
+                        // function 名保持单 name 字段（issue #93 / 审查 #4）
+                        if ns_encoded.contains(name.as_str()) {
+                            match crate::api_server::wb_responses::split_namespaced(name) {
+                                Some((ns, inner)) => {
+                                    item["name"] = json!(inner);
+                                    item["namespace"] = json!(ns);
+                                }
+                                None => {
+                                    item["name"] = json!(name);
+                                }
                             }
-                            None => {
-                                item["name"] = json!(name);
-                            }
+                        } else {
+                            item["name"] = json!(name);
                         }
                         let mut added = item.clone();
                         added["status"] = json!("in_progress");
@@ -1272,20 +1291,33 @@ mod tests {
     }
 
     /// issue #93：Responses 流式下编码名 function_call 还原为 {name, namespace}
-    /// 双字段；扁平 function 工具保持单 name 且不带 namespace（回归）
+    /// 双字段；扁平 function 工具保持单 name 且不带 namespace（回归）；
+    /// 审查 #4：仅请求侧展平集合命中者拆分，原生 `__` 名不拆
     #[test]
     fn stream_forward_responses_restores_namespaced_function_call() {
         let (tx, mut rx) = tokio::sync::mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(256);
         let lines = lines(&[
             "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"function\":{\"name\":\"multi_agent_v1__spawn_agent\",\"arguments\":\"{\\\"a\\\":1}\"}}]}}]}",
             "",
-            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":1,\"id\":\"call_2\",\"function\":{\"name\":\"shell\",\"arguments\":\"{}\"}}]},\"finish_reason\":\"tool_calls\"}],\"usage\":{\"prompt_tokens\":5,\"completion_tokens\":4}}",
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":1,\"id\":\"call_2\",\"function\":{\"name\":\"mcp__node_repl__js\",\"arguments\":\"{}\"}}]}}]}",
+            "",
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":2,\"id\":\"call_3\",\"function\":{\"name\":\"shell\",\"arguments\":\"{}\"}}]},\"finish_reason\":\"tool_calls\"}],\"usage\":{\"prompt_tokens\":5,\"completion_tokens\":4}}",
             "",
             "data: [DONE]",
             "",
         ]);
-        let (err, sent_any, usage) =
-            stream_forward(lines, &tx, crate::api_server::routes::Protocol::Responses, "resp_6", "m");
+        // 请求侧展平集合：multi_agent_v1__spawn_agent 为展平编码名；
+        // mcp__node_repl__js、shell 为原生扁平名（未入集合）
+        let mut ns = std::collections::HashSet::new();
+        ns.insert("multi_agent_v1__spawn_agent".to_string());
+        let (err, sent_any, _failed_inline, usage, _t) = stream_forward_ex_ns(
+            lines,
+            &tx,
+            crate::api_server::routes::Protocol::Responses,
+            "resp_6",
+            "m",
+            &ns,
+        );
         assert!(err.is_none());
         assert!(sent_any);
         assert!(usage.is_some());
@@ -1294,9 +1326,13 @@ mod tests {
         while let Ok(frame) = rx.try_recv() {
             body.push_str(&String::from_utf8_lossy(&frame.unwrap()));
         }
-        // done 项：编码名拆为 spawn_agent + namespace=multi_agent_v1
+        // done 项：集合命中的编码名拆为 spawn_agent + namespace=multi_agent_v1
         assert!(body.contains("\"name\":\"spawn_agent\""));
         assert!(body.contains("\"namespace\":\"multi_agent_v1\""));
+        // 审查 #4：原生含 `__` 扁平名不拆，保持单 name 字段
+        assert!(body.contains("\"name\":\"mcp__node_repl__js\""));
+        assert!(!body.contains("\"name\":\"js\""));
+        assert!(!body.contains("\"namespace\":\"mcp__node_repl\""));
         // 扁平工具不带 namespace 字段
         assert!(body.contains("\"name\":\"shell\""));
         assert!(!body.contains("\"namespace\":\"\""));

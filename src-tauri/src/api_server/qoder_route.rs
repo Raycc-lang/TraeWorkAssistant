@@ -749,13 +749,11 @@ fn run_qoder_stream(
                         empty_hits
                     ));
                     // 审查 P1-1：无健康账号错误帧按客户端协议分流（OpenAI/Anthropic/Responses
-                    // 各自形态，helper 内已含收尾帧），不再硬编码 OpenAI 格式
-                    send_stream_error(
-                        tx,
-                        proto,
-                        "no_healthy_account",
-                        "Qoder 上游暂无可用账号（无健康账号可调度），请稍后重试",
-                    );
+                    // 各自形态，helper 内已含收尾帧），不再硬编码 OpenAI 格式。
+                    // 审查 #8：message 改传 exhaust_msg（对齐 routes.rs Trae 流式收尾
+                    // L1949 同款）——空完成主导时归因文案（渠道指纹拦截/设备信任建议）
+                    // 随错误帧回传客户端，客户端仅看干瘪「无可用账号」无法排障
+                    send_stream_error(tx, proto, "no_healthy_account", &exhaust_msg);
                     return;
                 }
             },
@@ -1566,6 +1564,13 @@ pub async fn qoder_aggregate_chat(
                                 break;
                             }
                             RetryAction::Fatal => {
+                                // 三池统一：每请求一行终态记账——Fatal 为终态，补一行
+                                // 失败用量（对齐取号耗尽分支口径，防用量页缺行）
+                                state.record_usage_qoder(
+                                    &model, &picked.uid, &key_id, false, stream,
+                                    start_ts.elapsed().as_millis() as u64, 0, 0,
+                                    None, None, None, &session_ctx(&peek),
+                                );
                                 state.logger.log_request(
                                     "qoder", "POST", "/v1/chat/completions", &model, stream,
                                     status, &picked.uid,

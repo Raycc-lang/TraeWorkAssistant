@@ -760,9 +760,9 @@ pub async fn chat_completions(
                 let hint = effective_effort_hint(&state, r.effort_hint, explicit);
                 let body_vec = apply_effort_hint(body_vec, hint);
                 if stream {
-                    return wb_route::wb_stream_chat(state_clone, body_vec, r.model, start_ts, Protocol::OpenAi, key_str, guard);
+                    return wb_route::wb_stream_chat(state_clone, body_vec, Default::default(), r.model, start_ts, Protocol::OpenAi, key_str, guard);
                 }
-                return wb_route::wb_aggregate_chat(state_clone, body_vec, r.model, stream, start_ts, Protocol::OpenAi, key_str, guard).await;
+                return wb_route::wb_aggregate_chat(state_clone, body_vec, Default::default(), r.model, stream, start_ts, Protocol::OpenAi, key_str, guard).await;
             }
             TargetPool::Qoder => {
                 // Qoder 上游（p3-3）：请求体由执行路径按目录条目构造（agent 信封），
@@ -852,12 +852,14 @@ pub async fn responses_api(
     }
 
     // Responses → OpenAI chat 内部格式（纯投影，失败即 400）
-    let chat_body: Value = match super::wb_responses::responses_to_chat(&peek) {
-        Ok(v) => v,
-        Err(e) => {
-            return openai_error(StatusCode::BAD_REQUEST, "invalid_request_error", &e);
-        }
-    };
+    // 同时收集请求侧展平编码名集合，供回程 {name, namespace} 还原白名单（审查 #4）
+    let (chat_body, ns_encoded): (Value, std::collections::HashSet<String>) =
+        match super::wb_responses::responses_to_chat_with_ns(&peek) {
+            Ok((v, ns)) => (v, ns),
+            Err(e) => {
+                return openai_error(StatusCode::BAD_REQUEST, "invalid_request_error", &e);
+            }
+        };
 
     let state_clone = state.clone();
     let start_ts = std::time::Instant::now();
@@ -898,6 +900,7 @@ pub async fn responses_api(
         return wb_route::wb_tool_exec_chat(
             state_clone,
             chat_body,
+            ns_encoded,
             resolved_model,
             stream,
             start_ts,
@@ -913,9 +916,9 @@ pub async fn responses_api(
     let body_vec = apply_effort_hint(serde_json::to_vec(&chat_body).unwrap_or_default(), hint);
 
     if stream {
-        wb_route::wb_stream_chat(state_clone, body_vec, resolved_model, start_ts, Protocol::Responses, key_str, guard)
+        wb_route::wb_stream_chat(state_clone, body_vec, ns_encoded, resolved_model, start_ts, Protocol::Responses, key_str, guard)
     } else {
-        wb_route::wb_aggregate_chat(state_clone, body_vec, resolved_model, stream, start_ts, Protocol::Responses, key_str, guard).await
+        wb_route::wb_aggregate_chat(state_clone, body_vec, ns_encoded, resolved_model, stream, start_ts, Protocol::Responses, key_str, guard).await
     }
 }
 
@@ -1094,9 +1097,9 @@ pub async fn messages(
                 let hint = effective_effort_hint(&state, r.effort_hint, explicit);
                 let body_vec = apply_effort_hint(body_vec, hint);
                 if stream {
-                    return wb_route::wb_stream_chat(state_clone, body_vec, r.model, start_ts, Protocol::Anthropic, key_str, guard);
+                    return wb_route::wb_stream_chat(state_clone, body_vec, Default::default(), r.model, start_ts, Protocol::Anthropic, key_str, guard);
                 }
-                return wb_route::wb_aggregate_chat(state_clone, body_vec, r.model, stream, start_ts, Protocol::Anthropic, key_str, guard).await;
+                return wb_route::wb_aggregate_chat(state_clone, body_vec, Default::default(), r.model, stream, start_ts, Protocol::Anthropic, key_str, guard).await;
             }
             TargetPool::Qoder => {
                 // Qoder 上游（p3-3）：Anthropic 入参已在端点层投影为 OpenAI 内部格式
@@ -1247,9 +1250,9 @@ pub async fn completions(
                 let hint = effective_effort_hint(&state, r.effort_hint, false);
                 let body_vec = apply_effort_hint(body_vec, hint);
                 if stream {
-                    return wb_route::wb_stream_chat(state_clone, body_vec, r.model, start_ts, Protocol::OpenAiText, key_str, guard);
+                    return wb_route::wb_stream_chat(state_clone, body_vec, Default::default(), r.model, start_ts, Protocol::OpenAiText, key_str, guard);
                 }
-                return wb_route::wb_aggregate_chat(state_clone, body_vec, r.model, stream, start_ts, Protocol::OpenAiText, key_str, guard).await;
+                return wb_route::wb_aggregate_chat(state_clone, body_vec, Default::default(), r.model, stream, start_ts, Protocol::OpenAiText, key_str, guard).await;
             }
             TargetPool::Qoder => {
                 // Qoder 上游（p3-3）：text completions 入参已在端点层投影为内部格式

@@ -91,8 +91,10 @@ function DispatchCenterCard({
   // per_model 新增绑定行（本地输入态，添加时才落 policy）
   const [newPerModelName, setNewPerModelName] = useState('');
   const [newPerModelOrder, setNewPerModelOrder] = useState(POOL_ORDERS[0]);
-  // 账号保留剩余积分（issue #91）输入草稿：null = 未编辑（展示 policy 生效值），onBlur 才落盘
-  const [reserveDraft, setReserveDraft] = useState<number | null>(null);
+  // 账号保留剩余积分（issue #91）输入草稿：null = 未编辑（展示 policy 生效值），onBlur 才落盘。
+  // 审查 #14：字符串暂存——空串/中间态「-」「1e」等不立即转数字（Number('')=0 会把
+  // 「清空重输」瞬间变成保存 0），onBlur 时才解析，空串视为放弃编辑回显生效值
+  const [reserveDraft, setReserveDraft] = useState<string | null>(null);
   // F2：保存请求序号守卫（仅最新一次响应可写状态）
   const saveSeqRef = useRef(0);
 
@@ -299,13 +301,17 @@ function DispatchCenterCard({
               step={1}
               value={reserveDraft ?? policy.reserve_credits}
               disabled={saving}
-              onChange={(e) => {
-                const v = Number(e.target.value);
-                setReserveDraft(Number.isFinite(v) ? v : 0);
-              }}
+              onChange={(e) => setReserveDraft(e.target.value)}
               onBlur={() => {
-                if (reserveDraft != null && reserveDraft !== policy.reserve_credits) {
-                  void savePolicy({ reserve_credits: Math.max(0, reserveDraft) });
+                if (reserveDraft != null) {
+                  const n = Math.round(Number(reserveDraft));
+                  if (
+                    reserveDraft.trim() !== '' &&
+                    Number.isFinite(n) &&
+                    Math.max(0, n) !== policy.reserve_credits
+                  ) {
+                    void savePolicy({ reserve_credits: Math.max(0, n) });
+                  }
                 }
                 setReserveDraft(null);
               }}

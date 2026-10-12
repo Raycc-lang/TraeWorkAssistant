@@ -25,9 +25,9 @@
       nsExec::Exec 'taskkill /F /IM "ai-work-assistant.exe"'
       Pop $R9
       nsExec::Exec 'taskkill /F /IM "AI Work 助手.exe"'
-      Pop $R10
+      Pop $R6
       ${If} $R9 == 0
-      ${OrIf} $R10 == 0
+      ${OrIf} $R6 == 0
         ; 进程仍在运行：推进计数，500ms 后再查
         IntOp $R8 $R8 + 1
         Sleep 500

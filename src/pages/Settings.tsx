@@ -334,10 +334,11 @@ export default function Settings() {
 
           <div className="my-4 border-t border-slate-100 dark:border-zinc-800" />
 
-          <h3 className="mb-1 font-medium">6 层设备标识重置</h3>
+          <h3 className="mb-1 font-medium">{platform === 'windows' ? '6 层设备标识重置' : '设备标识重置（mac 5 层）'}</h3>
           <p className="mb-3 text-xs text-slate-500">
-            一次性重置所选应用的全部设备标识层：① machineid ② storage.json telemetry ③ storage.json aha.device ④
-            TinyStorage ⑤ 注册表 MachineGuid ⑥ webview 追踪数据。用于账号隔离与防关联，执行前请先关闭对应应用。
+            {platform === 'windows'
+              ? '一次性重置所选应用的全部设备标识层：① machineid ② storage.json telemetry ③ storage.json aha.device ④ TinyStorage ⑤ 注册表 MachineGuid ⑥ webview 追踪数据。用于账号隔离与防关联，执行前请先关闭对应应用。'
+              : '一次性重置所选应用的设备标识层：① machineid ② storage.json telemetry ③ storage.json aha.device ④ TinyStorage ⑤ webview 追踪数据（mac 无注册表 MachineGuid 层，自动跳过）。用于账号隔离与防关联，执行前请先关闭对应应用。'}
           </p>
           <div className="flex flex-wrap items-center gap-2">
             <select
@@ -354,7 +355,7 @@ export default function Settings() {
               disabled={deviceResetActive}
               className="btn-outline"
             >
-              <Fingerprint size={15} /> {deviceResetActive ? '重置中…' : '执行 6 层重置'}
+              <Fingerprint size={15} /> {deviceResetActive ? '重置中…' : platform === 'windows' ? '执行 6 层重置' : '执行重置（mac 5 层）'}
             </button>
             {deviceResetActive && (
               <span className="text-xs text-amber-500 animate-pulse">正在执行，请勿关闭应用…</span>

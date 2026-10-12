@@ -8,6 +8,8 @@
 //!
 //! 宽容解析红线：字段缺失不报错，只按规范降级（input 缺失 → 空消息列表）。
 
+use std::collections::HashSet;
+
 use serde_json::{json, Map, Value};
 
 /// Responses 请求 → OpenAI chat completions 内部格式
@@ -17,10 +19,21 @@ use serde_json::{json, Map, Value};
 /// tools 平铺（Responses 顶层 name/parameters → chat function 包裹）；
 /// max_output_tokens → max_tokens；reasoning.effort → reasoning_effort。
 pub fn responses_to_chat(body: &Value) -> Result<Value, String> {
+    responses_to_chat_with_ns(body).map(|(v, _)| v)
+}
+
+/// 同 responses_to_chat，并收集请求侧展平产生的编码名集合（`<ns>__<inner>`）。
+///
+/// 回程投影（completion_to_responses / stream_forward_ex 的 Responses 分支）仅对
+/// 集合命中者还原 {name, namespace} 双字段——客户端直配的原生扁平 function 名
+/// 含 `__`（如 MCP 的 mcp__server__tool）未经理展平，不得被误拆（审查 #4）。
+pub fn responses_to_chat_with_ns(body: &Value) -> Result<(Value, HashSet<String>), String> {
     if !body.is_object() {
         return Err("request body must be a JSON object".to_string());
     }
     let mut out = Map::new();
+    // 请求侧展平产生的编码名集合（回程拆分白名单）
+    let mut ns_encoded: HashSet<String> = HashSet::new();
 
     // 消息列表
     let mut messages: Vec<Value> = Vec::new();
@@ -37,7 +50,7 @@ pub fn responses_to_chat(body: &Value) -> Result<Value, String> {
             messages.push(json!({"role": "user", "content": s}));
         }
         Some(Value::Array(items)) => {
-            let converted = convert_input_items(items);
+            let converted = convert_input_items(items, Some(&mut ns_encoded));
             if converted.is_empty() {
                 return Err("input: at least one usable item required".to_string());
             }
@@ -93,7 +106,9 @@ pub fn responses_to_chat(body: &Value) -> Result<Value, String> {
                     if let Some(inner) = t.get("tools").and_then(|v| v.as_array()) {
                         for it in inner {
                             if let Some(name) = it.get("name").and_then(|v| v.as_str()) {
-                                converted.push(chat_function(&format!("{}__{}", ns, name), it));
+                                let encoded = format!("{}__{}", ns, name);
+                                ns_encoded.insert(encoded.clone());
+                                converted.push(chat_function(&encoded, it));
                             }
                         }
                     }
@@ -123,7 +138,7 @@ pub fn responses_to_chat(body: &Value) -> Result<Value, String> {
     }
 
     // tool_choice string 化（F-30）与 effort 改写由 wb_payload::prepare_wb_chat_body 统一处理
-    Ok(Value::Object(out))
+    Ok((Value::Object(out), ns_encoded))
 }
 
 /// Responses 工具对象 → chat function 包裹（name 可为编码名 `<ns>__<inner>`）
@@ -167,7 +182,10 @@ pub fn split_namespaced(name: &str) -> Option<(String, String)> {
 /// - 回填结果必须紧跟 assistant，其后才补被推迟的消息（顺序不可换，否则占位结果
 ///   又被推迟消息隔开、复现 11148）；孤儿/重复 `function_call_output`（无对应
 ///   未回填调用）直接丢弃
-fn convert_input_items(items: &[Value]) -> Vec<Value> {
+///
+/// `ns_encoded`：请求侧展平产生的编码名收集器（None = 纯转换不收集，测试用）。
+/// 历史 function_call 的 {name, namespace} 双字段拼回编码名后一并收集。
+fn convert_input_items(items: &[Value], mut ns_encoded: Option<&mut HashSet<String>>) -> Vec<Value> {
     let mut messages: Vec<Value> = Vec::new();
     // 已发出但尚未收到结果的 tool_call_id：非空即处于「工具结果必须连续」窗口。
     // 不变量：pending 非空 ⟺ open_assistant 为 Some
@@ -205,6 +223,9 @@ fn convert_input_items(items: &[Value]) -> Vec<Value> {
                 if let Some(ns) = item.get("namespace").and_then(|v| v.as_str()) {
                     if !ns.is_empty() && !name.is_empty() {
                         name = format!("{}__{}", ns, name);
+                        if let Some(set) = ns_encoded.as_deref_mut() {
+                            set.insert(name.clone());
+                        }
                     }
                 }
                 let args = item.get("arguments").and_then(|v| v.as_str()).unwrap_or("{}");
@@ -395,7 +416,20 @@ fn content_text(content: Option<&Value>) -> String {
 }
 
 /// 内部 OpenAI completion → Responses 对象（非流式 /v1/responses）
+///
+/// `ns_encoded`：请求侧 `responses_to_chat_with_ns` 收集的展平编码名集合。
+/// 仅对命中者还原 {name, namespace} 双字段；未命中（含原生 `__` 的扁平名，
+/// 如客户端直配的 MCP mcp__server__tool）保持单 name 字段（审查 #4）。
 pub fn completion_to_responses(v: &Value, resp_id: &str, model: &str) -> Value {
+    completion_to_responses_ns(v, resp_id, model, &HashSet::new())
+}
+
+pub fn completion_to_responses_ns(
+    v: &Value,
+    resp_id: &str,
+    model: &str,
+    ns_encoded: &HashSet<String>,
+) -> Value {
     let message = v
         .pointer("/choices/0/message")
         .cloned()
@@ -438,15 +472,17 @@ pub fn completion_to_responses(v: &Value, resp_id: &str, model: &str) -> Value {
                 "arguments": tc.pointer("/function/arguments").cloned().unwrap_or(json!("{}")),
             });
             // 编码名还原为 Codex 只接受的 {name, namespace} 双字段形态；
-            // 扁平 function 工具无 `__` 编码，保持单 name 字段（issue #93）
-            match split_namespaced(name) {
-                Some((ns, inner)) => {
+            // 仅请求侧真实经展平产生的编码名才拆分（集合命中）——原生含 `__`
+            // 的扁平 function 名保持单 name 字段（issue #93 / 审查 #4）
+            if ns_encoded.contains(name) {
+                if let Some((ns, inner)) = split_namespaced(name) {
                     fc["name"] = json!(inner);
                     fc["namespace"] = json!(ns);
-                }
-                None => {
+                } else {
                     fc["name"] = json!(name);
                 }
+            } else {
+                fc["name"] = json!(name);
             }
             output.push(fc);
         }
@@ -856,7 +892,9 @@ mod tests {
                                          "function": {"name": "shell", "arguments": "{}"}}]}}],
             "usage": {"prompt_tokens": 1, "completion_tokens": 1},
         });
-        let resp = completion_to_responses(&v, "resp_5", "m");
+        let mut ns = std::collections::HashSet::new();
+        ns.insert("multi_agent_v1__spawn_agent".to_string());
+        let resp = completion_to_responses_ns(&v, "resp_5", "m", &ns);
         let fc0 = &resp["output"][0];
         assert_eq!(fc0["type"], json!("function_call"));
         assert_eq!(fc0["name"], json!("spawn_agent"));
@@ -864,6 +902,31 @@ mod tests {
         let fc1 = &resp["output"][1];
         assert_eq!(fc1["name"], json!("shell"));
         assert!(fc1.get("namespace").is_none());
+    }
+
+    /// 审查 #4：未在请求侧展平集合命中的原生含 `__` 扁平名（如客户端直配的
+    /// MCP mcp__server__tool）回程不得被误拆为 {name, namespace} 双字段
+    #[test]
+    fn completion_keeps_native_flat_names_with_double_underscore() {
+        let v = json!({
+            "choices": [{"index": 0, "finish_reason": "tool_calls",
+                         "message": {"role": "assistant", "content": null,
+                                     "tool_calls": [{"id": "call_1", "type": "function",
+                                                     "function": {"name": "mcp__node_repl__js", "arguments": "{}"}}]}}],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1},
+        });
+        // 空集合（对应 qoder/custom 等无 Responses 入口的回程兜底路径）
+        let resp = completion_to_responses(&v, "resp_6", "m");
+        let fc = &resp["output"][0];
+        assert_eq!(fc["name"], json!("mcp__node_repl__js"));
+        assert!(fc.get("namespace").is_none());
+        // 集合命中才拆分
+        let mut ns = std::collections::HashSet::new();
+        ns.insert("mcp__node_repl__js".to_string());
+        let resp2 = completion_to_responses_ns(&v, "resp_7", "m", &ns);
+        let fc2 = &resp2["output"][0];
+        assert_eq!(fc2["name"], json!("js"));
+        assert_eq!(fc2["namespace"], json!("mcp__node_repl"));
     }
 
     /// split_namespaced：按最后一个 `__` 切分（兼容 namespace 自身含 `__`），
@@ -875,6 +938,7 @@ mod tests {
             Some(("multi_agent_v1".into(), "spawn_agent".into()))
         );
         // namespace 自身含 `__`：按最后一个切分，ns 完整保留
+        // （仅当该名为请求侧展平编码名、集合命中时才会走到拆分——审查 #4）
         assert_eq!(
             split_namespaced("mcp__node_repl__js"),
             Some(("mcp__node_repl".into(), "js".into()))
@@ -882,5 +946,51 @@ mod tests {
         assert_eq!(split_namespaced("shell"), None);
         assert_eq!(split_namespaced("__spawn"), None);
         assert_eq!(split_namespaced("ns__"), None);
+    }
+
+    /// 审查 #4 端到端：请求侧展平集合贯穿请求 → 回程，编码名命中拆分、
+    /// 原生 `__` 名不拆
+    #[test]
+    fn responses_roundtrip_collects_encoded_names() {
+        let body = json!({
+            "model": "m",
+            "input": [
+                {"type": "function_call", "call_id": "call_h", "name": "js", "namespace": "mcp__node_repl", "arguments": "{}"},
+                {"type": "function_call_output", "call_id": "call_h", "output": "ok"}
+            ],
+            "tools": [
+                {"type": "namespace", "name": "multi_agent_v1", "tools": [
+                    {"type": "function", "name": "spawn_agent", "description": "spawn", "parameters": {"type": "object"}}
+                ]},
+                {"type": "function", "name": "mcp__fs__read", "description": "read", "parameters": {"type": "object"}}
+            ],
+        });
+        let (chat, ns) = responses_to_chat_with_ns(&body).unwrap();
+        // 请求侧：namespace 展平编码名 + 历史 function_call 拼回编码名均入集合
+        assert!(ns.contains("multi_agent_v1__spawn_agent"));
+        assert!(ns.contains("mcp__node_repl__js"));
+        // 客户端直配的原生扁平名不入集合
+        assert!(!ns.contains("mcp__fs__read"));
+        let tools = chat["tools"].as_array().unwrap();
+        // namespace 展平 1 个 + 直配 function 1 个；历史 function_call 不产生 tools
+        assert_eq!(tools.len(), 2);
+
+        // 回程：命中集合的编码名拆双字段，原生 `__` 名保持单字段
+        let v = json!({
+            "choices": [{"index": 0, "finish_reason": "tool_calls",
+                         "message": {"role": "assistant", "content": null,
+                                     "tool_calls": [
+                                        {"id": "c1", "type": "function",
+                                         "function": {"name": "multi_agent_v1__spawn_agent", "arguments": "{}"}},
+                                        {"id": "c2", "type": "function",
+                                         "function": {"name": "mcp__fs__read", "arguments": "{}"}}]}}],
+        });
+        let resp = completion_to_responses_ns(&v, "resp_rt", "m", &ns);
+        let fc0 = &resp["output"][0];
+        assert_eq!(fc0["name"], json!("spawn_agent"));
+        assert_eq!(fc0["namespace"], json!("multi_agent_v1"));
+        let fc1 = &resp["output"][1];
+        assert_eq!(fc1["name"], json!("mcp__fs__read"));
+        assert!(fc1.get("namespace").is_none());
     }
 }

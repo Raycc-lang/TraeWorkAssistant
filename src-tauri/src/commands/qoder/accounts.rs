@@ -413,7 +413,9 @@ pub async fn qoder_account_refresh_token(
                     Some(qoder_common::CrossProcLockFail::Busy)
                 );
                 return Err(if busy {
-                    "另一进程正在续期该账号，请稍后重试".to_string()
+                    // 审查 #10：锁 scope 为 "refresh"（全账号共享，与 qoder-refresh 任务
+                    // 一致），被占用时可能是其它账号在刷新——不指名「该账号」误导
+                    "另一进程正在执行凭证刷新，请稍后重试".to_string()
                 } else {
                     format!("续期保护锁不可用（{reason}），请稍后重试")
                 });

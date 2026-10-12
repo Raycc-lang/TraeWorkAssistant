@@ -213,9 +213,11 @@ pub async fn do_start(
         }
         #[cfg(not(target_os = "windows"))]
         {
-            // F-75 M2-2.1：mac 补齐 Windows 同等能力——读取用户 VPN（scutil）作为
-            // 上游透传，并在停止时经 PREV_SYSTEM_PROXY 还原（语义与 Windows 分支一致）
-            match crate::platform::proxy_ctl::get_system_proxy() {
+            // F-75 M2-2.1：mac 补齐 Windows 同等能力——读取用户 VPN 作为
+            // 上游透传，并在停止时经 PREV_SYSTEM_PROXY 还原（语义与 Windows 分支一致）。
+            // 审查 #11：capture_proxy_snapshot_services 同时记录「启用代理的网络服务
+            // 清单」，还原时仅对这些服务写回用户 VPN、其余服务 off（还原面收窄）
+            match crate::platform::proxy_ctl::capture_proxy_snapshot_services() {
                 Some((en, sv, ov))
                     if sv != proxy_addr && !sv.contains(&format!("127.0.0.1:{port}")) =>
                 {
@@ -474,7 +476,9 @@ fn apply_prev_proxy(enable: bool, server: &str, bypass: &str) -> Result<(), Stri
     }
     #[cfg(target_os = "macos")]
     {
-        crate::platform::proxy_ctl::apply_system_proxy(enable, server, bypass)
+        // 审查 #11：还原面收窄——仅对捕获时启用代理的服务写回用户 VPN，
+        // 其余服务 off 清接管残留（capture_proxy_snapshot_services 记录的清单）
+        crate::platform::proxy_ctl::restore_system_proxy_services(enable, server, bypass)
     }
 }
 

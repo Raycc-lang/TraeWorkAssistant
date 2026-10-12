@@ -413,6 +413,7 @@ fn log_longctx_hint(state: &ApiSharedState, peek: &Value, model: &str) {
 pub fn wb_stream_chat(
     state: Arc<ApiSharedState>,
     body_vec: Vec<u8>,
+    ns_encoded: std::collections::HashSet<String>,
     model: String,
     start_ts: Instant,
     proto: Protocol,
@@ -462,7 +463,7 @@ pub fn wb_stream_chat(
             });
         }
 
-        run_wb_stream(&state, &body_vec, &model, proto, &key_id, &chat_id, &tx, start_ts, guard);
+        run_wb_stream(&state, &body_vec, &ns_encoded, &model, proto, &key_id, &chat_id, &tx, start_ts, guard);
     });
 
     let stream = ReceiverStream::new(rx);
@@ -483,6 +484,7 @@ pub fn wb_stream_chat(
 fn run_wb_stream(
     state: &Arc<ApiSharedState>,
     body_vec: &[u8],
+    ns_encoded: &std::collections::HashSet<String>,
     model: &str,
     proto: Protocol,
     key_id: &str,
@@ -687,7 +689,7 @@ fn run_wb_stream(
                         Box::new(win.lines) as Box<dyn Iterator<Item = String> + Send>,
                     );
                     let (error_info, sent_any, failed_inline, usage, eof_truncated) =
-                        wb_sse::stream_forward_ex(win_lines, tx, proto, chat_id, model);
+                        wb_sse::stream_forward_ex_ns(win_lines, tx, proto, chat_id, model, ns_encoded);
                     let duration_ms = start_ts.elapsed().as_millis() as u64;
                     {
                         let (pt, ct) = usage
@@ -900,6 +902,7 @@ fn run_wb_stream(
 pub async fn wb_aggregate_chat(
     state: Arc<ApiSharedState>,
     body_vec: Vec<u8>,
+    ns_encoded: std::collections::HashSet<String>,
     model: String,
     stream: bool,
     start_ts: Instant,
@@ -1202,6 +1205,10 @@ pub async fn wb_aggregate_chat(
                                 break;
                             }
                             RetryAction::Fatal => {
+                                // 三池统一：每请求一行终态记账——Fatal 为终态，补一行
+                                // 失败用量（对齐耗尽分支口径，防用量页缺行）
+                                state.record_usage(true, &model, &picked.uid, &key_id, false, stream,
+                                    start_ts.elapsed().as_millis() as u64, 0, 0);
                                 state.logger.log_request(
                                     "buddy", "POST", "/v2/chat/completions", &model, stream, status, &picked.uid,
                                     start_ts.elapsed().as_millis() as u64,
@@ -1231,10 +1238,11 @@ pub async fn wb_aggregate_chat(
                     &model_out,
                 ),
                 Protocol::OpenAiText => wb_sse::completion_to_text(&resp, &model_out),
-                Protocol::Responses => super::wb_responses::completion_to_responses(
+                Protocol::Responses => super::wb_responses::completion_to_responses_ns(
                     &resp,
                     &format!("resp_{}", now_ts()),
                     &model_out,
+                    &ns_encoded,
                 ),
                 Protocol::OpenAi => resp,
             };
@@ -1288,6 +1296,7 @@ pub async fn wb_aggregate_chat(
 pub async fn wb_tool_exec_chat(
     state: Arc<ApiSharedState>,
     mut chat_body: Value,
+    ns_encoded: std::collections::HashSet<String>,
     model: String,
     stream: bool,
     start_ts: Instant,
@@ -1654,7 +1663,7 @@ pub async fn wb_tool_exec_chat(
     };
 
     let resp_obj = {
-        let mut r = super::wb_responses::completion_to_responses(&final_completion, &resp_id, &model);
+        let mut r = super::wb_responses::completion_to_responses_ns(&final_completion, &resp_id, &model, &ns_encoded);
         if !ws_items.is_empty() {
             let mut output = ws_items;
             if let Some(old) = r.get("output").and_then(|o| o.as_array()).cloned() {

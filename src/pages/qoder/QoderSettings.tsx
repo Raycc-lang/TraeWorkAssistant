@@ -526,10 +526,9 @@ export default function QoderSettings() {
                 max={90}
                 value={compactDays}
                 onChange={(e) => setCompactDays(e.target.value)}
-                onBlur={() => {
-                  const n = Math.min(90, Math.max(1, Math.round(Number(compactDays) || 3)));
-                  setCompactDays(String(n));
-                }}
+                // 不做 onBlur 抢先钳制（对齐 renewHours 先例）：输入中途（清空重输、
+                // 输入 15 途经 1）会被改写成 1/3 干扰编辑；越界钳制与格式校验
+                // 统一在「保存配置」时执行（compactDaysNum + 正则拦截）
                 className="input h-9 !w-20 text-sm"
               />
               <span className="text-xs text-slate-400">

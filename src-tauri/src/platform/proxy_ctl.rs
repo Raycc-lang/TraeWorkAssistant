@@ -19,7 +19,9 @@ pub fn get_system_proxy() -> Option<(bool, String, String)> {
     }
     #[cfg(target_os = "macos")]
     {
-        networksetup_read()
+        // 服务清单仅还原面收窄消费（capture_system_proxy_snapshot 路径），
+        // 普通读取（updater/bypass）只需快照三元组
+        networksetup_read().map(|(snap, _)| snap)
     }
 }
 
@@ -55,13 +57,83 @@ pub(crate) fn network_services() -> Result<Vec<String>, String> {
 
 #[cfg(target_os = "macos")]
 fn networksetup_apply(enable: bool, server: &str, bypass: &str) -> Result<(), String> {
-    let services = network_services()?;
-    let (host, port) = server
-        .rsplit_once(':')
-        .ok_or_else(|| format!("系统代理地址格式非法（应为 host:port）: {server}"))?;
+    networksetup_apply_services(enable, server, bypass, &network_services()?)
+}
+
+/// #11 还原面收窄：捕获快照时启用代理的网络服务清单（mac 专用）。
+/// `capture_proxy_snapshot_services` 写入、`restore_system_proxy_services` 消费；
+/// None = 本次启动未捕获到清单（读失败/无代理），还原退化为全服务写（旧行为）。
+#[cfg(target_os = "macos")]
+static CAPTURED_PROXY_SERVICES: std::sync::Mutex<Option<Vec<String>>> = std::sync::Mutex::new(None);
+
+/// mac 快照捕获（commands/proxy.rs do_start 消费）：读快照三元组的同时，
+/// 把「已启用代理的服务清单」存入 CAPTURED_PROXY_SERVICES 供还原面收窄。
+/// 读失败/无代理时清空清单，避免上一次启动的陈旧清单被本次还原误用。
+#[cfg(target_os = "macos")]
+pub fn capture_proxy_snapshot_services() -> Option<(bool, String, String)> {
+    let captured = networksetup_read();
+    *CAPTURED_PROXY_SERVICES
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = captured.as_ref().map(|(_, svcs)| svcs.clone());
+    captured.map(|(snap, _)| snap)
+}
+
+/// mac 还原路径（#11 还原面收窄核心，commands/proxy.rs apply_prev_proxy 消费）：
+/// - 捕获时启用代理的服务 → 原样写回用户 VPN 值（enable=true）；
+/// - 其余全部服务 → off（清除接管时铺开的 127.0.0.1:port 残留，否则其余网卡
+///   仍指向已停止的本机代理，用户断网）；
+/// - 未捕获过清单（防御）→ 退化为全服务写（旧行为）。
+#[cfg(target_os = "macos")]
+pub fn restore_system_proxy_services(enable: bool, server: &str, bypass: &str) -> Result<(), String> {
+    let captured = CAPTURED_PROXY_SERVICES
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
+    let Some(list) = captured.filter(|l| !l.is_empty()) else {
+        return networksetup_apply(enable, server, bypass);
+    };
+    let others: Vec<String> = network_services()?
+        .into_iter()
+        .filter(|s| !list.contains(s))
+        .collect();
+    // 先关其余服务（清接管残留），再还原捕获服务；两步错误独立收集合并
+    let r_others = if others.is_empty() {
+        Ok(())
+    } else {
+        networksetup_apply_services(false, "", "", &others)
+    };
+    let r_captured = networksetup_apply_services(enable, server, bypass, &list);
+    match (r_others, r_captured) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(a), Err(b)) => Err(format!("{a}；{b}")),
+        (Err(e), Ok(())) | (Ok(()), Err(e)) => Err(e),
+    }
+}
+
+/// 逐服务写代理（#11 还原面收窄核心）：与 networksetup_apply 同构，但服务清单由
+/// 调用方给定——还原路径仅触碰「捕获时已启用代理的服务」，不把用户 VPN 快照
+/// 铺满全部网络服务（用户 VPN 通常只配在单一服务上，全服务还原会给原本无代理的
+/// Wi-Fi/VPN 虚拟网卡强塞用户代理地址）
+#[cfg(target_os = "macos")]
+pub(crate) fn networksetup_apply_services(
+    enable: bool,
+    server: &str,
+    bypass: &str,
+    services: &[String],
+) -> Result<(), String> {
+    // server 仅 enable=true 时需要（off 分支硬编码 0.0.0.0/0）——off 路径调用方
+    // 传 ("", "")，提前解析会把「地址格式非法」误报给合法的关闭操作
+    let (host, port) = if enable {
+        let (h, p) = server
+            .rsplit_once(':')
+            .ok_or_else(|| format!("系统代理地址格式非法（应为 host:port）: {server}"))?;
+        (h.to_string(), p.to_string())
+    } else {
+        (String::new(), String::new())
+    };
 
     let mut errs: Vec<String> = Vec::new();
-    for svc in &services {
+    for svc in services {
         let run = |args: &[&str]| -> Option<String> {
             crate::platform::cmd::sys_output(
                 crate::platform::cmd::sys_command("networksetup").args(args),
@@ -70,8 +142,8 @@ fn networksetup_apply(enable: bool, server: &str, bypass: &str) -> Result<(), St
         };
         if enable {
             for args in [
-                vec!["-setwebproxy", svc, host, port, "on"],
-                vec!["-setsecurewebproxy", svc, host, port, "on"],
+                vec!["-setwebproxy", svc.as_str(), host.as_str(), port.as_str(), "on"],
+                vec!["-setsecurewebproxy", svc.as_str(), host.as_str(), port.as_str(), "on"],
             ] {
                 if let Some(e) = run(&args) {
                     errs.push(format!("{svc}: {e}"));
@@ -115,10 +187,14 @@ fn networksetup_apply(enable: bool, server: &str, bypass: &str) -> Result<(), St
 /// 读系统代理（mac 分派，M-1 侦察 ⑧ 2026-09-20 实测）：macOS 12 的 `scutil`
 /// **不支持 `--proxies` 子命令**（unrecognized option），原 scutil_parse 恒 None
 /// （启动前捕获用户 VPN 能力失效）——改逐网络服务 `networksetup -getwebproxy`
-/// 读（与 networksetup_apply 逐服务写对称），任一服务 HTTP 代理启用即返回。
+/// 读（与 networksetup_apply 逐服务写对称），任一服务代理启用即返回。
+/// 审查 #11：遍历全部服务收集「已启用代理的服务清单」一并返回——还原面收窄
+/// 只还原捕获时启用代理的服务，不把用户 VPN 铺满全部网络服务
 #[cfg(target_os = "macos")]
-fn networksetup_read() -> Option<(bool, String, String)> {
+fn networksetup_read() -> Option<((bool, String, String), Vec<String>)> {
     let services = network_services().ok()?;
+    let mut result: Option<(bool, String, String)> = None;
+    let mut enabled_services: Vec<String> = Vec::new();
     for svc in &services {
         let out = |args: &[&str]| -> Option<String> {
             crate::platform::cmd::sys_output(
@@ -128,15 +204,19 @@ fn networksetup_read() -> Option<(bool, String, String)> {
         };
         // 输出形如：Enabled: Yes / Server: 127.0.0.1 / Port: 7890 /
         // Authenticated Proxy Enabled: 0（前缀匹配安全：Server 不命中认证段）
-        // 审查 P1：单个服务的 -getwebproxy 查询失败（VPN 虚拟网卡/失效服务等）
+        // 审查 P1：单个服务的查询失败（VPN 虚拟网卡/失效服务等）
         // 只跳过该服务继续下一个，不得让整个函数返回 None——否则用户 VPN 代理
         // 快照丢失、停止时被误清（对齐写路径「逐服务独立收集错误」语义）
-        let Some(web) = out(&["-getwebproxy", svc]) else {
+        // 审查 #6：HTTP 与 HTTPS（secure）代理是两个独立开关（部分 VPN 工具
+        // 仅启用 secure web proxy），写路径成对写两键、读路径也须成对读两键，
+        // 任一启用即纳入快照（HTTP 优先，与写路径同 server 对称）
+        let picked = pick_proxy_text(
+            out(&["-getwebproxy", svc]),
+            out(&["-getsecurewebproxy", svc]),
+        );
+        let Some(web) = picked else {
             continue;
         };
-        if parse_enabled(&web) != Some(true) {
-            continue;
-        }
         let (Some(host), Some(port)) = (parse_field(&web, "Server"), parse_field(&web, "Port"))
         else {
             continue;
@@ -157,18 +237,38 @@ fn networksetup_read() -> Option<(bool, String, String)> {
                     .join(";")
             })
             .unwrap_or_default();
-        return Some((true, format!("{host}:{port}"), bypass));
+        // 快照取首个命中服务（与原「任一启用即返回」口径一致）；服务清单收集
+        // 全部启用代理的服务——还原面收窄的数据来源
+        if result.is_none() {
+            result = Some((true, format!("{host}:{port}"), bypass));
+        }
+        enabled_services.push(svc.clone());
     }
-    None
+    result.map(|r| (r, enabled_services))
 }
 
-/// networksetup 读输出 Enabled 行解析（Yes/No；缺行返回 None）
-#[cfg(target_os = "macos")]
+/// networksetup 读输出 Enabled 行解析（Yes/No；缺行返回 None）。
+/// 跨平台纯函数（pick_proxy_text 消费；Windows 主代码不使用故 allow dead_code）
+#[allow(dead_code)]
 fn parse_enabled(text: &str) -> Option<bool> {
     text.lines()
         .find(|l| l.trim_start().starts_with("Enabled"))
         .and_then(|l| l.split_once(':'))
         .map(|(_, v)| v.trim().eq_ignore_ascii_case("yes"))
+}
+
+/// HTTP 与 secure（HTTPS）两路读输出中选中启用的一路：HTTP 启用优先（与写路径
+/// 两键同 server 对称），其次 secure；两路都未启用/不可读返回 None。
+/// 跨平台纯函数（不依赖真机 networksetup），锁定「任一启用即纳入快照」口径
+fn pick_proxy_text(web: Option<String>, secure: Option<String>) -> Option<String> {
+    let enabled = |t: &Option<String>| t.as_deref().and_then(parse_enabled) == Some(true);
+    if enabled(&web) {
+        web
+    } else if enabled(&secure) {
+        secure
+    } else {
+        None
+    }
 }
 
 /// networksetup 读输出字段解析（"Key: value" 形态，前缀匹配）
@@ -256,6 +356,19 @@ mod tests {
         assert_eq!(parse_enabled(&off), Some(false));
         let auth = "Enabled: Yes\nServer: 1.2.3.4\nPort: 8888\nAuthenticated Proxy Enabled: Yes\n";
         assert_eq!(parse_field(&auth, "Server").as_deref(), Some("1.2.3.4"));
+    }
+
+    #[test]
+    fn pick_proxy_text_任一启用即纳入快照() {
+        let on = Some("Enabled: Yes\nServer: 127.0.0.1\nPort: 7890\n".into());
+        let off = Some("Enabled: No\nServer: 0.0.0.0\nPort: 0\n".into());
+        // HTTP 启用优先（与写路径两键同 server 对称）
+        assert_eq!(pick_proxy_text(on.clone(), off.clone()), on);
+        // 仅 secure 启用（部分 VPN 工具形态）：原审查漏读场景
+        assert_eq!(pick_proxy_text(off.clone(), on.clone()), on);
+        // 两路都未启用 / 不可读 → None（不纳入快照）
+        assert_eq!(pick_proxy_text(off.clone(), off.clone()), None);
+        assert_eq!(pick_proxy_text(None, None), None);
     }
 
     #[test]

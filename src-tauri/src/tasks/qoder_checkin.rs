@@ -1078,11 +1078,18 @@ fn process_account(
         "already" => "already",
         _ => "fail",
     };
-    // 空活动列表诊断（脱敏：只记账号与结论，不含 token/响应原文）
+    // 空活动列表诊断（脱敏：只记账号与结论，不含 token/响应原文）。
+    // 审查 #7：同时记录 Cosy-MachineOS 实发值——mac 侧 aarch64/x86_64_darwin
+    // 为编译期推断（未经真机抓包验证），若服务端按投放条件过滤该特征，列表
+    // 将持续为空；带出实发值便于用户上报时定位是否需调整 mac 形态常量
     if message.starts_with(EMPTY_CAMPAIGNS_TAG) {
         fs_utils::app_log(
             &state.data_dir,
-            &format!("qoder 签到空活动列表: {aid}（Cosy-ClientType={} 已带；若持续出现请核查活动状态/接口结构 R-9）", qoder_common::COSY_CLIENT_TYPE),
+            &format!(
+                "qoder 签到空活动列表: {aid}（Cosy-ClientType={} Cosy-MachineOS={} 已带；若持续出现请核查活动状态/接口结构/设备特征过滤 R-9）",
+                qoder_common::COSY_CLIENT_TYPE,
+                qoder_common::client_machine_os()
+            ),
         );
     }
     let mut ev = json!({ "user_id": aid, "name": base_ev["name"], "status": status_txt, "message": message });

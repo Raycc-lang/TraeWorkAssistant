@@ -52,11 +52,13 @@ fn open_in_browser(url: &str) -> Result<(), String> {
 }
 
 /// macOS 实装（2026-10-05 合并审查）：`open <url>` 走 LaunchServices 默认浏览器，
-/// 与 Windows cmd start 同语义；URL 校验逻辑跨平台共用，调用方 qoder_oauth_login 零改动
+/// 与 Windows cmd start 同语义；URL 校验逻辑跨平台共用，调用方 qoder_oauth_login 零改动。
+/// 审查 #9：改走 sys_command 收口（对齐 workbuddy/cert/env 同款）——保持命令构建
+/// 单一来源，平台附加标志（如 Windows CREATE_NO_WINDOW）变更时此处自动跟随
 #[cfg(target_os = "macos")]
 fn open_in_browser(url: &str) -> Result<(), String> {
     validate_open_url(url)?;
-    Command::new("open")
+    crate::platform::cmd::sys_command("open")
         .arg(url)
         .spawn()
         .map(|_| ())

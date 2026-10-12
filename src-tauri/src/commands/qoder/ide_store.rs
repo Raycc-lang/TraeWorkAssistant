@@ -360,36 +360,49 @@ pub struct QoderIdeScanResult {
 /// mac = Keychain Safe Storage + AES-128-CBC（见模块头【macOS 实装】），
 /// 入池/落库主流程两端同构。
 /// async：命令含 Keychain/DPAPI 解密 + SQLite 读取等阻塞 IO，移出主线程避免卡 UI。
-#[tauri::command(async)]
-pub fn qoder_ide_scan(
-    state: State<AppState>,
+#[tauri::command]
+pub async fn qoder_ide_scan(
+    state: State<'_, AppState>,
     runtime: State<'_, std::sync::Mutex<Option<crate::commands::api_server::ApiServerRuntime>>>,
 ) -> Result<QoderIdeScanResult, String> {
-    let data_dir = ide_data_dir()
-        .ok_or("无法定位 QoderCN 数据目录（平台数据根缺失）")?;
-    let login = match scan_ide_login(&data_dir) {
-        Ok(l) => l,
-        Err(e) => {
-            return Ok(QoderIdeScanResult {
-                found: false,
-                reason: e,
-                ..Default::default()
-            })
-        }
-    };
-    if login.token.is_empty() {
-        return Ok(QoderIdeScanResult {
-            found: false,
-            reason: "登录态中无 token".into(),
-            ..Default::default()
-        });
-    }
+    // Keychain/DPAPI 解密 + SQLite 读写均为阻塞操作：整体移入 spawn_blocking
+    // 移出 async worker 线程（审查 #5 修复，对齐 qoder_live_logins 惯例）；
+    // 仅网关热重载留在 async 侧——reload_pools_if_running 需借用 runtime State
+    // 引用（非 'static），无法进入 spawn_blocking 闭包
+    let st = state.inner().clone();
+    let (result, should_reload) = tauri::async_runtime::spawn_blocking(
+        move || -> Result<(QoderIdeScanResult, bool), String> {
+            let data_dir = ide_data_dir()
+                .ok_or("无法定位 QoderCN 数据目录（平台数据根缺失）")?;
+            let login = match scan_ide_login(&data_dir) {
+                Ok(l) => l,
+                Err(e) => {
+                    return Ok((
+                        QoderIdeScanResult {
+                            found: false,
+                            reason: e,
+                            ..Default::default()
+                        },
+                        false,
+                    ))
+                }
+            };
+            if login.token.is_empty() {
+                return Ok((
+                    QoderIdeScanResult {
+                        found: false,
+                        reason: "登录态中无 token".into(),
+                        ..Default::default()
+                    },
+                    false,
+                ));
+            }
     let id = account_id_of(&login.token);
     // I09：持锁读-改-写，防并发整池覆盖丢更新。
     // P2 审查修复：入池匹配补 uid 兜底（对齐 oauth/data_io/PAT 导入的同款语义）——
     // 同账号先经其他通道入池（token 派生 id 不同）后再扫描 IDE 时，uid 命中保留
     // 原 id，防同 uid 重复账号；凭证按生效 id 落库，与池条目对齐
-    let (updated, nickname, effective_id) = with_pool_mut(&state, |accounts| {
+    let (updated, nickname, effective_id) = with_pool_mut(&st, |accounts| {
         if let Some(a) = accounts
             .iter_mut()
             .find(|a| a.id == id || (!login.uid.is_empty() && a.uid == login.uid))
@@ -458,18 +471,28 @@ pub fn qoder_ide_scan(
     };
     // 凭证按生效 id 落库（uid 兜底命中时为池内既有 id），与池条目对齐——
     // 若按派生 id 落库则凭证与池条目错位，后续扫描/导入按 id 查不到新凭证
-    qoder_common::save_token_store(&state, &effective_id, &creds)?;
-    crate::fs_utils::app_log(&state.data_dir, &format!("Qoder IDE 存储账号已发现并导入: {effective_id}"));
+    qoder_common::save_token_store(&st, &effective_id, &creds)?;
+    crate::fs_utils::app_log(&st.data_dir, &format!("Qoder IDE 存储账号已发现并导入: {effective_id}"));
+            Ok((
+                QoderIdeScanResult {
+                    found: true,
+                    imported: !updated,
+                    updated,
+                    account_id: effective_id,
+                    nickname,
+                    reason: String::new(),
+                },
+                true,
+            ))
+        },
+    )
+    .await
+    .map_err(|e| format!("IDE 存储扫描任务失败: {e}"))??;
     // 新账号/凭证变更联动网关池热重载（fail-open 即时入池调度；服务未运行时 no-op）
-    crate::commands::api_server::reload_pools_if_running(&state, runtime.inner());
-    Ok(QoderIdeScanResult {
-        found: true,
-        imported: !updated,
-        updated,
-        account_id: effective_id,
-        nickname,
-        reason: String::new(),
-    })
+    if should_reload {
+        crate::commands::api_server::reload_pools_if_running(&state, runtime.inner());
+    }
+    Ok(result)
 }
 
 /// 平台无关测试（parse_buffer/expire/vscdb 全为跨平台函数；2026-10-05 终审
