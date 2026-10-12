@@ -53,6 +53,22 @@ pub(crate) fn load_pool_file(data_dir: &std::path::Path) -> ApiPoolFile {
     load_pool_file_with_legacy_migration(store::db(data_dir).kv_get_raw("api_pool"))
 }
 
+/// api_pool 配置读-改-写互斥（审查 B1）：kv("api_pool") 为整文档覆盖写，
+/// 三个写点（pool_set / 分组删除清引用 / 标签删除清引用）的
+/// 「load_pool_file → 修改 → kv_set」复合段并发时，旧副本整文档写回会互相
+/// 覆盖丢更新。所有此类复合段必须持本锁；纯读（load_pool_file）无需持锁。
+/// 锁序约定：叶子锁——现有写点均在池锁/org 锁释放后获取本锁；严禁持本锁
+/// 再取任何池锁或 org_defs_lock。启动迁移（kv api_pool 首次落库）在 server
+/// bind 前完成，无并发窗口，不取本锁。
+static POOL_CFG_LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+
+pub(crate) fn api_pool_cfg_lock() -> std::sync::MutexGuard<'static, ()> {
+    POOL_CFG_LOCK
+        .get_or_init(|| std::sync::Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+}
+
 /// 汇总网关共享状态（原 do_start 装配段）：网关设置 → 池装配 → 诊断日志 → 共享状态。
 /// 不负责监听绑定（由调用方 merge build_router 后自行 axum::serve）。
 pub fn build_shared(state: &AppState) -> Arc<ApiSharedState> {

@@ -324,7 +324,9 @@ impl UsageFile {
         );
     }
 
-    /// 按桶记录一次请求（带 TTFT，F-76）
+    /// 按桶记录一次请求（带 TTFT，F-76）；日期自取（today_key）。
+    /// 调用方已持有请求入口日期时请用 `record_in_ttfb_on`（审查修复 G3：
+    /// 入口取日与写入路径二次取日跨零点漂移，会把同一请求分裂到两个日期行）
     #[allow(clippy::too_many_arguments)]
     pub fn record_in_ttfb(
         &mut self,
@@ -339,8 +341,32 @@ impl UsageFile {
         completion_tokens: u64,
         ttfb_ms: Option<u64>,
     ) {
-        let day = self.bucket_mut(bucket).entry(today_key()).or_default();
-        day.record(
+        self.record_in_ttfb_on(
+            bucket, &today_key(), model, uid, key_id, ok, is_stream, duration_ms,
+            prompt_tokens, completion_tokens, ttfb_ms,
+        );
+    }
+
+    /// 按桶记录一次请求到指定日期行（带 TTFT，F-76）：`day` 由调用方在请求
+    /// 入口一次性取定（审查修复 G3），保证同请求的请求统计与积分/会话流水
+    /// 落同一日期行，不在写入路径二次取当前日期
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_in_ttfb_on(
+        &mut self,
+        bucket: UsageBucket,
+        day: &str,
+        model: &str,
+        uid: &str,
+        key_id: &str,
+        ok: bool,
+        is_stream: bool,
+        duration_ms: u64,
+        prompt_tokens: u64,
+        completion_tokens: u64,
+        ttfb_ms: Option<u64>,
+    ) {
+        let d = self.bucket_mut(bucket).entry(day.to_string()).or_default();
+        d.record(
             model, uid, key_id, ok, is_stream, duration_ms, prompt_tokens,
             completion_tokens, ttfb_ms,
         );

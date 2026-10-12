@@ -279,13 +279,17 @@ fn safe_slice(s: &str, n: usize) -> &str {
 struct QoderHedgeLease {
     uid: String,
     counter: std::sync::Arc<std::sync::atomic::AtomicU32>,
+    /// 审查修复 G4：对冲信封的 request_id/session_id（对冲请求按对冲账号 uid
+    /// 重建 agent 信封，session 派生依赖 uid）——接管时记账须用对冲侧 ids，
+    /// 否则 qoder_sessions 行 uid=对冲账号而键属主账号信封，归属错位
+    session_ids: Option<(String, String)>,
 }
 
 impl QoderHedgeLease {
-    fn acquire(state: &ApiSharedState, uid: &str) -> Self {
+    fn acquire(state: &ApiSharedState, uid: &str, session_ids: Option<(String, String)>) -> Self {
         let counter = state.qoder_pool.inflight_handle(uid);
         counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        Self { uid: uid.to_string(), counter }
+        Self { uid: uid.to_string(), counter, session_ids }
     }
 }
 
@@ -302,6 +306,10 @@ struct QoderRaceWin {
     uid: String,
     hedge: Option<QoderHedgeLease>,
     takeover: bool,
+    /// 审查修复 G4：胜者信封的 request_id/session_id（在胜出判定后从胜者
+    /// 连接自身取）——接管时为对冲信封 ids，其余为主信封 ids；记账与
+    /// 胜者账号归属保持一致
+    session_ids: Option<(String, String)>,
 }
 
 /// 首字竞速（F-80-余 v2，镜像 wb_route::race_first_byte）：对冲关闭（阈值 0）
@@ -309,6 +317,9 @@ struct QoderRaceWin {
 /// （走同一 busy 过滤——主账号已 inflight 天然让位，受 F-77 并发上限约束）
 /// 发对冲请求，先出首字者胜。对冲请求独立解析凭证（identity 回调）并按对冲
 /// 账号 uid 重建 agent 信封（session 派生依赖 uid）。
+/// `primary_ids`：主账号信封的 request_id/session_id（外层已解析一次）；
+/// 审查修复 G4：胜出判定后按胜者连接落定 QoderRaceWin.session_ids——接管时
+/// 取对冲信封 ids（随租约带回），否则取主信封 ids，保证记账归属一致。
 #[allow(clippy::too_many_arguments)]
 fn race_qoder_first_byte(
     state: &Arc<ApiSharedState>,
@@ -321,6 +332,7 @@ fn race_qoder_first_byte(
     tried: &HashSet<String>,
     allowed: Option<&HashSet<String>>,
     dedicated: Option<&str>,
+    primary_ids: Option<&(String, String)>,
 ) -> Result<QoderRaceWin, ()> {
     let hedge_ms = state
         .qoder_hedge_threshold_ms
@@ -332,6 +344,7 @@ fn race_qoder_first_byte(
             uid: primary_uid.to_string(),
             hedge: None,
             takeover: false,
+            session_ids: primary_ids.cloned(),
         });
     }
     let state2 = state.clone();
@@ -351,10 +364,14 @@ fn race_qoder_first_byte(
             state2.logger.log_sched_event(&ev);
         }
         // 租约先于凭证解析获取：失败路径随闭包局部变量 Drop 自动 -1
-        let lease = QoderHedgeLease::acquire(&state2, &picked2.uid);
+        //（ids 此时尚未解析，先占位 None，信封构建后回填）
+        let mut lease = QoderHedgeLease::acquire(&state2, &picked2.uid, None);
         let creds2 = (state2.qoder_identity.as_ref()? )(&picked2.uid).ok()?;
         let converted2 = qoder_upstream::prepare_qoder_body(&peek2, &entry2, &creds2.uid).ok()?;
+        // 审查修复 G4：对冲信封 ids 随租约带回，接管时供记账使用
+        let ids2 = extract_envelope_ids(&converted2);
         let reader2 = qoder_upstream::make_qoder_request(&creds2, &converted2, &mk2, &ms2).ok()?;
+        lease.session_ids = ids2;
         Some((reader2, lease))
     };
     match lines_with_first_byte_hedged(primary_reader, hedge_ms, spawn_backup) {
@@ -367,7 +384,22 @@ fn race_qoder_first_byte(
             } else {
                 primary_uid.to_string()
             };
-            Ok(QoderRaceWin { lines: out.lines, uid, hedge: out.hedge, takeover: out.takeover })
+            // 审查修复 G4：胜出判定后按胜者连接取信封 ids（与 uid 兜底口径一致）
+            let session_ids = if out.takeover {
+                out.hedge
+                    .as_ref()
+                    .and_then(|l| l.session_ids.clone())
+                    .or_else(|| primary_ids.cloned())
+            } else {
+                primary_ids.cloned()
+            };
+            Ok(QoderRaceWin {
+                lines: out.lines,
+                uid,
+                hedge: out.hedge,
+                takeover: out.takeover,
+                session_ids,
+            })
         }
         Err(()) => Err(()),
     }
@@ -741,6 +773,7 @@ fn run_qoder_stream(
                         &tried,
                         allowed_set.as_ref(),
                         dedicated.as_deref(),
+                        envelope_ids.as_ref(),
                     ) {
                         Ok(w) => w,
                         Err(()) => {
@@ -753,6 +786,9 @@ fn run_qoder_stream(
                     guard = settle_qoder_hedge(state, &mut race, guard, &picked.uid);
                     hedge_taken = race.takeover;
                     let win_uid = race.uid.clone();
+                    // 审查修复 G4：胜出判定后取胜者信封 ids（接管时=对冲信封），
+                    // 记账归属与实际服务账号一致；race 随后 move 进翻译器
+                    let win_session_ids = race.session_ids.clone();
                     // 竞速胜者行源（原始上游行）统一翻译后喂 stream_forward_ex
                     let ilines = translate_race_lines(race, err_slot.clone(), chat_id, model);
                     let (error_info, sent_any, failed_inline, usage) =
@@ -786,7 +822,8 @@ fn run_qoder_stream(
                         Some(ttfb_ms),
                         credits,
                         original_credits,
-                        &session_ctx_from_ids(&peek, envelope_ids.as_ref()),
+                        // 审查修复 G4：session_ctx 用胜者信封 ids（接管时=对冲侧）
+                        &session_ctx_from_ids(&peek, win_session_ids.as_ref()),
                     );
                     match error_info {
                         Some((code, msg)) => {
@@ -1182,6 +1219,7 @@ pub async fn qoder_aggregate_chat(
                             &tried,
                             allowed_set.as_ref(),
                             dedicated.as_deref(),
+                            envelope_ids.as_ref(),
                         ) {
                             Ok(w) => w,
                             Err(()) => {
@@ -1194,6 +1232,9 @@ pub async fn qoder_aggregate_chat(
                         guard = settle_qoder_hedge(&state, &mut race, guard, &picked.uid);
                         hedge_taken = race.takeover;
                         let win_uid = race.uid.clone();
+                        // 审查修复 G4：胜出判定后取胜者信封 ids（接管时=对冲信封），
+                        // 记账归属与实际服务账号一致；race.lines 随后 move 进聚合器
+                        let win_session_ids = race.session_ids.clone();
                         // 竞速胜者原始行源 → 翻译 → 聚合（tool_calls 合并/usage 收集）；
                         // 首字超时已在 race 内裁定，聚合阶段无失败通道
                         let agg_chat_id = format!("chatcmpl-{}", now_ts());
@@ -1224,7 +1265,8 @@ pub async fn qoder_aggregate_chat(
                                     Some(ttfb_ms),
                                     credits,
                                     original_credits,
-                                    &session_ctx_from_ids(&peek, envelope_ids.as_ref()),
+                                    // 审查修复 G4：session_ctx 用胜者信封 ids（接管时=对冲侧）
+                                    &session_ctx_from_ids(&peek, win_session_ids.as_ref()),
                                 );
                                 clear_model_cooldown(&model); // 审查修复：成功即清模型级冷却
                                 state.qoder_pool.note_success(&win_uid);

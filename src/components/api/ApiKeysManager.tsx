@@ -70,6 +70,10 @@ export default function ApiKeysManager({
   const [orgPreview, setOrgPreview] = useState<Record<string, number> | null>(null);
   // key 列表行的覆盖账号数批量预览（仅对配置了组/标签的 key 计算）
   const [listOrgPreview, setListOrgPreview] = useState<Record<string, Record<string, number>>>({});
+  // 审查 F4：预览失败态 + 重试序号——失败显示「--」占位并可点击重新拉取，
+  // 不再永久停留在 '…'（加载中）占位
+  const [listOrgPreviewFailed, setListOrgPreviewFailed] = useState(false);
+  const [listOrgPreviewTick, setListOrgPreviewTick] = useState(0);
   // issue #25 资源池绑定："" = 跟随全局调度 | "trae" | "buddy" | "qoder"
   const [editBindPool, setEditBindPool] = useState('');
   // issue #30：打开弹框时的原始白名单/专一值（未归一）。保存时若用户未改动勾选
@@ -209,9 +213,15 @@ export default function ApiKeysManager({
     setEditBindPool(k.bind_pool || '');
     setEditGroups(new Set(k.allowed_groups ?? []));
     setEditTags(new Set(k.allowed_tags ?? []));
-    // 共享分组/标签候选（全局一份；含各池成员计数）
-    api.groups.sharedList().then(setSharedGroups).catch(() => {});
-    api.tags.list().then(setSharedTags).catch(() => {});
+    // 共享分组/标签候选（全局一份；含各池成员计数）：审查 F3，失败时给出提示，不再静默吞掉
+    api.groups
+      .sharedList()
+      .then(setSharedGroups)
+      .catch(() => toast('error', '分组候选列表加载失败，请关闭后重新打开弹框重试'));
+    api.tags
+      .list()
+      .then(setSharedTags)
+      .catch(() => toast('error', '标签候选列表加载失败，请关闭后重新打开弹框重试'));
     // 服务可能刚启动，三池候选列表即时刷新
     api.apiServer
       .poolStatus()
@@ -270,21 +280,29 @@ export default function ApiKeysManager({
     const bound = apiKeys.filter((k) => (k.allowed_groups?.length ?? 0) > 0 || (k.allowed_tags?.length ?? 0) > 0);
     if (bound.length === 0) {
       setListOrgPreview({});
+      setListOrgPreviewFailed(false);
       return;
     }
     let cancelled = false;
     api.apiServer
       .keysOrgPreview(bound)
       .then((r) => {
-        if (!cancelled) setListOrgPreview(r);
+        if (!cancelled) {
+          setListOrgPreview(r);
+          setListOrgPreviewFailed(false);
+        }
       })
       .catch(() => {
-        if (!cancelled) setListOrgPreview({});
+        // 审查 F4：失败进入错误占位态（渲染层显示「--」，点击可重新拉取）
+        if (!cancelled) {
+          setListOrgPreview({});
+          setListOrgPreviewFailed(true);
+        }
       });
     return () => {
       cancelled = true;
     };
-  }, [apiKeys]);
+  }, [apiKeys, listOrgPreviewTick]);
   useEffect(() => {
     if (!editKey) {
       setOrgPreview(null);
@@ -614,13 +632,21 @@ export default function ApiKeysManager({
                           限{k.allowed_accounts.length}账号
                         </span>
                       )}
-                      {/* P2 文档补齐：key 列表展示组/标签覆盖账号数预览（实时展开计算） */}
+                      {/* P2 文档补齐：key 列表展示组/标签覆盖账号数预览（实时展开计算）；
+                          审查 F4：失败态显示「--」并允许点击重试，不再停留 '…' */}
                       {((k.allowed_groups?.length ?? 0) > 0 || (k.allowed_tags?.length ?? 0) > 0) && (
                         <span
-                          className={`ml-1 text-xs ${listOrgPreview[k.id]?.total === 0 ? 'font-medium text-rose-500' : 'text-slate-400'}`}
-                          title={`组/标签实时展开覆盖 ${listOrgPreview[k.id]?.total ?? '…'} 个账号（组 ∩ 标签，D5）`}
+                          className={`ml-1 text-xs ${listOrgPreview[k.id]?.total === 0 ? 'font-medium text-rose-500' : 'text-slate-400'}${listOrgPreviewFailed ? ' cursor-pointer underline decoration-dotted' : ''}`}
+                          title={
+                            listOrgPreviewFailed
+                              ? '覆盖账号数获取失败，点击重试'
+                              : `组/标签实时展开覆盖 ${listOrgPreview[k.id]?.total ?? '…'} 个账号（组 ∩ 标签，D5）`
+                          }
+                          onClick={
+                            listOrgPreviewFailed ? () => setListOrgPreviewTick((t) => t + 1) : undefined
+                          }
                         >
-                          覆盖{listOrgPreview[k.id]?.total ?? '…'}账号
+                          覆盖{listOrgPreview[k.id]?.total ?? (listOrgPreviewFailed ? '--' : '…')}账号
                           {listOrgPreview[k.id]?.total === 0 && ' ⚠ 空集'}
                         </span>
                       )}

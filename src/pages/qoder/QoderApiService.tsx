@@ -61,13 +61,23 @@ export default function QoderApiService() {
   const [usage, setUsage] = useState<UsageDayView[]>([]);
   // Qoder 池实时状态（可观测：per-account inflight 在途计数）
   const [qoderPool, setQoderPool] = useState<PoolStatus[]>([]);
+  // 审查 F1：账号列表加载失败态（null = 正常）——区分「成功但空」（空集引导）
+  // 与「请求失败」（错误态），避免把读取失败误报成「暂无账号」
+  const [accountsError, setAccountsError] = useState<string | null>(null);
 
   const refresh = useCallback(async () => {
     setRefreshing(true);
     try {
+      // 审查 F1：账号列表失败时返回 null（区别于「成功但空数组」）
+      let accsErr: unknown = null;
       const [pf, accs, cat, groups, tags] = await Promise.all([
         api.apiServer.poolList().catch(() => null),
-        api.qoder.accountsList().catch(() => [] as QoderAccountView[]),
+        api.qoder
+          .accountsList()
+          .catch((e) => {
+            accsErr = e;
+            return null;
+          }),
         api.apiServer
           .unifiedModels()
           .then((list) => list.filter((m) => m.sources.some((s) => s.pool === 'qoder')))
@@ -76,7 +86,14 @@ export default function QoderApiService() {
         api.tags.list().catch(() => [] as TagView[]),
       ]);
       setPool(pf);
-      setAccounts(accs);
+      if (accs === null) {
+        // 审查 F1：读取失败 → 错误态 + toast，不落空数组（不触发空集引导）
+        setAccountsError(String(accsErr));
+        pushToast('error', `账号列表加载失败：${String(accsErr)}`);
+      } else {
+        setAccounts(accs);
+        setAccountsError(null);
+      }
       setModels(cat);
       setQoderGroups(groups);
       setTagDefs(tags);
@@ -369,7 +386,9 @@ export default function QoderApiService() {
             </div>
             <p className="mb-2 text-xs text-slate-400">
               {credAccounts.length === 0
-                ? '暂无含凭证账号'
+                ? accountsError
+                  ? `账号列表加载失败（${accountsError}），请点击右上角「刷新」重试`
+                  : '暂无含凭证账号'
                 : '勾选账号参与 Qoder 上游调度（清空 = 全部含凭证账号自动入池）；保存后即时生效'}
             </p>
 
@@ -479,9 +498,16 @@ export default function QoderApiService() {
 
             {/* 账号清单（勾选白名单：健康状态 / 在途计数 / credits 余额；筛选外整行灰显） */}
             {credAccounts.length === 0 ? (
-              <p className="py-4 text-center text-xs text-slate-400">
-                暂无含凭证账号：请先在「账号管理」PAT 导入或 OAuth 登录入池（凭证写入本地 token store）。
-              </p>
+              accountsError ? (
+                /* 审查 F1：请求失败显示错误态，不显示「暂无账号」空集引导 */
+                <p className="py-4 text-center text-xs text-amber-600 dark:text-amber-400">
+                  账号列表加载失败：{accountsError}，请点击右上角「刷新」重试
+                </p>
+              ) : (
+                <p className="py-4 text-center text-xs text-slate-400">
+                  暂无含凭证账号：请先在「账号管理」PAT 导入或 OAuth 登录入池（凭证写入本地 token store）。
+                </p>
+              )
             ) : (
               <div className="space-y-1">
                 {credAccounts.map((a) => {

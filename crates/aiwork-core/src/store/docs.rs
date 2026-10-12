@@ -298,6 +298,18 @@ pub fn qoder_pool_load(s: &Store) -> Value {
     json!({ "accounts": accounts })
 }
 
+/// 读整池（fail-closed 版本，审查 B5）：表读失败返回 Err 而非静默空池，
+/// 供删除等不可逆路径预检使用——防止把读失败误当「空池」跳过成员回落，
+/// 删定义后留下悬空 group_id 引用。
+pub fn qoder_pool_load_raw(s: &Store) -> Result<Value, String> {
+    let accounts: Vec<Value> = s
+        .rows_all("qoder_accounts")?
+        .into_iter()
+        .map(|(_, data)| data)
+        .collect();
+    Ok(json!({ "accounts": accounts }))
+}
+
 /// 写整池（pk = 账号 id，缺 id 用序号占位）
 pub fn qoder_pool_save(s: &Store, pool: &Value) -> Result<(), String> {
     let empty = Vec::new();
@@ -1013,8 +1025,23 @@ pub fn account_tags_map(s: &Store) -> std::collections::HashMap<String, Vec<Stri
         .collect()
 }
 
+/// account_tags 绑定表读-改-写互斥（审查 B3）：remove_tag 为「读全表快照 →
+/// 逐行改写」复合段，与 set/remove_account 并发时快照过期会把新写入的绑定漏在
+/// 删除范围外（幽灵绑定指向已删除标签）。所有 account_tags 写路径必须持本锁。
+/// 锁序约定：最底层叶子锁——持任何池锁/org 锁的段取本锁均合法（「池锁 → 本锁」
+/// 单向）；持本锁期间严禁再取任何其他锁。
+static ACCOUNT_TAGS_LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+
+fn account_tags_lock() -> std::sync::MutexGuard<'static, ()> {
+    ACCOUNT_TAGS_LOCK
+        .get_or_init(|| std::sync::Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+}
+
 /// 全量覆盖式设置某账号的标签绑定（校验 tag_id 存在由命令层负责）
 pub fn account_tags_set(s: &Store, uid: &str, tag_ids: &[String]) -> Result<(), String> {
+    let _guard = account_tags_lock();
     let data = serde_json::to_string(&tag_ids).map_err(|e| format!("序列化失败: {e}"))?;
     s.with_conn(move |c| {
         c.execute(
@@ -1029,6 +1056,7 @@ pub fn account_tags_set(s: &Store, uid: &str, tag_ids: &[String]) -> Result<(), 
 /// 删除某账号的全部标签绑定（账号删除路径调用，防幽灵绑定污染
 /// 标签计数 / 组标签展开 / Key 覆盖预览）
 pub fn account_tags_remove_account(s: &Store, uid: &str) -> Result<(), String> {
+    let _guard = account_tags_lock();
     s.with_conn(|c| {
         c.execute("DELETE FROM account_tags WHERE pk = ?1", [uid])?;
         Ok(())
@@ -1037,6 +1065,7 @@ pub fn account_tags_remove_account(s: &Store, uid: &str) -> Result<(), String> {
 
 /// 删除某标签的全部绑定（标签定义删除时清理引用）
 pub fn account_tags_remove_tag(s: &Store, tag_id: &str) -> Result<usize, String> {
+    let _guard = account_tags_lock();
     let map = account_tags_map(s);
     let mut affected = 0usize;
     for (uid, ids) in map {
@@ -1299,6 +1328,16 @@ pub fn wb_pool_load(s: &Store) -> Value {
     json!({ "accounts": accounts })
 }
 
+/// 读整池（fail-closed 版本，审查 B5，同 qoder_pool_load_raw 口径）
+pub fn wb_pool_load_raw(s: &Store) -> Result<Value, String> {
+    let accounts: Vec<Value> = s
+        .rows_all("wb_accounts")?
+        .into_iter()
+        .map(|(_, data)| data)
+        .collect();
+    Ok(json!({ "accounts": accounts }))
+}
+
 /// 写整池（对齐原「整文件写回」语义；pk = 账号 id，缺 id 用序号占位）
 pub fn wb_pool_save(s: &Store, pool: &Value) -> Result<(), String> {
     let empty = Vec::new();
@@ -1410,10 +1449,13 @@ pub fn api_usage_load(s: &Store) -> UsageFile {
 }
 
 pub fn api_usage_save(s: &Store, f: &UsageFile) -> Result<(), String> {
+    // 四桶必须齐全（审查 B8）：本函数整表 DELETE+重插覆盖写，漏桶 = 该池既有行
+    // 被清空（迁移路径经此整体转写，Qoder 桶缺席即历史用量丢失）
     let rows: Vec<(String, String, String)> = [
         (UsageBucket::Trae, &f.days),
         (UsageBucket::Wb, &f.wb_days),
         (UsageBucket::Custom, &f.custom_days),
+        (UsageBucket::Qoder, &f.qoder_days),
     ]
     .into_iter()
     .flat_map(|(b, map)| {

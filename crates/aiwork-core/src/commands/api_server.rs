@@ -185,6 +185,8 @@ pub fn pool_set(
     wb_tag_ids: Option<Vec<String>>,
     qoder_tag_ids: Option<Vec<String>>,
 ) -> Result<(), String> {
+    // 读-改-写互斥（审查 B1）：整文档覆盖写，防与其他写点并发时旧副本覆盖丢更新
+    let _pool_cfg = crate::api_server::runtime::api_pool_cfg_lock();
     let existing: ApiPoolFile = crate::api_server::runtime::load_pool_file(&state.data_dir);
     let mut pool_file = merge_pool_set(
         &existing,
@@ -230,6 +232,7 @@ pub fn pool_set(
         pool_file.qoder_tag_ids = v;
     }
     crate::store::db(&state.data_dir).kv_set("api_pool", &pool_file)?;
+    drop(_pool_cfg); // 写回完成即释放；下方热应用段读内存值，不持配置锁
     // 热应用：网关运行中即改内存池策略（Buddy 池空值沿用 Trae 池策略，与启动逻辑一致）
     if let Some(shared) = crate::api_server::runtime::gateway_shared() {
         shared

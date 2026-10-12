@@ -57,6 +57,13 @@ export default function SessionsTab({
     let cancelled = false;
     setLoading(true);
     setError(null);
+    // 审查修复：日期倒置时跳过请求并给出持续可见的横幅提示（后端对倒置区间
+    // 会静默返回空列表，原先无任何提示，用户会误以为区间内没有数据）
+    if (start > end) {
+      setLoading(false);
+      setError('开始日期不能晚于结束日期，请调整日期区间后重试');
+      return;
+    }
     const fetchFn =
       scope === 'buddy'
         ? api.workbuddy.usageSessions

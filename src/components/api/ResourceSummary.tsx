@@ -13,7 +13,7 @@
  * （Buddy 池）、pool_list.qoder_enabled / qoder_accounts_list（Qoder 池）、custom_models_list
  * （自定义模型池）。
  */
-import { useEffect, useMemo, useState, type ReactNode } from 'react';
+import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import { ArrowDown, ArrowUp, Blocks, Bot, Boxes, Layers, Server, SlidersHorizontal, Star, X } from 'lucide-react';
 import { Badge } from '../ui';
 import { api } from '../../lib/tauri';
@@ -88,6 +88,9 @@ function DispatchCenterCard({
   const toast = useAppStore((s) => s.pushToast);
   const [policy, setPolicy] = useState<DispatchPolicy | null>(null);
   const [saving, setSaving] = useState(false);
+  // 审查 F2：保存请求序号（仅最后一次请求的响应生效）——per_model 快速连续切换时
+  // 乱序返回的旧响应丢弃，避免旧数据覆盖用户最后的选择
+  const saveSeqRef = useRef(0);
   // per_model 新增绑定行（本地输入态，添加时才落 policy）
   const [newPerModelName, setNewPerModelName] = useState('');
   const [newPerModelOrder, setNewPerModelOrder] = useState(POOL_ORDERS[0]);
@@ -150,13 +153,19 @@ function DispatchCenterCard({
 
   const savePolicy = async (patch: Partial<DispatchPolicy>) => {
     if (!policy) return;
+    const seq = ++saveSeqRef.current;
     setSaving(true);
     try {
-      setPolicy(await api.apiServer.dispatchPolicySet({ ...policy, ...patch }));
+      const next = await api.apiServer.dispatchPolicySet({ ...policy, ...patch });
+      // 审查 F2：乱序返回的旧响应丢弃，不 setState（仅最后一次请求生效）
+      if (seq !== saveSeqRef.current) return;
+      setPolicy(next);
     } catch (e) {
+      if (seq !== saveSeqRef.current) return;
       toast('error', `调度策略保存失败：${String(e).slice(0, 120)}`);
     } finally {
-      setSaving(false);
+      // 旧请求提前返回时不重置 saving（由最后一次请求负责）
+      if (seq === saveSeqRef.current) setSaving(false);
     }
   };
 

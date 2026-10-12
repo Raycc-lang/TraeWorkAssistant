@@ -491,7 +491,8 @@ fn migrate_kv_flows_v1_to_v2(store: &Store) -> Result<(), String> {
         ("wb_sticky_sessions", import_sticky_bindings_value),
     ];
     for (key, importer) in importers {
-        let Some(text) = store.kv_get_raw(key) else {
+        // 读库失败 ≠ 无键：fail-closed，错误直接上抛中止迁移
+        let Some(text) = store.kv_get_raw_checked(key)? else {
             continue; // v1 老库无此键（全新安装）→ 跳过
         };
         let v: Value = serde_json::from_str(&text)
@@ -528,15 +529,31 @@ fn migrate_unified_groups(store: &Store) -> Result<usize, String> {
     // 1. 读三处 defs + Trae membership，整体快照备份（可回滚）。
     //    快照只写一次（审查修复）：中途失败重试时若覆盖快照，备份会被
     //    「已部分重定向」的状态污染，恰在回滚最需要时失效。
-    let trae_all: Vec<Group> = docs::group_defs_load(store);
+    //    审查 B2：三处源读改 fail-closed——本迁移是重创性操作（defs 全删全写、
+    //    删私有 kv），源读失败静默空集会把「读不到」当「没有」执行合并。
+    let trae_rows = store.rows_all("groups")?;
+    let trae_all: Vec<Group> = trae_rows
+        .into_iter()
+        .map(|(_, data)| {
+            serde_json::from_value::<Group>(data)
+                .map_err(|e| format!("groups 行反序列化失败: {e}"))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
     // 上次中途失败残留的 shg_ 定义不算 Trae 旧定义（迁移计数/备份口径均剔除）
     let trae: Vec<Group> = trae_all
         .iter()
         .filter(|g| !g.id.starts_with("shg_"))
         .cloned()
         .collect();
-    let wb: Vec<Group> = store.kv_get("workbuddy_groups");
-    let qoder: Vec<Group> = store.kv_get("qoder_groups");
+    let kv_groups = |key: &str| -> Result<Vec<Group>, String> {
+        match store.kv_get_raw_checked(key)? {
+            None => Ok(Vec::new()),
+            Some(s) => serde_json::from_str::<Vec<Group>>(&s)
+                .map_err(|e| format!("{key} 反序列化失败: {e}")),
+        }
+    };
+    let wb: Vec<Group> = kv_groups("workbuddy_groups")?;
+    let qoder: Vec<Group> = kv_groups("qoder_groups")?;
     let member_rows: Vec<(String, String)> = store
         .with_conn(|c| {
             let mut stmt = c.prepare("SELECT uid, group_id FROM group_members")?;
@@ -544,11 +561,10 @@ fn migrate_unified_groups(store: &Store) -> Result<usize, String> {
                 .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
             Ok(rows)
-        })
-        .unwrap_or_default();
+        })?;
     let members_before: std::collections::HashMap<String, String> =
         member_rows.iter().cloned().collect();
-    if store.kv_get_raw("groups_pre_migration").is_none() {
+    if store.kv_get_raw_checked("groups_pre_migration")?.is_none() {
         store.kv_set(
             "groups_pre_migration",
             &json!({
@@ -682,7 +698,7 @@ fn redirect_api_pool_group_ids(
     store: &Store,
     id_map: &std::collections::HashMap<String, String>,
 ) -> Result<(), String> {
-    let Some(raw) = store.kv_get_raw("api_pool") else {
+    let Some(raw) = store.kv_get_raw_checked("api_pool")? else {
         return Ok(());
     };
     let mut v: Value = serde_json::from_str(&raw).map_err(|e| format!("api_pool 解析失败: {e}"))?;

@@ -50,17 +50,30 @@ fn validate_name(defs: &[Tag], name: &str, exclude_id: Option<&str>) -> Result<S
     Ok(name)
 }
 
-/// 孤儿绑定检测的存活 uid 全集（审查 P5）：Trae 凭证库 user_id + WB/Qoder 池
+/// 孤儿绑定检测的存活 uid 全集（审查 P5）：Trae accounts 表 user_id + WB/Qoder 池
 /// 账号 id（行文档 data JSON）。任一源表读失败时返回 None，调用方跳过本轮自愈
 /// （避免读库故障时把全部绑定误当孤儿清理）
 fn known_uids(state: &AppState) -> Option<std::collections::HashSet<String>> {
-    let mut known = std::collections::HashSet::new();
-    for a in &crate::vault::load_accounts(state).accounts {
-        if let Some(uid) = &a.user_id {
-            known.insert(uid.clone());
-        }
-    }
     let store = crate::store::db(&state.data_dir);
+    let mut known = std::collections::HashSet::new();
+    // Trae 侧直读 accounts 表 user_id 列（审查 B4：accounts_load 与 vault 凭据回填
+    // 内部 fail-open，且此处只需账号存在性、无需凭据；读失败返回 None 跳过本轮自愈）
+    match store.with_conn(|c| {
+        let mut stmt = c.prepare("SELECT user_id FROM accounts")?;
+        let rows = stmt
+            .query_map([], |r| r.get::<_, Option<String>>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }) {
+        Ok(rows) => {
+            for uid in rows.into_iter().flatten() {
+                if !uid.is_empty() {
+                    known.insert(uid);
+                }
+            }
+        }
+        Err(_) => return None,
+    }
     for table in ["wb_accounts", "qoder_accounts"] {
         match store.rows_all(table) {
             Ok(rows) => {
@@ -208,21 +221,28 @@ fn delete_inner(state: &AppState, id: &str) -> Result<(), String> {
         }
         changed
     });
-    // 池筛选引用读改写基线统一走迁移入口（对齐上游 P1 审查修复，同 shared_groups）
-    let mut pool_file = crate::api_server::runtime::load_pool_file(&state.data_dir);
-    let mut pool_changed = false;
-    for ids in [
-        &mut pool_file.trae_tag_ids,
-        &mut pool_file.wb_tag_ids,
-        &mut pool_file.qoder_tag_ids,
-    ] {
-        if ids.iter().any(|t| t == id) {
-            ids.retain(|t| t != id);
-            pool_changed = true;
+    // 池筛选引用读改写基线统一走迁移入口（对齐上游 P1 审查修复，同 shared_groups；
+    // 审查 B1：api_pool 整文档覆盖写互斥——锁内完成读改写+落盘，热重载放锁外）
+    let pool_changed = {
+        let _pool_cfg = crate::api_server::runtime::api_pool_cfg_lock();
+        let mut pool_file = crate::api_server::runtime::load_pool_file(&state.data_dir);
+        let mut pool_changed = false;
+        for ids in [
+            &mut pool_file.trae_tag_ids,
+            &mut pool_file.wb_tag_ids,
+            &mut pool_file.qoder_tag_ids,
+        ] {
+            if ids.iter().any(|t| t == id) {
+                ids.retain(|t| t != id);
+                pool_changed = true;
+            }
         }
-    }
+        if pool_changed {
+            store.kv_set("api_pool", &pool_file)?;
+        }
+        pool_changed
+    };
     if pool_changed {
-        store.kv_set("api_pool", &pool_file)?;
         crate::api_server::runtime::reload_pools_after_change(state);
     }
     // org 展开索引失效（account_tags 变化）

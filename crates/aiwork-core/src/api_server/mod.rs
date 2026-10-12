@@ -243,7 +243,8 @@ impl ApiSharedState {
     /// `credits`/`original_credits`：上游 usage 中的积分测量（issue #82 T2），
     /// 上游未下发 usage 时传 (None, None) 不入账（不得伪造）
     /// `session`：请求级会话上下文（issue #82 问题5）——同步直写 qoder_sessions 流水
-    /// （INSERT OR IGNORE 幂等；写失败静默，不影响记账主路径）
+    /// （UPSERT：ON CONFLICT(request_id) DO UPDATE 且仅新 ts 覆盖旧行；
+    /// 写失败静默，不影响记账主路径）
     #[allow(clippy::too_many_arguments)]
     pub fn record_usage_qoder(
         &self,
@@ -268,8 +269,11 @@ impl ApiSharedState {
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         guard.record_credits_qoder(model, &day, credits, original_credits);
-        guard.record_in_ttfb(
+        // 审查修复 G3：请求统计与上方 credits/下方会话流水共用入口取定的 day，
+        // 不在写入路径二次取当日日期（跨零点会把同一请求分裂到两个日期行）
+        guard.record_in_ttfb_on(
             usage::UsageBucket::Qoder,
+            &day,
             model, uid, key_id, ok, is_stream, duration_ms, prompt_tokens, completion_tokens,
             ttfb_ms,
         );

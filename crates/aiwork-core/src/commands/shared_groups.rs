@@ -45,60 +45,44 @@ pub(crate) fn validate_name(
     Ok(name)
 }
 
-/// 各池成员推导（D1：成员关系保持各池机制）。返回 (trae_uids, wb_ids, qoder_ids)。
-/// Trae 成员读 group_members 表；WB/Qoder 读各自池账号 group_id 字段。
-pub(crate) fn pool_members(state: &AppState, gid: &str) -> (Vec<String>, Vec<String>, Vec<String>) {
-    let store = crate::store::db(&state.data_dir);
-    // Trae：group_members 表
-    let trae: Vec<String> = store
-        .with_conn(|c| {
-            let mut stmt = c.prepare("SELECT uid FROM group_members WHERE group_id = ?1")?;
-            let rows = stmt
-                .query_map([gid], |r| r.get::<_, String>(0))?
-                .collect::<rusqlite::Result<Vec<_>>>()?;
-            Ok(rows)
-        })
-        .unwrap_or_default();
-    // Buddy：wb_accounts 行文档 group_id 字段（Value 语义，与迁移同源）
-    let wb_pool = crate::store::docs::wb_pool_load(&store);
-    let wb: Vec<String> = wb_pool
-        .get("accounts")
-        .and_then(serde_json::Value::as_array)
-        .map(|arr| {
-            arr.iter()
-                .filter(|a| a.get("group_id").and_then(|v| v.as_str()) == Some(gid))
-                .filter_map(|a| a.get("id").and_then(|v| v.as_str()))
-                .map(String::from)
-                .collect()
-        })
-        .unwrap_or_default();
-    // Qoder：qoder_accounts 行文档 group_id 字段
-    let qoder_pool = crate::store::docs::qoder_pool_load(&store);
-    let qoder: Vec<String> = qoder_pool
-        .get("accounts")
-        .and_then(serde_json::Value::as_array)
-        .map(|arr| {
-            arr.iter()
-                .filter(|a| a.get("group_id").and_then(|v| v.as_str()) == Some(gid))
-                .filter_map(|a| a.get("id").and_then(|v| v.as_str()))
-                .map(String::from)
-                .collect()
-        })
-        .unwrap_or_default();
-    (trae, wb, qoder)
-}
-
 // ── 列表 ────────────────────────────────────────────────────────────────────
 
 /// 共享分组列表：defs 全局一份；uids = 三池成员并集（trae 数字 uid + wb- + qd-，
 /// 命名空间天然不冲突），count = uids.len()。供 API Key 分组绑定等跨池消费方使用。
+/// 三池各一次整表扫描构建 gid → uids（审查 B6：禁止每分组重读三池形成 N+1）。
 pub fn shared_groups_list(state: &AppState) -> Vec<GroupView> {
     let defs = defs_load(state);
+    let store = crate::store::db(&state.data_dir);
+    let mut uids_by_gid: std::collections::HashMap<String, Vec<String>> = Default::default();
+    // Trae：group_members 表一次全量
+    if let Ok(rows) = store.with_conn(|c| {
+        let mut stmt = c.prepare("SELECT group_id, uid FROM group_members")?;
+        let rows = stmt
+            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }) {
+        for (gid, uid) in rows {
+            uids_by_gid.entry(gid).or_default().push(uid);
+        }
+    }
+    // Buddy / Qoder：池账号 group_id 字段（行文档 data JSON），各一次全量
+    for table in ["wb_accounts", "qoder_accounts"] {
+        for (_pk, data) in store.rows_all(table).unwrap_or_default() {
+            let (Some(gid), Some(id)) = (
+                data.get("group_id").and_then(serde_json::Value::as_str),
+                data.get("id").and_then(serde_json::Value::as_str),
+            ) else {
+                continue;
+            };
+            if !gid.is_empty() {
+                uids_by_gid.entry(gid.to_string()).or_default().push(id.to_string());
+            }
+        }
+    }
     defs.into_iter()
         .map(|g| {
-            let (mut uids, wb, qoder) = pool_members(state, &g.id);
-            uids.extend(wb);
-            uids.extend(qoder);
+            let uids = uids_by_gid.remove(&g.id).unwrap_or_default();
             let count = uids.len();
             GroupView { id: g.id, name: g.name, color: g.color, order: g.order, count, uids }
         })
@@ -182,15 +166,20 @@ pub fn shared_groups_update(
 /// 引用 → ④ 有成员或引用变更时热重载 + org 索引失效。
 pub(crate) fn delete_inner(state: &AppState, id: &str) -> Result<(), String> {
     let store = crate::store::db(&state.data_dir);
+    // 预检（审查 B5）：池表读失败 fail-closed 中止删除——防止误当空池跳过成员
+    // 回落，删定义后留下悬空 group_id 引用；此处零副作用，报错后可重试
+    crate::store::docs::wb_pool_load_raw(&store)?;
+    crate::store::docs::qoder_pool_load_raw(&store)?;
     // ①a Trae 成员回落：直接删 group_members 行（缺失 = 未分组，幂等）
     store.with_conn(|c| {
         c.execute("DELETE FROM group_members WHERE group_id = ?1", [id])?;
         Ok(())
     })?;
-    // ①b Buddy 成员回落（读-改-写互斥：罩住池段防旧副本整文档覆盖）
+    // ①b Buddy 成员回落（读-改-写互斥：罩住池段防旧副本整文档覆盖；读改用
+    // fail-closed 版本——中途读失败即中止，防半回落状态）
     {
         let _guard = state.wb_pool_lock.lock().unwrap_or_else(|e| e.into_inner());
-        let mut pool = crate::store::docs::wb_pool_load(&store);
+        let mut pool = crate::store::docs::wb_pool_load_raw(&store)?;
         let mut changed = false;
         if let Some(arr) = pool.get_mut("accounts").and_then(serde_json::Value::as_array_mut) {
             for a in arr.iter_mut() {
@@ -208,7 +197,7 @@ pub(crate) fn delete_inner(state: &AppState, id: &str) -> Result<(), String> {
     // qoder::common 为私有模块，此处与 WB 侧同构实现）
     {
         let _guard = state.qoder_pool_lock.lock().unwrap_or_else(|e| e.into_inner());
-        let mut pool = crate::store::docs::qoder_pool_load(&store);
+        let mut pool = crate::store::docs::qoder_pool_load_raw(&store)?;
         let mut changed = false;
         if let Some(arr) = pool.get_mut("accounts").and_then(serde_json::Value::as_array_mut) {
             for a in arr.iter_mut() {
@@ -230,23 +219,28 @@ pub(crate) fn delete_inner(state: &AppState, id: &str) -> Result<(), String> {
         defs_save(state, &defs)?;
     }
     // ③ 清引用：api_pool 三池分组筛选 + api_keys.allowed_groups
-    let mut refs_changed = false;
     // 读改写基线统一走迁移入口（对齐上游 P1 审查修复）：直读 kv_get 会落 serde
     // default，整表写回把 Buddy 池旧共享迁移值静默覆盖丢失；runtime.rs::load_pool_file
-    // 即为此统一入口（pool_set / 各池 groups 写回共用）
-    let mut pool_file = crate::api_server::runtime::load_pool_file(&state.data_dir);
-    for ids in [
-        &mut pool_file.group_ids,
-        &mut pool_file.wb_group_ids,
-        &mut pool_file.qoder_group_ids,
-    ] {
-        if ids.iter().any(|g| g == id) {
-            ids.retain(|g| g != id);
-            refs_changed = true;
+    // 即为此统一入口（pool_set / 各池 groups 写回共用）。
+    // 读-改-写互斥（审查 B1）：整文档覆盖写，持 api_pool_cfg_lock 防并发写点互覆
+    // （此时 ①② 段池锁/org 锁均已释放，锁序「池/组织 → 本」单向成立）
+    let mut refs_changed = false;
+    {
+        let _pool_cfg = crate::api_server::runtime::api_pool_cfg_lock();
+        let mut pool_file = crate::api_server::runtime::load_pool_file(&state.data_dir);
+        for ids in [
+            &mut pool_file.group_ids,
+            &mut pool_file.wb_group_ids,
+            &mut pool_file.qoder_group_ids,
+        ] {
+            if ids.iter().any(|g| g == id) {
+                ids.retain(|g| g != id);
+                refs_changed = true;
+            }
         }
-    }
-    if refs_changed {
-        store.kv_set("api_pool", &pool_file)?;
+        if refs_changed {
+            store.kv_set("api_pool", &pool_file)?;
+        }
     }
     // Key 引用清理走锁内原子修改（防与并发 UI 保存互覆约束字段）
     crate::api_server::api_keys::modify(&state.data_dir, |keys_file| {

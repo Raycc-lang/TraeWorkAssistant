@@ -112,6 +112,19 @@ impl Store {
         .ok()
     }
 
+    /// 与 [`Self::kv_get_raw`] 的区别：读库失败返回 Err，与「无键」（Ok(None)）可区分。
+    /// 迁移等破坏性路径应使用本方法实现 fail-closed；展示路径可继续用 kv_get_raw。
+    pub fn kv_get_raw_checked(&self, key: &str) -> Result<Option<String>, String> {
+        self.with_conn(|c| {
+            c.query_row("SELECT content FROM kv WHERE key = ?1", [key], |r| r.get::<_, String>(0))
+                .map(Some)
+                .or_else(|e| match e {
+                    rusqlite::Error::QueryReturnedNoRows => Ok(None),
+                    other => Err(other),
+                })
+        })
+    }
+
     pub fn kv_set_raw(&self, key: &str, content: &str) -> Result<(), String> {
         self.with_conn(|c| {
             c.execute(

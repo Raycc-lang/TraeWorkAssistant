@@ -10,39 +10,22 @@
 
 > 合并点 `main@8628629` → `main@b59eb4b`（4 个提交，手工语义移植，未 merge）。
 
-### 共享分组与账号标签（D1-D5）
+### 新增
 
-- 后端：新增共享分组 / 标签命令模块与 `org_index` 组织索引（cmd_bridge 全量注册）；三池私有分组统一迁移为共享分组（`shg_` 前缀，幂等可断点续跑，备份键可回滚）；API Key 支持 `allowed_groups` / `allowed_tags` 约束与覆盖数预览；三池装配层标签筛选与分组取交集（均空 = 不限）；三平台导入链路恢复标签绑定（未知标签忽略计数）。
-- 前端：新增 `TagSelect` / `TagsModal`，三池账号页增「标签」列与入口；GroupsModal 接共享分组（三池来源徽标）；ApiKeysManager 分组/标签双列勾选 + 实时覆盖数预览（空集强提示）；三池服务页标签筛选 chips；Trae/Buddy/Qoder 描述去「池」字。
+- **共享分组与账号标签（D1-D5）**：新增共享分组/标签命令模块与 `org_index` 组织索引；三池私有分组统一迁移为共享分组（`shg_` 前缀，幂等可断点续跑，可回滚）；API Key 支持 `allowed_groups` / `allowed_tags` 约束与覆盖数预览；三池装配层标签筛选与分组取交集（均空 = 不限）；三平台导入链路恢复标签绑定。前端新增 `TagSelect` / `TagsModal`，账号页「标签」列、ApiKeysManager 分组/标签双列勾选 + 实时预览、服务页标签筛选 chips。
+- **会话明细与网关积分计量（issue #82）**：三平台会话明细查询（分页 + 模型/用户过滤，Trae 补到期包清单）；用量计数补 `credits` / `original_credits`；Qoder 网关积分计量（复数 `credits` 优先）。前端 Dashboard 新增 SessionsTab 会话明细，分组/账号全局筛选联动 KPI 与各 Tab；ExpiryTab / CreditsTab / TokensTab 相应适配。
 
-### 会话明细与用量计量（issue #82）
+### 修复与加固（发布前 + 二轮复核，12 项发现 11 修 1 明示不修）
 
-- 后端：三平台会话明细查询命令（分页 + 模型/用户过滤，Trae 补 `trae_expired_ents` 到期包清单）；用量计数与日维度补 `credits` / `original_credits`；`usage_row` 时间戳解析兼容多格式；网关侧 Qoder 积分计量（复数 `credits` 优先，取不到不入账），会话 preview 取末条 user 消息。
-- 前端：Dashboard 新增 SessionsTab 三平台会话明细（分页 + 错误横幅，按平台裁剪列）；`sessions_preview_enabled` 控制会话说明列显隐；分组/账号全局筛选联动 KPI 与各 Tab；ExpiryTab 到期日历并入 `trae_expired_ents`（去重）；CreditsTab 逐账号 earned 过滤与 Qoder 网关积分口径；TokensTab Qoder 仅网关源渲染。
+- **并发**：新增 `org_defs_lock` 组织定义表互斥（groups/tags 整删全写模型防丢更新，12 处写路径纳锁，锁序单向）；分组定义迁移前移至引用重定向前，断点续跑不再产生重复定义。
+- **数据与容错**：导入凭证回写/标签绑定改主体落库后批量执行，单条失败聚合不中断（防半成品，重导可补齐，三平台口径对齐）；Qoder 会话 `account_name` 恒空修复；孤儿标签绑定自愈；`org_index` 读库失败降级空索引补日志。
+- **分页**：三平台会话明细页码夹取至最后一页，防 u32 乘法回绕，前端空页自动回夹。
+- **杂项**：SchedulerTasksCard 补齐 every_hours 三档模式；`config_set` 整表携带任务时刻/模式/小时防清空；启动公告一次性取走；删除重复预览块、弹框失败重抛等小修。
+- 明示不修：Qoder 导入覆盖已存在账号的标签/分组绑定（导入文件为权威态，与 WB 语义一致）。
 
-### 调度与杂项
+### 跳过（桌面/OS 专属）
 
-- SchedulerTasksCard 补齐 every_hours 三档模式与间隔小时输入；`config_set` 整表携带 `task_times` / `task_modes` / `task_hours`（防清空）；`startup_notice_take` 启动公告一次性取走；dispatch / oauth 写路径接入 `org_index` 失效；类型层与 `tauri.ts` 同步扩展。
-
-### 跳过（桌面/OS 专属或无对应结构）
-
-- `workbuddy_stats` 本地 Token 统计、profile 槽位体积缓存、state sync_mode 零值归一及其设置表单块、`refreshLocalEntitlement`（docker 无对应数据源或模块）。
-
-### 发布前审查修复
-
-> 对本版移植内容逐行全面审查，12 项发现全部经双验证员交叉确认，11 修 1 明示不修；多数为 main 上游同源缺陷随移植带入。
-
-- 并发：新增 `org_defs_lock` 组织定义表互斥——groups/tags 为整删全写模型，Web 并发读改写会丢更新；纳锁 12 处写路径，锁序单向「池锁 → 本锁」。迁移 `group_defs_save` 前移至引用重定向前，断点续跑不再产生重复定义（补恢复专项测试）。
-- 数据：Trae 导入标签绑定延迟至主体落库后批量写（失败聚合进日志不中断）；Qoder 会话明细 `account_name` 恒空修复（流水 uid 记账号 id，改按 id 建键 + uid 兜底）。
-- 分页：三平台会话明细 page 无上界致 u32 乘法回绕——页码夹取至最后一页并同步夹返回 `page`，前端空页且 total>0 时自动回夹。
-- 前端/杂项：ApiService 删除重复预览块（保留含空集警示的超集预览）；QoderAccounts 弹框回调失败改重抛（保留输入便于重试）；SchedulerTasksCard 补 `trae-usage-sync` 条目与文案；scheduler 注释修正（缺省恒 `every_hours`，行为无变化）。
-- 明示不修：Qoder 导入覆盖已存在账号的标签/分组绑定（与 WB 导入语义一致，导入文件为权威态）。
-
-### 二轮复核修复（导入容错与口径对齐）
-
-- 导入容错：WB/Qoder 导入的凭证回写与标签绑定改为主体落库后统一执行，单条失败聚合进 `rejected` 不再中断（避免「账号已入池但凭证/标签缺失」半成品，重新导入可补齐）；Qoder 导入响应补 `tags_restored` / `tags_ignored`（三平台口径对齐）；导入标签收集逻辑下沉共享 `tags::collect_import_tags`。
-- 孤儿绑定自愈：`tags_list` 顺带清理指向已不存在账号的绑定行并记日志（源表读失败跳过本轮，防读库故障时误清全部绑定）。
-- 可观测与杂项：`org_index` 读库失败降级空索引补错误日志（fail-closed 语义不变）；WB 积分快照遇旧格式上一快照（无账号明细）记日志提示 earned 差分偏低（次日自愈）；调度日志每小时模式计数改精确匹配 `every_hours`；`extract_billing` 文档注释修正（max 保守记账与 `or` 链的语义边界）。
+- `workbuddy_stats` 本地 Token 统计、profile 槽位体积缓存、state sync_mode 零值归一、`refreshLocalEntitlement`。
 
 ### 验证
 

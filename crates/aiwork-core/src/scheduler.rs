@@ -497,10 +497,12 @@ pub fn scheduler_config_set(st: &AppState, cfg: Value) -> Result<Value, String> 
     fs_utils::app_log(
         &st.data_dir,
         &format!(
-            "[调度器] 任务配置已更新：{} 项停用，{} 项自定义时刻，{} 项每小时模式",
+            "[调度器] 任务配置已更新：{} 项停用，{} 项自定义时刻，{} 项每小时模式，{} 项自定义间隔模式",
             disabled.len(),
             times.len(),
-            // 审查 P10：精确匹配每小时模式（原 != "daily" 会把无效值也计入）
+            // 审查 G7：hourly 与 every_hours 分别如实计数——原「每小时模式」槽位
+            // 误填 every_hours 数量，hourly 任务被漏计（延续审查 P10 精确匹配口径）
+            modes.iter().filter(|(_, v)| v.as_str() == "hourly").count(),
             modes.iter().filter(|(_, v)| v.as_str() == "every_hours").count()
         ),
     );

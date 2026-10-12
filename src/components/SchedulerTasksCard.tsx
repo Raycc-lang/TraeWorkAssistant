@@ -64,6 +64,8 @@ export default function SchedulerTasksCard({
   const [modes, setModes] = useState<Record<string, string>>({});
   /** every_hours 间隔小时数（key → 1..24；缺省 2，状态接口回填生效值） */
   const [taskHours, setTaskHours] = useState<Record<string, number>>({});
+  /** 间隔输入草稿（key → 原始字符串；保留清空等中间态，失焦时才数值化保存） */
+  const [hourDrafts, setHourDrafts] = useState<Record<string, string>>({});
   const [toggling, setToggling] = useState<string | null>(null);
   const [timeSaving, setTimeSaving] = useState<string | null>(null);
   const [resetting, setResetting] = useState(false);
@@ -280,10 +282,22 @@ export default function SchedulerTasksCard({
                           type="number"
                           min={1}
                           max={24}
-                          value={taskHours[key] ?? 2}
+                          value={hourDrafts[key] ?? String(taskHours[key] ?? 2)}
                           disabled={timeSaving === key}
-                          onChange={(e) => setTaskHours({ ...taskHours, [key]: Number(e.target.value) })}
-                          onBlur={(e) => void saveHours(key, Number(e.target.value))}
+                          onChange={(e) => setHourDrafts({ ...hourDrafts, [key]: e.target.value })}
+                          onBlur={() => {
+                            // 审查修复：输入过程保留原始字符串（清空的中间态不再瞬时变 0），
+                            // 失焦时丢弃草稿恢复已生效显示；空串/非数字不触发保存
+                            const raw = (hourDrafts[key] ?? '').trim();
+                            setHourDrafts((prev) => {
+                              if (!(key in prev)) return prev;
+                              const next = { ...prev };
+                              delete next[key];
+                              return next;
+                            });
+                            if (raw === '' || Number.isNaN(Number(raw))) return;
+                            void saveHours(key, Number(raw));
+                          }}
                           className="w-14 rounded-md border border-slate-200 bg-white px-1.5 py-0.5 text-xs tabular-nums text-slate-600 disabled:opacity-50 dark:border-zinc-700 dark:bg-zinc-800 dark:text-zinc-300"
                           title="间隔小时数（1-24，失焦保存；距上次成功满间隔才再跑）"
                         />

@@ -79,11 +79,12 @@ pub fn qoder_sessions_query(
         })?;
         while let Some(item) = it.next() {
             let (model, pair) = item?;
-            // models 清单收录不受 model 过滤影响（筛选下拉用）
-            models.insert(model);
+            // 审查修复：models 聚合与 session 行使用同一份 uid 过滤后的数据源，
+            // 避免筛选下拉泄露其他账号用过的模型名；不受 model 过滤影响（下拉用）
             if uid_filter.is_some_and(|f| pair.1.user_id != f) {
                 continue;
             }
+            models.insert(model);
             if model_filter.is_some_and(|m| pair.1.model != m) {
                 continue;
             }

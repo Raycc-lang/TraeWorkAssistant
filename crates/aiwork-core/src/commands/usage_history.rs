@@ -366,9 +366,12 @@ fn fetch_chunk(
             sessions.entry(date).or_default().push(row);
         }
         got += arr.len();
-        let total_n = total.unwrap_or(0);
-        // 终止条件：已取满 total / 本页不满页大小（服务端截断页）
-        if got >= total_n || (arr.len() as u32) < PAGE_SIZE {
+        // 终止条件：已取满 total / 本页不满页大小（服务端截断页）。
+        // total 缺失（响应无该字段）不得当作 0「已取完」——那会在第一页后静默截断
+        // 后续分页（审查 G9）；此时以「本页是否满页大小」判断是否还有更多，继续拉到
+        // 取完或达 MAX_PAGES 上限（达上限如实返回 Ok(false) 上报截断，不静默丢弃）
+        let reached_total = matches!(total, Some(n) if got >= n);
+        if reached_total || (arr.len() as u32) < PAGE_SIZE {
             break;
         }
         // 页数安全上限已到但 total 未取完：如实在上报截断（不再静默丢弃差额）

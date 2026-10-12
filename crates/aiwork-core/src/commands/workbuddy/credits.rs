@@ -725,9 +725,18 @@ fn sessions_kv_lock() -> &'static std::sync::Mutex<()> {
 }
 
 /// Buddy 行级明细落盘（kv 缓存；31 天滑动窗口全量替换该账号桶）。
-/// 结构：`{ fetched_at: i64, accounts: { <acct_id>: { name, rows: [WbSessionRow] } } }`
+/// 结构：`{ fetched_at: i64, accounts: { <acct_id>: { name, fetched_at, rows: [WbSessionRow] } } }`
 /// 读-改-写经 SESSIONS_KV_LOCK 串行化（审查 P1）。
-fn save_account_session_rows(state: &AppState, acct_id: &str, name: &str, rows: &[WbSessionRow]) {
+/// full_refresh：是否全账号批量刷新路径——仅其更新全局 fetched_at（UI「上次全量
+/// 刷新时间」口径）；单账号刷新只写自身账号桶的 fetched_at，避免覆盖全局时间戳
+/// 导致「上次全量刷新时间」失真（审查 G6）。
+fn save_account_session_rows(
+    state: &AppState,
+    acct_id: &str,
+    name: &str,
+    rows: &[WbSessionRow],
+    full_refresh: bool,
+) {
     const KEY: &str = "workbuddy_usage_sessions_cache";
     let _guard = sessions_kv_lock().lock().unwrap_or_else(|e| e.into_inner());
     let db = crate::store::db(&state.data_dir);
@@ -738,8 +747,11 @@ fn save_account_session_rows(state: &AppState, acct_id: &str, name: &str, rows: 
     if !cache.get("accounts").map(Value::is_object).unwrap_or(false) {
         cache["accounts"] = serde_json::json!({});
     }
-    cache["fetched_at"] = serde_json::json!(chrono::Utc::now().timestamp_millis());
-    cache["accounts"][acct_id] = serde_json::json!({ "name": name, "rows": rows });
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    if full_refresh {
+        cache["fetched_at"] = serde_json::json!(now_ms);
+    }
+    cache["accounts"][acct_id] = serde_json::json!({ "name": name, "fetched_at": now_ms, "rows": rows });
     let _ = db.kv_set(KEY, &cache);
 }
 
@@ -833,7 +845,8 @@ pub(crate) fn workbuddy_usage_official_impl(
         .find(|a| a.id == acct_id)
         .map(|a| a.nickname.clone())
         .unwrap_or_default();
-    save_account_session_rows(state, &acct_id, &acct_name, &session_rows);
+    // 单账号刷新：不写全局 fetched_at（审查 G6，见 save_account_session_rows）
+    save_account_session_rows(state, &acct_id, &acct_name, &session_rows, false);
     fs_utils::app_log(
         &state.data_dir,
         &format!(
@@ -877,6 +890,10 @@ fn usage_official_fetch(
     let mut session_rows: Vec<WbSessionRow> = vec![]; // 请求级行（会话明细落盘）
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut reported_total: u64 = 0;
+    // 审查 G5：requestId 缺失行的派生键行序号（见 uuidless_key）。字段缺失/为空的
+    // 请求若仅按 (date, model, credit) 派生，同日同模型同积分的多条请求会得到相同键，
+    // 被 seen 去重静默丢弃导致用量/积分漏计；追加行序号保证键在本批内唯一
+    let mut uuidless_seq: u64 = 0;
     for page in 1u64..=20 {
         let body = serde_json::json!({
             "startTime": start_text,
@@ -921,7 +938,10 @@ fn usage_official_fetch(
                 .filter(|m| !m.is_empty())
                 .unwrap_or_else(|| "未知模型".into());
             let rid = as_str(fs_utils::dig(item, &["requestId", "request_id"]))
-                .unwrap_or_else(|| uuidless_key(&date, &model, &credit));
+                .unwrap_or_else(|| {
+                    uuidless_seq += 1;
+                    uuidless_key(&date, &model, &credit, uuidless_seq)
+                });
             if seen.insert(rid.clone()) {
                 rows.push((date, credit, model.clone()));
                 if let Some(ts) = usage_row_ts(item) {
@@ -1133,7 +1153,8 @@ pub(crate) fn workbuddy_usage_official_all_impl(
             .find(|a| &a.id == id)
             .map(|a| a.nickname.clone())
             .unwrap_or_default();
-        save_account_session_rows(state, id, &acct_name, &session_rows);
+        // 全账号批量刷新：更新全局 fetched_at（审查 G6）
+        save_account_session_rows(state, id, &acct_name, &session_rows, true);
         req_total += p.get("request_count_total").and_then(Value::as_u64).unwrap_or(0);
         for row in p.get("daily").and_then(Value::as_array).into_iter().flatten() {
             let Some(date) = row.get("date").and_then(Value::as_str) else { continue };
@@ -1400,12 +1421,16 @@ pub fn workbuddy_sessions_query(
     })
 }
 
-/// requestId 缺失时的稳定兜底 key（不含任何敏感字段）
-fn uuidless_key(date: &str, model: &str, credit: &f64) -> String {
+/// requestId 缺失时的稳定兜底 key（不含任何敏感字段）。
+/// seq 为本批拉取内的递增行序号：仅按 (date, model, credit) 派生时，同日同模型同
+/// 积分的合法多条请求会碰撞出相同键、被 seen 去重误伤而漏计（审查 G5），加入 seq
+/// 保证键在本批内唯一；有真实 requestId 的行不受影响。
+fn uuidless_key(date: &str, model: &str, credit: &f64, seq: u64) -> String {
     let mut h = Sha256::new();
     h.update(date.as_bytes());
     h.update(model.as_bytes());
     h.update(credit.to_le_bytes());
+    h.update(seq.to_le_bytes());
     let hex: String = h.finalize().iter().map(|b| format!("{b:02x}")).collect();
     format!("auto-{}", &hex[..16])
 }

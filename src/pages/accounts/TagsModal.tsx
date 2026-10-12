@@ -126,7 +126,11 @@ export function TagsModal({
                         return next;
                       });
                     })
-                    .catch(() => {});
+                    .catch(() => {
+                      // 审查 F5：保存失败时回退输入框为旧名（新名未持久化，不能留在展示态
+                      // 误导用户以为改成功）；失败提示 toast 由调用方发出
+                      setEditingNames((prev) => ({ ...prev, [t.id]: t.name }));
+                    });
                 }
               }}
               className="input !py-1 flex-1 !text-xs"
