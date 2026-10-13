@@ -129,6 +129,15 @@ fn note_model_server_cooldown(model: &str) {
             // 会让窗口不断向前滑动，恢复探测被无限推迟（只要请求不停，冷却永不到期），
             // 与「渐进 + 到期探测」的设计相悖。窗口仅在**新片段开始时**重设。
             if Instant::now() < *until {
+                if *fails == 0 {
+                    // 排队退避落下的短窗（fails=0）：Server 失败应至少抬到基准窗
+                    // （5s 排队窗不足以覆盖 5xx），但不递增计数（同片段语义；
+                    // fails>=1 的 Server 冷却窗维持「未过期不后延」防滑动）
+                    let cand = Instant::now() + Duration::from_secs(SERVER_COOLDOWN_BASE_SECS);
+                    if cand > *until {
+                        *until = cand;
+                    }
+                }
                 return;
             }
             *fails = fails.saturating_add(1);
@@ -925,8 +934,9 @@ fn run_qoder_stream(
                     let win_session_ids = race.session_ids.clone().or_else(|| envelope_ids.clone());
                     // 竞速胜者行源（原始上游行）统一翻译后喂 stream_forward_ex
                     let ilines = translate_race_lines(race, err_slot.clone(), chat_id, model);
+                    // Qoder 无 namespace 展平编码（F4 移植）→ 空集合禁用编码名拆分
                     let (error_info, sent_any, failed_inline, usage) =
-                        wb_sse::stream_forward_ex(ilines, tx, proto, chat_id, model, false);
+                        wb_sse::stream_forward_ex(ilines, tx, proto, chat_id, model, &std::collections::HashSet::new());
                     let duration_ms = start_ts.elapsed().as_millis() as u64;
                     let meta = err_slot
                         .lock()
@@ -985,9 +995,29 @@ fn run_qoder_stream(
                                             .clamp(1, QUEUE_BACKOFF_MAX_SECS);
                                         // 审查修复：模型级冷却——排队是模型级现象，
                                         // 记录窗口供 dispatch 预检快速回退；已在冷却
-                                        // 中（并发请求刚记录过）则跳过同号退避空转
+                                        // 中（并发请求刚记录过）则直接终止轮换返回
+                                        // 429（移植 7883d1c），不再对池内每个账号硬打
+                                        // 已知故障上游（原 break 换号会轮换到耗尽，
+                                        // 逐账号真实请求）
                                         if model_cooling_remaining_secs(model).is_some() {
-                                            break;
+                                            // 复用外层 duration_ms（与同分支其余记账同一口径）
+                                            state.record_usage_qoder(
+                                                model, &win_uid, key_id, false, true,
+                                                duration_ms, 0, 0, None, None, None,
+                                                &usage_ctx,
+                                            );
+                                            state.logger.log_request(
+                                                "qoder", "POST", "/v1/chat/completions",
+                                                model, true, 429, &win_uid, duration_ms,
+                                                &key_name,
+                                                &state.qoder_pool.name_of(&win_uid),
+                                                Some("模型冷却中，终止轮换"),
+                                            );
+                                            send_stream_error(
+                                                tx, proto, 429,
+                                                &format!("model {model} cooling down, retry later"),
+                                            );
+                                            return;
                                         }
                                         note_model_cooldown(model, secs);
                                         queue_same += 1;
@@ -1101,8 +1131,8 @@ fn run_qoder_stream(
                         }
                         RetryAction::SwitchKey => {
                             // Qoder 业务错误常在 403/200 信封里：按 upstream 分类；
-                            // 排队（10605）同号退避优先——模型已在冷却中则
-                            // break 换号（快速失败，见下方冷却检查）
+                            // 排队（10605）同号退避优先——模型已在冷却中则直接
+                            // 429 终止轮换（见下方冷却检查，移植 7883d1c）
                             let classified =
                                 qoder_upstream::classify_upstream_error(status, &resp_body);
                             if classified.kind == UpstreamKind::Queued
@@ -1114,9 +1144,26 @@ fn run_qoder_stream(
                                     .and_then(|q| q.retry_after_secs)
                                     .unwrap_or(QUEUE_DEFAULT_BACKOFF_SECS)
                                     .clamp(1, QUEUE_BACKOFF_MAX_SECS);
-                                // 审查修复：模型级冷却（同流内 Queued 分支）
+                                // 审查修复：模型级冷却（同流内 Queued 分支）——
+                                // 冷却中直接终止轮换返回 429（移植 7883d1c），不再逐账号硬打
                                 if model_cooling_remaining_secs(model).is_some() {
-                                    break;
+                                    let duration_ms = start_ts.elapsed().as_millis() as u64;
+                                    state.record_usage_qoder(
+                                        model, &picked.uid, key_id, false, true,
+                                        duration_ms, 0, 0, None, None, None,
+                                        &session_ctx(&peek),
+                                    );
+                                    state.logger.log_request(
+                                        "qoder", "POST", "/v1/chat/completions", model, true,
+                                        429, &picked.uid, duration_ms, &key_name,
+                                        &state.qoder_pool.name_of(&picked.uid),
+                                        Some("模型冷却中，终止轮换"),
+                                    );
+                                    send_stream_error(
+                                        tx, proto, 429,
+                                        &format!("model {model} cooling down, retry later"),
+                                    );
+                                    return;
                                 }
                                 note_model_cooldown(model, secs);
                                 queue_same += 1;
@@ -1158,6 +1205,12 @@ fn run_qoder_stream(
                         RetryAction::Fatal => {
                             let msg =
                                 format!("upstream {} error: {}", status, safe_slice(&resp_body, 300));
+                            // 终态记账对齐「每请求一行」口径（移植 7883d1c，审查 F3）：
+                            // Fatal 是请求终局（同 no-healthy 由取号分支记录），此前仅
+                            // log_request 导致用量统计页缺口；ttfb/credits 无失败语义传 None
+                            state.record_usage_qoder(model, &picked.uid, key_id, false, true,
+                                start_ts.elapsed().as_millis() as u64, 0, 0,
+                                None, None, None, &session_ctx(&peek));
                             state.logger.log_request(
                                 "qoder", "POST", "/v1/chat/completions", model, true, status,
                                 &picked.uid, start_ts.elapsed().as_millis() as u64, &key_name,
@@ -1470,14 +1523,32 @@ pub async fn qoder_aggregate_chat(
                                                 .and_then(|q| q.retry_after_secs)
                                                 .unwrap_or(QUEUE_DEFAULT_BACKOFF_SECS)
                                                 .clamp(1, QUEUE_BACKOFF_MAX_SECS);
-                                            // 审查修复：模型级冷却（同流式分支）；
-                                            // 非流式无下行通道，保持整段 sleep
+                                            // 审查修复：模型级冷却（同流式分支）——
+                                            // 冷却中直接终止轮换返回 429（移植 7883d1c，
+                                            // upstream 前缀借助端点状态码透传映射），
+                                            // 不再逐账号硬打已知故障上游
                                             if model_cooling_remaining_secs(&model).is_some() {
-                                                break;
+                                                state.record_usage_qoder(
+                                                    &model, &win_uid, &key_id, false, stream,
+                                                    duration_ms, 0, 0, None, None, None,
+                                                    &session_ctx(&peek),
+                                                );
+                                                state.logger.log_request_ttfb(
+                                                    "qoder", "POST", "/v1/chat/completions",
+                                                    &model, stream, 429, &win_uid, duration_ms,
+                                                    Some(ttfb_ms), &key_name,
+                                                    &state.qoder_pool.name_of(&win_uid),
+                                                    Some("模型冷却中，终止轮换"),
+                                                );
+                                                return Err(format!(
+                                                    "upstream 429 error: model {model} cooling down, retry later"
+                                                ));
                                             }
                                             note_model_cooldown(&model, secs);
                                             queue_same += 1;
-                                            std::thread::sleep(Duration::from_secs(secs));
+                                            // 统一走 sleep_interruptible(None)（移植 7883d1c）：
+                                            // 分段等待封装统一，语义等同整段 sleep
+                                            sleep_interruptible(Duration::from_secs(secs), None);
                                             continue;
                                         }
                                         break; // 超限换号
@@ -1534,7 +1605,11 @@ pub async fn qoder_aggregate_chat(
                         match retry_plan(status, &resp_body, same_attempt, retry_after) {
                             RetryAction::RetrySame { delay_ms } => {
                                 same_attempt += 1;
-                                std::thread::sleep(Duration::from_millis(delay_ms.min(60_000)));
+                                // 统一走 sleep_interruptible(None)：分段等待封装统一
+                                sleep_interruptible(
+                                    Duration::from_millis(delay_ms.min(60_000)),
+                                    None,
+                                );
                                 continue;
                             }
                             RetryAction::SwitchKey => {
@@ -1549,14 +1624,28 @@ pub async fn qoder_aggregate_chat(
                                         .and_then(|q| q.retry_after_secs)
                                         .unwrap_or(QUEUE_DEFAULT_BACKOFF_SECS)
                                         .clamp(1, QUEUE_BACKOFF_MAX_SECS);
-                                    // 审查修复：模型级冷却（同流式分支）；非流式
-                                    // 无下行通道，保持整段 sleep
+                                    // 审查修复：模型级冷却（同流式分支）——冷却中
+                                    // 直接终止轮换返回 429（移植 7883d1c），不再逐账号硬打
                                     if model_cooling_remaining_secs(&model).is_some() {
-                                        break;
+                                        state.record_usage_qoder(&model, &picked.uid, &key_id,
+                                            false, stream,
+                                            start_ts.elapsed().as_millis() as u64, 0, 0,
+                                            None, None, None, &session_ctx(&peek));
+                                        state.logger.log_request(
+                                            "qoder", "POST", "/v1/chat/completions", &model,
+                                            stream, 429, &picked.uid,
+                                            start_ts.elapsed().as_millis() as u64, &key_name,
+                                            &state.qoder_pool.name_of(&picked.uid),
+                                            Some("模型冷却中，终止轮换"),
+                                        );
+                                        return Err(format!(
+                                            "upstream 429 error: model {model} cooling down, retry later"
+                                        ));
                                     }
                                     note_model_cooldown(&model, secs);
                                     queue_same += 1;
-                                    std::thread::sleep(Duration::from_secs(secs));
+                                    // 统一走 sleep_interruptible(None)：分段等待封装统一
+                                    sleep_interruptible(Duration::from_secs(secs), None);
                                     continue;
                                 }
                                 let kind = classified.kind.to_err_kind();
@@ -1592,6 +1681,12 @@ pub async fn qoder_aggregate_chat(
                                 break;
                             }
                             RetryAction::Fatal => {
+                                // 终态记账对齐「每请求一行」口径（移植 7883d1c，审查 F3）：
+                                // Fatal 是请求终局（同 no-healthy 由取号分支记录），此前仅
+                                // log_request 导致用量统计页缺口
+                                state.record_usage_qoder(&model, &picked.uid, &key_id, false, stream,
+                                    start_ts.elapsed().as_millis() as u64, 0, 0,
+                                    None, None, None, &session_ctx(&peek));
                                 state.logger.log_request(
                                     "qoder", "POST", "/v1/chat/completions", &model, stream,
                                     status, &picked.uid,
@@ -1626,7 +1721,8 @@ pub async fn qoder_aggregate_chat(
                     &resp,
                     &format!("resp_{}", now_ts()),
                     &model_out,
-                    false,
+                    // Qoder 无 namespace 展平编码（Responses 分支为防御性兜底）
+                    &std::collections::HashSet::new(),
                 ),
                 Protocol::OpenAi => resp,
             };
@@ -1638,13 +1734,14 @@ pub async fn qoder_aggregate_chat(
         Ok(Err(msg)) => {
             // 审查修复（对齐 wb_aggregate_chat）：Fatal 错误透传上游状态码——
             // 上游 400/404/413 等请求级错误不降级 503，避免严格客户端无意义重试；
-            // 401/403/429 属账号/池问题，维持 503 语义
+            // 401/403 维持 503 语义；429 为模型冷却主动限流（移植 7883d1c），
+            // 透传让客户端按 Retry-After 语义退避而非立即重试
             let upstream_status = msg
                 .strip_prefix("upstream ")
                 .and_then(|rest| rest.split(' ').next())
                 .and_then(|s| s.parse::<u16>().ok());
             let status = match upstream_status {
-                Some(s) if (400..500).contains(&s) && !matches!(s, 401 | 403 | 429) => {
+                Some(s) if (400..500).contains(&s) && !matches!(s, 401 | 403) => {
                     StatusCode::from_u16(s).unwrap_or(StatusCode::SERVICE_UNAVAILABLE)
                 }
                 _ => StatusCode::SERVICE_UNAVAILABLE,
@@ -1811,18 +1908,18 @@ mod tests {
         );
         // 排队退避先落条目：fails = 0、窗口 5s
         note_model_cooldown(&model, 5);
-        // Server 失败：窗口未过期 → 不递增计数（避免把一次请求内的逐账号换号
-        // 放大成多条失败片段），也不得下溢（曾为 `*fails - 1`：debug panic /
-        // release 冷却被错误推到上限）
+        // Server 失败（移植 7883d1c）：fails=0 的排队短窗不足以覆盖 5xx——
+        // 窗口抬到基准 30s 但不递增计数（同片段语义）；也不得下溢
+        // （曾为 `*fails - 1`：debug panic / release 冷却被错误推到上限）
         note_model_server_cooldown(&model);
         let r = model_cooling_remaining_secs(&model).unwrap();
-        assert!(r > 3 && r <= 5, "既有窗口内不改写截止时刻（不后延、不缩短），实际 {r}");
+        assert!(r > 28 && r <= 30, "fails=0 排队短窗应被 Server 失败抬到基准 30s，实际 {r}");
         let (_, fails) = *cooldown_map()
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .get(&model)
             .unwrap();
-        assert_eq!(fails, 0, "窗口未过期不得递增失败计数");
+        assert_eq!(fails, 0, "短窗抬升不递增失败计数（同片段语义）");
         // 窗口过期后同一 Server 失败 → 开启新片段，按计数递增到基准 30s
         cooldown_map()
             .lock()

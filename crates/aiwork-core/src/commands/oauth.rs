@@ -1424,6 +1424,11 @@ fn login_page_hostname() -> String {
     }
 }
 
+/// 取 uid 尾 6 位用于报错辨认，避免完整 uid 出现在提示中（B3 移植）
+fn tail6(s: &str) -> String {
+    s.chars().rev().take(6).collect::<Vec<_>>().into_iter().rev().collect()
+}
+
 /// OAuth 登录闭环：解析回调 → 换取 accessToken → 获取用户信息 → 保存账号
 // async：内含最多两次 120s 超时的串行网络请求（exchange_token/get_user_info），同步命令会冻结 UI（审查修复）
 // Web 化（ADR-3）：runtime 参数已删除，池热重载改走 crate::api_server::runtime::reload_pools_after_change
@@ -1436,16 +1441,17 @@ pub fn oauth_login(
     // 防止浏览器里登错账号导致凭证合到其他账号/误新增
     expect_uid: Option<String>,
 ) -> Result<OAuthLoginResult, String> {
-    // 重新登录模式的副作用基线：`bound_device_id` 在 token 交换内部即被持久化
+    // 副作用基线：`bound_device_id` 在 token 交换内部即被持久化
     // （`persist_bound_device_id` 深埋在交换/刷新闭包内无法延后到 uid 校验之后），
     // 故 uid 校验不通过时必须回滚该全局 kv——否则浏览器登错账号会把**他人**的
     // 设备指纹写成本机全局回退值，污染后续全部账号的刷新链路
-    // （20403 Token device not match）。仅重登模式读一次 kv，普通登录零额外开销。
-    let bound_before = if expect_uid.is_some() {
+    // （20403 Token device not match）。
+    // B3 移植审查修正：无条件读基线（原仅重登模式读）——回调 uid 与 JWT 不一致
+    // 的拒绝分支同样走回滚，普通登录若按 None 基线回滚会把既有合法设备绑定
+    // 误清成 None。kv 读为 SQLite 本地内存级，无网络开销
+    let bound_before = {
         let dev: OAuthDevice = crate::store::db(&state.data_dir).kv_get("oauth_device");
         dev.bound_device_id
-    } else {
-        None
     };
 
     // 1. 解析回调 URL
@@ -1481,30 +1487,55 @@ pub fn oauth_login(
     };
 
     // 4. 解析 JWT 获取 user_id
+    // B3 移植（审查 2026-10-13）：以 JWT 解析值为权威 uid——回调 URL 参数可被
+    // 用户粘贴/构造篡改，此前 URL 参数优先，构造 userId=<目标uid> + 他人 code
+    // 即可把他人凭证写入目标账号。JWT 由授权服务签发不可篡改；两者并存且不一致
+    // 时拒绝，仅 JWT 有值或 URL 参数恰好一致才放行
     let jwt_info = jwt::parse(&jwt);
-    let user_id = callback_info
+    let jwt_uid = jwt_info
         .user_id
         .clone()
-        .or_else(|| jwt_info.user_id.clone())
-        .ok_or_else(|| "无法从回调或 JWT 中获取 user_id".to_string())?;
+        .ok_or_else(|| "无法从 JWT 中解析 user_id".to_string())?;
+    let callback_uid = callback_info
+        .user_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    if let Some(cb_uid) = callback_uid {
+        if cb_uid != jwt_uid {
+            // 回滚副作用（见函数开头 bound_before 说明）：bound_device_id 是全局 kv，
+            // 不回滚会让登错账号的设备指纹污染全体账号的后续刷新
+            let store = crate::store::db(&state.data_dir);
+            let mut dev: OAuthDevice = store.kv_get("oauth_device");
+            if dev.bound_device_id != bound_before {
+                dev.bound_device_id = bound_before;
+                if let Err(e) = store.kv_set("oauth_device", &dev) {
+                    fs_utils::app_log(
+                        &state.data_dir,
+                        &format!("[OAuth] 回调 uid 与 JWT 不一致，回滚 BoundDeviceID 失败（需人工核对 kv oauth_device）: {e}"),
+                    );
+                }
+            }
+            // 清理在途会话：陈旧 PKCE verifier 与会话设备不得残留到下次登录被误用
+            {
+                let mut guard = LAST_OAUTH_STATE.lock().unwrap_or_else(|e| e.into_inner());
+                *guard = None;
+            }
+            return Err(format!(
+                "回调 URL 中的账号 uid（尾号 {}）与凭证 JWT 解析结果（尾号 {}）不一致，已拒绝——请确认回调 URL 完整未被修改",
+                tail6(cb_uid),
+                tail6(&jwt_uid)
+            ));
+        }
+    }
+    let user_id = jwt_uid;
 
     // 重新登录防呆：行内「重新登录」携带目标账号 uid，浏览器误登其他账号时拒绝。
-    //
-    // 审查修复（两处）:
-    // ① **以 JWT 解析 uid 为权威**：回调 URL 由用户手动粘贴，`userId` 参数外部可控；
-    //    原实现优先取回调参数，`expect_uid` 等于与一个可伪造值比对——构造带目标
-    //    uid 的回调即可绕过防呆、把他人凭证写进目标账号。现改为：JWT 有 uid 时以
-    //    JWT 为准；且 JWT 与回调声明不一致同样拒绝（两者都指向同一账号才算登对）。
-    // ② 空串/纯空白视为「未指定」：`cmd_bridge::opt_arg` 对 "" 返回 Some("")，
-    //    原先会让重登 100% 失败并报「账号不一致」，排查方向完全被带偏。
+    // expect_uid 先 trim，空串视为未指定（前端对空输入曾回传 Some("")，导致重登必
+    // 失败）；uid 权威性已由上方 JWT 校验保证，此处仅比对目标账号
     let expect_uid = expect_uid.as_deref().map(str::trim).filter(|s| !s.is_empty());
     if let Some(expected) = expect_uid {
-        let jwt_uid = jwt_info.user_id.as_deref().filter(|s| !s.is_empty());
-        let actual = jwt_uid.unwrap_or(user_id.as_str());
-        let declared = callback_info.user_id.as_deref().filter(|s| !s.is_empty());
-        let mismatched = expected != actual
-            || matches!((jwt_uid, declared), (Some(j), Some(d)) if j != d);
-        if mismatched {
+        if expected != user_id {
             // 回滚副作用（见函数开头 bound_before 说明）：bound_device_id 是全局 kv，
             // 不回滚会让登错账号的设备指纹污染全体账号的后续刷新
             let store = crate::store::db(&state.data_dir);
@@ -1518,10 +1549,7 @@ pub fn oauth_login(
                     );
                 }
             }
-            let tail = |s: &str| {
-                s.chars().rev().take(6).collect::<Vec<_>>().into_iter().rev().collect::<String>()
-            };
-            // 清理在途会话：与成功落库路径同源（1644-1650），否则陈旧 PKCE verifier
+            // 清理在途会话：与成功落库路径同源，否则陈旧 PKCE verifier
             // 与会话设备会残留到下次登录被误用
             {
                 let mut guard = LAST_OAUTH_STATE.lock().unwrap_or_else(|e| e.into_inner());
@@ -1530,8 +1558,8 @@ pub fn oauth_login(
             return Err(format!(
                 "登录账号与目标账号不一致：本次授权的账号 uid 尾号 {}，目标账号 uid 尾号 {}。\
                  已取消（未写入账号凭证、已回滚本次登录产生的设备绑定），请确认浏览器中登录的是同一账号后重试（若浏览器当前为其他账号，请先退出登录）",
-                tail(actual),
-                tail(expected)
+                tail6(&user_id),
+                tail6(expected)
             ));
         }
     }

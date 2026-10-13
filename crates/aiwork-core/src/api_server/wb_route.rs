@@ -432,6 +432,9 @@ pub fn wb_stream_chat(
     proto: Protocol,
     key_id: String,
     guard: InflightGuard,
+    // F4 移植：请求侧 encoded_tool_names 收集的 namespace 展平编码名集合，
+    // /v1/responses 入口随执行链下发；其他协议入口传空集合（不拆分）
+    encoded: std::collections::HashSet<String>,
 ) -> Response {
     let (tx, rx) = tokio::sync::mpsc::channel(64);
 
@@ -476,7 +479,7 @@ pub fn wb_stream_chat(
             });
         }
 
-        run_wb_stream(&state, &body_vec, &model, proto, &key_id, &chat_id, &tx, start_ts, guard);
+        run_wb_stream(&state, &body_vec, &model, proto, &key_id, &chat_id, &tx, start_ts, guard, &encoded);
     });
 
     let stream = ReceiverStream::new(rx);
@@ -504,15 +507,14 @@ fn run_wb_stream(
     tx: &tokio::sync::mpsc::Sender<Result<bytes::Bytes, std::io::Error>>,
     start_ts: Instant,
     mut guard: InflightGuard,
+    encoded: &std::collections::HashSet<String>,
 ) {
     // 请求日志附带的 API Key 展示名（匿名/未知 → 空串，日志显示 "-"）
     let key_name = super::api_keys::key_name_for(&state.data_dir, key_id);
     let peek: Value = serde_json::from_slice(body_vec).unwrap_or(json!({}));
     let sticky_key = SessionKey::from_body(&peek);
-    // issue #93 审查修复 #1：请求 tools 含 namespace 展平的编码名（`__` 分隔）
-    // 时开启响应侧拆分还原；纯普通名（Codex 顶层工具不含 `__`）不拆
-    let split_ns = super::wb_responses::has_separated_tool_names(&peek);
-    // F-76④ 上下文过大提示（仅日志标注，不做真裁剪）
+    // F4 移植：编码名集合由 /v1/responses 入口下发（原 has_separated_tool_names
+    // 布尔判据会误拆原生含 `__` 的扁平名，已废弃）
     log_longctx_hint(state, &peek, model);
     let templates = load_templates(state);
     let mut sanitize = state.wb_sanitize.load(std::sync::atomic::Ordering::Relaxed);
@@ -703,7 +705,7 @@ fn run_wb_stream(
                         Box::new(win.lines) as Box<dyn Iterator<Item = String> + Send>,
                     );
                     let (error_info, sent_any, failed_inline, usage) =
-                        wb_sse::stream_forward_ex(win_lines, tx, proto, chat_id, model, split_ns);
+                        wb_sse::stream_forward_ex(win_lines, tx, proto, chat_id, model, encoded);
                     let duration_ms = start_ts.elapsed().as_millis() as u64;
                     {
                         let (pt, ct) = usage
@@ -898,13 +900,12 @@ pub async fn wb_aggregate_chat(
     proto: Protocol,
     key_id: String,
     guard: InflightGuard,
+    // F4 移植：请求侧 namespace 展平编码名集合（/v1/responses 入口下发）
+    encoded: std::collections::HashSet<String>,
 ) -> Response {
     let model_out = model.clone();
-    // issue #93 审查修复 #1：开关须在 body_vec 被 move 进阻塞闭包前计算——
-    // 请求 tools 含 namespace 展平的编码名（`__` 分隔）时开启响应侧拆分还原
-    let split_ns = serde_json::from_slice::<Value>(&body_vec)
-        .map(|v| super::wb_responses::has_separated_tool_names(&v))
-        .unwrap_or(false);
+    // F4 移植：编码名集合由 /v1/responses 入口随参数下发（须在 body_vec 被
+    // move 进阻塞闭包前捕获），不再从转换后 body 反推布尔开关
     // P2 修复：聚合含分级重试（RetrySame 退避 std::thread::sleep 最长 60s×N），
     // 长阻塞占主池会饿死鉴权等短任务，迁入 stream_runtime 专用阻塞池
     let result = super::stream_runtime().spawn_blocking(move || {
@@ -1223,7 +1224,7 @@ pub async fn wb_aggregate_chat(
                     &resp,
                     &format!("resp_{}", now_ts()),
                     &model_out,
-                    split_ns,
+                    &encoded,
                 ),
                 Protocol::OpenAi => resp,
             };
@@ -1282,11 +1283,12 @@ pub async fn wb_tool_exec_chat(
     start_ts: Instant,
     key_id: String,
     guard: InflightGuard,
+    // F4 移植：请求侧 namespace 展平编码名集合（/v1/responses 入口下发）
+    encoded: std::collections::HashSet<String>,
 ) -> Response {
     let model_inner = model.clone();
-    // issue #93 审查修复 #1：开关须在 chat_body 被 move 进阻塞闭包前计算——
-    // 请求 tools 含 namespace 展平的编码名（`__` 分隔）时开启响应侧拆分还原
-    let split_ns = super::wb_responses::has_separated_tool_names(&chat_body);
+    // F4 移植：编码名集合由 /v1/responses 入口随参数下发（须在 chat_body 被
+    // move 进阻塞闭包前捕获），不再从转换后 body 反推布尔开关
     // P2 修复：工具代执行多轮上游请求 + 重试退避（最长 60s×N），长阻塞占主池
     // 会饿死鉴权等短任务，与非流式聚合一并迁入 stream_runtime 专用阻塞池
     let result = super::stream_runtime().spawn_blocking(move || {
@@ -1635,7 +1637,7 @@ pub async fn wb_tool_exec_chat(
     };
 
     let resp_obj = {
-        let mut r = super::wb_responses::completion_to_responses(&final_completion, &resp_id, &model, split_ns);
+        let mut r = super::wb_responses::completion_to_responses(&final_completion, &resp_id, &model, &encoded);
         if !ws_items.is_empty() {
             let mut output = ws_items;
             if let Some(old) = r.get("output").and_then(|o| o.as_array()).cloned() {

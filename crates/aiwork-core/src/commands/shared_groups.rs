@@ -280,8 +280,9 @@ pub(crate) fn delete_inner(state: &AppState, id: &str) -> Result<(), String> {
             store.kv_set("api_pool", &pool_file)?;
         }
     }
-    // Key 引用清理走锁内原子修改（防与并发 UI 保存互覆约束字段）
-    crate::api_server::api_keys::modify(&state.data_dir, |keys_file| {
+    // Key 引用清理走锁内原子修改（防与并发 UI 保存互覆约束字段）。
+    // 审查修复（中等项，移植 2026-10-13）：modify 返回值（是否清理了引用）不丢弃，留痕可观测
+    let keys_cleaned = crate::api_server::api_keys::modify(&state.data_dir, |keys_file| {
         let mut changed = false;
         for k in keys_file.keys.iter_mut() {
             if k.allowed_groups.iter().any(|g| g == id) {
@@ -291,6 +292,12 @@ pub(crate) fn delete_inner(state: &AppState, id: &str) -> Result<(), String> {
         }
         changed
     });
+    if keys_cleaned {
+        crate::fs_utils::app_log(
+            &state.data_dir,
+            &format!("分组 {id} 已删除：同步清理了引用它的 API Key allowed_groups"),
+        );
+    }
     // ④ 联动：成员回落 / 池筛选变更都影响调度池；Key 约束展开索引失效
     if refs_changed {
         crate::api_server::runtime::reload_pools_after_change(state);

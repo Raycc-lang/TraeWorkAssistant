@@ -88,7 +88,11 @@ pub fn ensure_uid_safe(uid: &str) -> Result<(), String> {
 }
 
 pub fn now_iso() -> String {
-    chrono::Local::now().format("%Y-%m-%dT%H:%M:%S").to_string()
+    // B1（审查 2026-10-13 移植）：补时区偏移（%:z）——此前输出的本地裸串无偏移，
+    // DateTime::parse_from_rfc3339 解析恒失败，消费端 credits_fetched_at 恒 None，
+    // reserve 过滤与 24h 陈旧判定整体失效（fail-open）。带偏移后 rfc3339 直接可解析；
+    // 存量裸串由 parse_ts_loose 二级兜底覆盖。
+    chrono::Local::now().format("%Y-%m-%dT%H:%M:%S%:z").to_string()
 }
 
 pub fn now_ts() -> String {
@@ -103,7 +107,8 @@ pub fn now_ts() -> String {
 /// 此前 `api_server/runtime.rs` 只走 rfc3339 一臂，导致 reserve 过滤与 24h 陈旧
 /// 判定在生产环境结构性失效（单测直接构造 `Some(i64)` 掩盖了该问题）。
 ///
-/// 解析顺序（由严到宽）：rfc3339 → 带小数秒/无小数秒的 naive 串（按本机
+/// 解析顺序（由严到宽，B1 移植 2026-10-13）：纯数字时间戳（秒/毫秒 ≥1e12）→
+/// rfc3339（`Z`/`/` 预处理归一）→ 带小数秒/无小数秒的 naive 串（按本机
 /// Local 时区解释，与写入侧 `chrono::Local` 同口径）→ 纯日期（当天 23:59:59）。
 /// 无法识别返回 None（调用方按「无时间信息」fail-open 处理）。
 pub fn parse_ts_loose(s: &str) -> Option<i64> {
@@ -112,7 +117,17 @@ pub fn parse_ts_loose(s: &str) -> Option<i64> {
     if s.is_empty() {
         return None;
     }
-    if let Ok(d) = chrono::DateTime::parse_from_rfc3339(s) {
+    // 纯数字：按时间戳秒/毫秒解释（毫秒 ≥1e12）
+    if s.chars().all(|c| c.is_ascii_digit()) {
+        let n: f64 = s.parse().ok()?;
+        return if n >= 1e12 {
+            Some((n / 1000.0) as i64)
+        } else {
+            Some(n as i64)
+        };
+    }
+    let s = s.replace('Z', "+00:00").replace('/', "-");
+    if let Ok(d) = chrono::DateTime::parse_from_rfc3339(&s) {
         return Some(d.timestamp());
     }
     for fmt in [
@@ -123,12 +138,12 @@ pub fn parse_ts_loose(s: &str) -> Option<i64> {
         "%Y-%m-%d %H:%M",
         "%Y-%m-%dT%H:%M",
     ] {
-        if let Ok(d) = chrono::NaiveDateTime::parse_from_str(s, fmt) {
+        if let Ok(d) = chrono::NaiveDateTime::parse_from_str(&s, fmt) {
             return chrono::Local.from_local_datetime(&d).single().map(|t| t.timestamp());
         }
     }
     // 纯日期：按当天 23:59:59 计（避免凌晨 0 点把当日快照误判为「已过期」）
-    if let Ok(d) = chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d") {
+    if let Ok(d) = chrono::NaiveDate::parse_from_str(&s, "%Y-%m-%d") {
         return chrono::Local
             .from_local_datetime(&d.and_hms_opt(23, 59, 59)?)
             .single()
@@ -330,6 +345,9 @@ mod fs_path_tests {
         assert_eq!(with_z.unwrap() - with_off.unwrap(), 8 * 3600);
         // 小数秒
         assert!(parse_ts_loose("2026-09-15T10:00:00.500").is_some());
+        // B1 移植回归：纯数字 Unix 秒/毫秒（2026-09-15T00:00:00Z = 1789440000）
+        assert_eq!(parse_ts_loose("1789440000"), Some(1789440000));
+        assert_eq!(parse_ts_loose("1789440000000"), Some(1789440000));
         // 纯日期回退当日 23:59:59（不得被判为 Nil）
         assert!(parse_ts_loose("2026-09-15").is_some());
         // 非法输入 fail-open：None（不得 panic）

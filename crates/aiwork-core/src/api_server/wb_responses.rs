@@ -204,20 +204,59 @@ pub fn split_namespaced(name: &str) -> (String, Option<String>) {
 }
 
 /// 判定转发 body 的 tools 中是否存在含 `__` 分隔符的 function 名。
-/// Responses 请求含 namespace 组时，展平编码名 `<ns>__<inner>` 必含 `__`；
-/// 响应侧（completion_to_responses / stream_forward_ex）据此决定是否拆分还原
-/// （issue #93 审查修复 #1）：无任何含 `__` 工具名时关闭拆分，恰好含 `__` 的
-/// 普通名不再被误拆出 namespace 字段。
-pub fn has_separated_tool_names(body: &Value) -> bool {
-    body.get("tools")
-        .and_then(|v| v.as_array())
-        .map_or(false, |tools| {
-            tools.iter().any(|t| {
-                t.pointer("/function/name")
-                    .and_then(|v| v.as_str())
-                    .map_or(false, |n| n.contains("__"))
-            })
-        })
+/// 请求侧编码名集合（回程拆分闸门，F4 移植，审查 2026-10-13）：
+/// `responses_to_chat` 的 namespace 组展平时实际生成的全部 `<ns>__<inner>`
+/// 编码名（与展平同一遍历口径：顶层 function 同名碰撞去重后仍在集合内的
+/// 才算有效编码名）。/v1/responses 入口在投影前收集并随执行链下发，
+/// 回程投影（completion_to_responses / wb_sse 流式）仅对集合内命中者做
+/// split_namespaced 还原——客户端原生扁平工具名可能天然含 `__`（MCP 惯例
+/// `mcp__server__tool`），无差别拆分会把未编码扁平名误拆成
+/// {name, namespace} 双字段，客户端工具分发匹配失败
+pub fn encoded_tool_names(body: &Value) -> HashSet<String> {
+    let mut encoded = HashSet::new();
+    let Some(tools) = body.get("tools").and_then(|v| v.as_array()) else {
+        return encoded;
+    };
+    // 与 responses_to_chat 同口径的碰撞去重：顶层 function 名先占位，
+    // 与之或与先前展平项重名的编码名被跳过（保留先声明者）——
+    // 被跳过的编码名未向上游声明，上游不可能回呼，无需登记
+    let mut seen: HashSet<String> = tools
+        .iter()
+        .filter(|t| t.get("type").and_then(|v| v.as_str()) == Some("function"))
+        .filter_map(|t| t.get("name").and_then(|v| v.as_str()).map(str::to_string))
+        .collect();
+    for t in tools
+        .iter()
+        .filter(|t| t.get("type").and_then(|v| v.as_str()) == Some("namespace"))
+    {
+        let Some(ns) = t
+            .get("name")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+        else {
+            continue;
+        };
+        let Some(inner) = t.get("tools").and_then(|v| v.as_array()) else {
+            continue;
+        };
+        for it in inner.iter() {
+            if it.get("type").and_then(|v| v.as_str()) != Some("function") {
+                continue;
+            }
+            let Some(iname) = it
+                .get("name")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+            else {
+                continue;
+            };
+            let name = format!("{}__{}", ns, iname);
+            if seen.insert(name.clone()) {
+                encoded.insert(name);
+            }
+        }
+    }
+    encoded
 }
 
 /// input items → chat messages
@@ -466,10 +505,11 @@ fn content_text(content: Option<&Value>) -> String {
 
 /// 内部 OpenAI completion → Responses 对象（非流式 /v1/responses）
 ///
-/// `split_ns`（issue #93 审查修复 #1）：请求声明过含 `__` 的工具名
-/// （namespace 组展平编码名）时为 true，编码名拆回 {name, namespace}；
-/// false 时名字原样透传（请求无 namespace 工具，含 `__` 的普通名不误拆）。
-pub fn completion_to_responses(v: &Value, resp_id: &str, model: &str, split_ns: bool) -> Value {
+/// `encoded`（F4 移植，审查 2026-10-13）：请求侧 `encoded_tool_names` 收集的
+/// namespace 组展平编码名集合——仅集合内命中的工具名拆回 {name, namespace}；
+/// 未登记的扁平名（可能天然含 `__`，如 MCP 惯例 `mcp__server__tool`）保持
+/// 单 name 字段。非 /v1/responses 入口的防御性分支传空集合。
+pub fn completion_to_responses(v: &Value, resp_id: &str, model: &str, encoded: &HashSet<String>) -> Value {
     let message = v
         .pointer("/choices/0/message")
         .cloned()
@@ -502,12 +542,13 @@ pub fn completion_to_responses(v: &Value, resp_id: &str, model: &str, split_ns: 
         for (i, tc) in tcs.iter().enumerate() {
             // 编码名 `<ns>__<name>` 还原为 Codex 可路由的 {name, namespace} 双字段
             // （issue #93：Codex router 只认双字段，namespace 拼进 name 会被判未知工具）；
-            // 审查修复 #1：仅当请求声明过 namespace 组（split_ns）才拆分
+            // F4 移植：仅对请求侧登记的编码名拆分——客户端原生扁平工具名可能
+            // 天然含 `__`（MCP 惯例），未登记者保持单 name 字段
             let raw = tc
                 .pointer("/function/name")
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
-            let (nm, ns) = if split_ns {
+            let (nm, ns) = if encoded.contains(raw) {
                 split_namespaced(raw)
             } else {
                 (raw.to_string(), None)
@@ -632,7 +673,7 @@ mod tests {
                          "finish_reason": "stop"}],
             "usage": {"prompt_tokens": 7, "completion_tokens": 3},
         });
-        let resp = completion_to_responses(&v, "resp_1", "glm-5.3", false);
+        let resp = completion_to_responses(&v, "resp_1", "glm-5.3", &HashSet::new());
         assert_eq!(resp["object"], json!("response"));
         assert_eq!(resp["status"], json!("completed"));
         assert_eq!(resp["output"][0]["type"], json!("message"));
@@ -650,7 +691,7 @@ mod tests {
                                                      "function": {"name": "shell", "arguments": "{\"cmd\":\"ls\"}"}}]}}],
             "usage": {"prompt_tokens": 1, "completion_tokens": 1},
         });
-        let resp = completion_to_responses(&v, "resp_2", "m", false);
+        let resp = completion_to_responses(&v, "resp_2", "m", &HashSet::new());
         assert_eq!(resp["output"][0]["type"], json!("function_call"));
         assert_eq!(resp["output"][0]["call_id"], json!("call_x"));
         assert_eq!(resp["stop_reason"], json!("tool_use"));
@@ -663,13 +704,13 @@ mod tests {
             "choices": [{"index": 0, "finish_reason": "length",
                          "message": {"role": "assistant", "content": "truncat"}}],
         });
-        let resp = completion_to_responses(&v, "resp_3", "m", false);
+        let resp = completion_to_responses(&v, "resp_3", "m", &HashSet::new());
         assert_eq!(resp["status"], json!("incomplete"));
         assert_eq!(resp["incomplete_details"]["reason"], json!("max_output_tokens"));
         // 正常完成仍是 completed + incomplete_details=null
         let mut v2 = v.clone();
         v2["choices"][0]["finish_reason"] = json!("stop");
-        let resp2 = completion_to_responses(&v2, "resp_4", "m", false);
+        let resp2 = completion_to_responses(&v2, "resp_4", "m", &HashSet::new());
         assert_eq!(resp2["status"], json!("completed"));
         assert!(resp2["incomplete_details"].is_null());
     }
@@ -946,7 +987,12 @@ mod tests {
                                  ]}}],
             "usage": {"prompt_tokens": 1, "completion_tokens": 1},
         });
-        let resp = completion_to_responses(&v, "resp_ns", "m", true);
+        let resp = completion_to_responses(
+            &v,
+            "resp_ns",
+            "m",
+            &HashSet::from(["multi_agent_v1__spawn_agent".to_string()]),
+        );
         let out = resp["output"].as_array().unwrap();
         assert_eq!(out[0]["type"], json!("function_call"));
         assert_eq!(out[0]["name"], json!("spawn_agent"));
@@ -1056,29 +1102,117 @@ mod tests {
         );
     }
 
-    /// 审查修复 #1：has_separated_tool_names 判据——tools 含 `__` 编码名即
-    /// 开启拆分；纯普通名/无 tools 关闭
+    /// F4 移植：encoded_tool_names 仅收集 namespace 组展平名，
+    /// 顶层 function 不入集合；无 tools / 碰撞去重语义与 responses_to_chat 同口径
     #[test]
-    fn has_separated_tool_names_detects_encoded_tools() {
-        assert!(has_separated_tool_names(&json!({
-            "tools": [{"type": "function", "function": {"name": "mcp__node_repl__js"}}]
-        })));
-        assert!(!has_separated_tool_names(&json!({
-            "tools": [{"type": "function", "function": {"name": "shell"}}]
-        })));
-        assert!(!has_separated_tool_names(&json!({"model": "m"})));
+    fn encoded_tool_names_collects_only_namespace_groups() {
+        let body = json!({
+            "tools": [
+                {"type": "function", "name": "mcp__server__tool", "parameters": {}},
+                {"type": "namespace", "name": "multi_agent_v1", "tools": [
+                    {"type": "function", "name": "spawn_agent", "parameters": {}}
+                ]},
+                {"type": "namespace", "name": "", "tools": [
+                    {"type": "function", "name": "skipped_empty_ns", "parameters": {}}
+                ]},
+            ],
+        });
+        let encoded = encoded_tool_names(&body);
+        assert!(encoded.contains("multi_agent_v1__spawn_agent"));
+        assert_eq!(encoded.len(), 1);
+        assert!(!encoded.contains("mcp__server__tool"));
+        // 无 tools / 非对象 tools：空集合
+        assert!(encoded_tool_names(&json!({"model": "m"})).is_empty());
     }
 
-    /// 审查修复 #1：split_ns=false 时编码名原样透传，不拆分出 namespace
+    /// F4 移植防漂移锁：encoded_tool_names 与 responses_to_chat 的 namespace 展平
+    /// 是两处独立遍历，必须同口径——展平产物中所有含 `__` 的名字恰为登记集合
+    /// （含同名碰撞去重、空组名/空内名跳过语义）。两侧漂移会导致回程误拆或漏还原
     #[test]
-    fn completion_without_split_flag_keeps_encoded_name() {
+    fn encoded_tool_names_matches_flattened_tools_exactly() {
+        let body = json!({
+            "tools": [
+                {"type": "function", "name": "shell", "parameters": {}},
+                // 与顶层同名碰撞：编码名被去重跳过，不得入集合
+                {"type": "namespace", "name": "collide", "tools": [
+                    {"type": "function", "name": "shell", "parameters": {}}
+                ]},
+                {"type": "namespace", "name": "mcp__node_repl", "tools": [
+                    {"type": "function", "name": "js", "parameters": {}},
+                    // 空内名跳过
+                    {"type": "function", "parameters": {}},
+                    // 非 function 类型跳过
+                    {"type": "other", "name": "not_fn", "parameters": {}}
+                ]},
+                // 空组名跳过
+                {"type": "namespace", "tools": [{"type": "function", "name": "x", "parameters": {}}]},
+            ],
+        });
+        let encoded = encoded_tool_names(&body);
+        let chat = responses_to_chat(&body).unwrap();
+        let with_sep: HashSet<String> = chat["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|t| {
+                t.pointer("/function/name")
+                    .and_then(|v| v.as_str())
+                    .filter(|n| n.contains("__"))
+                    .map(str::to_string)
+            })
+            .collect();
+        assert_eq!(
+            encoded, with_sep,
+            "登记集合必须与展平产物中含 `__` 的名字完全一致"
+        );
+        // 去重语义（与 responses_to_chat 一致，字面比较）：collide 组编码名
+        // `collide__shell` 与顶层名 `shell` 字面不同 → 不冲突、正常展平入集合；
+        // 仅当顶层 function 名字面等于编码名形式（如既有测试的
+        // encoded_name_collision_keeps_first_declared）才被去重跳过
+        assert_eq!(
+            encoded,
+            HashSet::from([
+                "collide__shell".to_string(),
+                "mcp__node_repl__js".to_string(),
+            ])
+        );
+    }
+
+    /// F4 移植回归：回程拆分以请求侧编码名集合为闸门——客户端原生扁平工具名
+    /// 含 `__`（MCP 惯例 mcp__server__tool）未登记时不误拆，登记时正常还原
+    #[test]
+    fn completion_split_gated_by_encoded_names() {
+        let v = json!({
+            "choices": [{"index": 0, "finish_reason": "tool_calls",
+                         "message": {"role": "assistant", "content": null,
+                                     "tool_calls": [
+                                        {"id": "call_1", "type": "function",
+                                         "function": {"name": "mcp__server__tool", "arguments": "{}"}}]}}],
+        });
+        // 未登记（扁平原生名）：保持单 name，不产出 namespace
+        let resp = completion_to_responses(&v, "resp_g1", "m", &HashSet::new());
+        let fc = &resp["output"][0];
+        assert_eq!(fc["type"], json!("function_call"));
+        assert_eq!(fc["name"], json!("mcp__server__tool"));
+        assert!(fc.get("namespace").is_none());
+        // 登记（确属 namespace 分组展平名）：正常还原双字段
+        let encoded = HashSet::from(["mcp__server__tool".to_string()]);
+        let resp = completion_to_responses(&v, "resp_g2", "m", &encoded);
+        let fc = &resp["output"][0];
+        assert_eq!(fc["name"], json!("tool"));
+        assert_eq!(fc["namespace"], json!("mcp__server"));
+    }
+
+    /// 编码名未登记（空集合）时原样透传，不拆分出 namespace（旧 split_ns=false 语义）
+    #[test]
+    fn completion_without_encoded_registration_keeps_encoded_name() {
         let v = json!({
             "choices": [{"index": 0, "finish_reason": "tool_calls",
                          "message": {"role": "assistant", "content": null,
                                      "tool_calls": [{"id": "call_a", "type": "function",
                                       "function": {"name": "mcp__node_repl__js", "arguments": "{}"}}]}}],
         });
-        let resp = completion_to_responses(&v, "resp_nosplit", "m", false);
+        let resp = completion_to_responses(&v, "resp_nosplit", "m", &HashSet::new());
         let out = resp["output"].as_array().unwrap();
         assert_eq!(out[0]["type"], json!("function_call"));
         assert_eq!(out[0]["name"], json!("mcp__node_repl__js"));
