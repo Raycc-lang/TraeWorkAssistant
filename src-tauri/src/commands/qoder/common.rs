@@ -282,7 +282,11 @@ pub(crate) fn ide_split_installed() -> bool {
 
 #[cfg(target_os = "macos")]
 pub(crate) fn ide_split_installed() -> bool {
-    Path::new("/Applications/Qoder CN IDE.app").exists()
+    // 双根检索（审查修复：main 侧单根 /Applications 版本会在合并时覆盖 macos_main
+    // 的双根语义——装在 ~/Applications 的用户拆分形态判定恒 false）
+    mac_app_bases()
+        .iter()
+        .any(|b| b.join("Qoder CN IDE.app").is_dir())
 }
 
 #[cfg(not(any(target_os = "windows", target_os = "macos")))]
