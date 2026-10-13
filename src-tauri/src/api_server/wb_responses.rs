@@ -12,6 +12,8 @@ use std::collections::HashSet;
 
 use serde_json::{json, Map, Value};
 
+use super::wb_sse::cached_tokens_of;
+
 /// Responses 请求 → OpenAI chat completions 内部格式
 ///
 /// 映射：instructions → system；input（string | items[]）→ messages；
@@ -537,7 +539,7 @@ pub fn completion_to_responses_ns(
         "error": null,
         "usage": {
             "input_tokens": it,
-            "input_tokens_details": {"cached_tokens": 0},
+            "input_tokens_details": {"cached_tokens": v.get("usage").map(cached_tokens_of).unwrap_or(0)},
             "output_tokens": ot,
             "output_tokens_details": {"reasoning_tokens": 0},
             "total_tokens": it + ot,
