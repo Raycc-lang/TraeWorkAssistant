@@ -620,8 +620,23 @@ fn anthropic_stop_reason(finish: &str) -> &'static str {
     }
 }
 
+/// token 数值宽口径解析：整数直收；f64 四舍五入（上游偶发 123.0 形态）；字符串
+/// 形态（"123"）解析。审查修复：原 as_i64 窄口径下这两种形态静默归零，可出现
+/// 「缓存读 > 总输入」的矛盾账。
+/// 负值过滤（审查收尾）：token 数恒非负，负值按缺省处理——对齐 wb_sse::token_number
+/// 的 u64 口径（负数/负 f64/负字符串三分支同拒），避免求和被异常负值拉低出矛盾账
+fn token_number(v: &Value) -> Option<i64> {
+    if let Some(n) = v.as_i64() {
+        return (n >= 0).then_some(n);
+    }
+    if let Some(f) = v.as_f64() {
+        return f.is_finite().then(|| f.round() as i64).filter(|n| *n >= 0);
+    }
+    v.as_str()?.trim().parse::<i64>().ok().filter(|n| *n >= 0)
+}
+
 fn usage_i64(u: &Value, keys: &[&str]) -> Option<i64> {
-    keys.iter().find_map(|k| u.get(*k).and_then(|v| v.as_i64()))
+    keys.iter().find_map(|k| u.get(*k).and_then(token_number))
 }
 
 /// 归一化 OpenAI usage：WB token_usage 原始字段（cache_read_token 等）→
@@ -1362,6 +1377,29 @@ mod tests {
         let u = serde_json::json!({"prompt_tokens": i64::MAX, "completion_tokens": 1});
         let n = normalize_openai_usage(&u);
         assert_eq!(n["total_tokens"], serde_json::json!(i64::MAX));
+    }
+
+    #[test]
+    fn normalize_openai_usage_accepts_f64_and_string_tokens() {
+        // 审查修复回归：f64（123.0）与字符串（"20"）形态 token 不得静默归零
+        let n = normalize_openai_usage(&serde_json::json!({
+            "prompt_tokens": 100.7, "completion_tokens": "20"
+        }));
+        assert_eq!(n["prompt_tokens"], serde_json::json!(101));
+        assert_eq!(n["completion_tokens"], serde_json::json!(20));
+        assert_eq!(n["total_tokens"], serde_json::json!(121));
+    }
+
+    #[test]
+    fn token_number_rejects_negative_values() {
+        // 审查收尾回归：token 数恒非负，负值（数字/浮点/字符串三分支）按缺省处理，
+        // 对齐 wb_sse::token_number 的 u64 口径
+        assert_eq!(usage_i64(&serde_json::json!({"prompt_tokens": -3}), &["prompt_tokens"]), None);
+        assert_eq!(usage_i64(&serde_json::json!({"prompt_tokens": -1.5}), &["prompt_tokens"]), None);
+        assert_eq!(usage_i64(&serde_json::json!({"prompt_tokens": "-3"}), &["prompt_tokens"]), None);
+        // 正值三分支不受影响
+        assert_eq!(usage_i64(&serde_json::json!({"prompt_tokens": 5}), &["prompt_tokens"]), Some(5));
+        assert_eq!(usage_i64(&serde_json::json!({"prompt_tokens": "5"}), &["prompt_tokens"]), Some(5));
     }
 
     #[test]

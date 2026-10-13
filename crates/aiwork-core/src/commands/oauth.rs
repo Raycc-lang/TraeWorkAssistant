@@ -1026,6 +1026,11 @@ fn mask_sensitive(v: &mut serde_json::Value) {
         SENSITIVE.iter().any(|s| kl.contains(s))
     }
     fn mask_str(s: &str) -> String {
+        // 审查修复：短纯数字串（≤12 位）为错误码等业务标识（如 Error.Code="20101"），
+        // 打码会毁掉排障关键信息——豁免不打码；真实凭证（token/jwt 等）远长于此，不受影响
+        if !s.is_empty() && s.len() <= 12 && s.bytes().all(|b| b.is_ascii_digit()) {
+            return s.to_string();
+        }
         let head: String = s.chars().take(6).collect();
         format!("{head}…(len={})", s.chars().count())
     }

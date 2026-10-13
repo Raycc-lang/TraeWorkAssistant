@@ -6,6 +6,35 @@
 
 ---
 
+## [1.4.13] · 2026-10-13 · 移植 main：指纹诊断闭环 + 模板规则合并语义
+
+> 合并点 `main@f5e3f48` → `main@dea9ceb`（2 个提交，手工语义移植，未 merge）。桌面/OS 专属改动跳过。
+
+### 新增
+
+- **指纹诊断闭环（issue #99）**：11128 拦截自动提取指纹样本（去重落日志），流式/聚合、WB/Qoder 全管线覆盖；池耗尽诊断行结构化，指纹封禁收尾补落样本。
+- **模板规则合并语义（issue #99）**：默认表全量生效，自定义表覆盖/追加；`to` 可空（null=停用、空串=剥离）；前端指纹清洗面板支持逐条停用。
+- **落池观测**：dispatch 落池时落 pool/model/bind/fallback_from 结构化日志。
+
+### 修复与加固
+
+- **日志本地时区**：`api_logger` 时间戳改 chrono 本地时间，容器 `TZ` 生效。
+- **usage 宽口径**：token 数提取支持 f64/字符串形态，不再静默得 0。
+- **OAuth 掩码豁免**：≤12 位纯数字串原样返回。
+- **调度幂等与重试**：wb-checkin / wb-growth 抢锁失败改 `skipped_busy` 跳过；成长任务失败区分可重试与永久失败，可重试自动重试。
+- **审查收尾修复**：wb-checkin / wb-growth 凭证类失败事件补结构化 `permanent` 标记，调度重试判定改结构化字段权威（显式 false 不被文案翻案、缺省退化文案匹配），不再依赖中文措辞稳定；`sse.rs` token 宽口径解析补负值过滤（数字/浮点/字符串三分支，对齐 `wb_sse` u64 口径）。
+- **模板映射校验**：校验提示明确 `to` 可为字符串/空串/null。
+
+### 跳过（桌面/OS 专属）
+
+- OAuth 平台分派、`fs_utils` %APPDATA%、`qoder_common` Windows API、ideScan 桌面导入、`device_proxy`、`ide_store`、`updater`、`proxy` 等。
+
+### 验证
+
+- `cargo test --workspace` 674+12 通过（7 忽略）· `tsc` 0 错误 · `vitest` 61 通过。
+
+---
+
 ## [1.4.12] · 2026-10-13 · 移植 main 缓存 tokens 口径对齐批：宽口径提取 + usage 归一化 + OpenAI 流式噪声帧治理
 
 > 合并点 `main@aa4b475` → `main@f5e3f48`（3 个补充提交 + 本分支 PR #97 收敛，手工语义移植，未 merge）。全部为网关协议出口层系统无关改动，无桌面/OS 依赖。

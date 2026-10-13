@@ -483,11 +483,11 @@ fn process_account(state: &AppState, agent: &ureq::Agent, acct: &Value, opts: &C
     ]);
     let base_ev = json!({"user_id": aid, "name": name});
     if opts.skip_expired && py_truthy(acct.get("needs_relogin")) {
-        return json!({ "user_id": aid, "name": base_ev["name"], "status": "fail", "message": "需重新登录，已跳过" });
+        return json!({ "user_id": aid, "name": base_ev["name"], "status": "fail", "permanent": true, "message": "需重新登录，已跳过" });
     }
     let (creds, refreshed, note) = wb_common::ensure_fresh(state, agent, acct, opts.lazy_hours);
     if creds.access_token.is_empty() {
-        return json!({ "user_id": aid, "name": base_ev["name"], "status": "fail", "message": format!("无可用凭证（{note}）") });
+        return json!({ "user_id": aid, "name": base_ev["name"], "status": "fail", "permanent": true, "message": format!("无可用凭证（{note}）") });
     }
     if refreshed {
         sync_pool_expiry(state, &aid, &creds);
@@ -919,7 +919,7 @@ fn process_account_growth(state: &AppState, agent: &ureq::Agent, acct: &Value, f
     let base_ev = json!({"type": "growth", "user_id": aid, "name": name});
     let (creds, _refreshed, note) = wb_common::ensure_fresh(state, agent, acct, 24);
     if creds.access_token.is_empty() {
-        return json!({ "type": "growth", "user_id": aid, "name": base_ev["name"], "status": "fail", "message": format!("无可用凭证（{note}）") });
+        return json!({ "type": "growth", "user_id": aid, "name": base_ev["name"], "status": "fail", "permanent": true, "message": format!("无可用凭证（{note}）") });
     }
     let urls = urls_for(wb_common::region_billing_base(&creds.domain));
 

@@ -526,6 +526,35 @@ pub fn scheduler_config_set(st: &AppState, cfg: Value) -> Result<Value, String> 
     Ok(scheduler_config_get(st))
 }
 
+/// 失败事件永久性判定（审查收尾）：结构化 `permanent` 字段为权威来源（显式
+/// false 同样生效——文案命中不得翻案；wb_checkin 凭证类失败事件自 1.4.13 起携带），
+/// 字段缺省时退化文案匹配兼容旧事件——判定不再依赖「需重新登录」/「无可用凭证」
+/// 中文措辞稳定
+fn is_permanent_failure(e: &Value) -> bool {
+    match e.get("permanent") {
+        Some(Value::Bool(b)) => *b,
+        _ => {
+            let m = e.get("message").and_then(Value::as_str).unwrap_or("");
+            m.contains("需重新登录") || m.contains("无可用凭证")
+        }
+    }
+}
+
+/// 成长轮失败统计（run_task wb-growth 重试口径）：返回 (失败账号数, 其中永久性失败数)。
+/// 仅统计 growth 事件（type=growth && status=fail），start/done 等推进事件不计
+fn growth_fail_stats(events: &[Value]) -> (i64, i64) {
+    let is_growth_fail = |e: &Value| {
+        e.get("type").and_then(Value::as_str) == Some("growth")
+            && e.get("status").and_then(Value::as_str) == Some("fail")
+    };
+    let failed = events.iter().filter(|e| is_growth_fail(e)).count() as i64;
+    let permanent = events
+        .iter()
+        .filter(|e| is_growth_fail(e) && is_permanent_failure(e))
+        .count() as i64;
+    (failed, permanent)
+}
+
 /// 执行单个任务（复用 CLI 任务同款实现，进度静默、结果汇总落日志）
 fn run_task(key: &str, st: &AppState) -> Result<Value, String> {
     match key {
@@ -569,7 +598,9 @@ fn run_task(key: &str, st: &AppState) -> Result<Value, String> {
         // 永久性凭证失败（需重新登录 / 无可用凭证，30 分钟内不会自愈）剔除出重试判定
         "wb-checkin" => {
             let Ok(_round) = crate::commands::workbuddy::try_acquire_wb_round() else {
-                return Err("跳过：已有签到/成长任务在执行中".into());
+                // skipped_busy：抢不到轮次锁（UI 路径在跑）= 幂等跳过而非失败（对齐
+                // qoder-checkin）——返 Err 会触发当日首败误报通知 + 白耗 Server酱 额度
+                return Ok(json!({ "ok": true, "skipped": "已有签到/成长任务在执行中，本轮跳过", "skipped_busy": true }));
             };
             let mut events: Vec<Value> = Vec::new();
             let done = crate::tasks::wb_checkin::run_checkin_round(
@@ -580,11 +611,7 @@ fn run_task(key: &str, st: &AppState) -> Result<Value, String> {
             let failed = done.get("failed").and_then(Value::as_i64).unwrap_or(0);
             let failed_permanent = events
                 .iter()
-                .filter(|e| {
-                    let m = e.get("message").and_then(Value::as_str).unwrap_or("");
-                    e.get("status").and_then(Value::as_str) == Some("fail")
-                        && (m.contains("需重新登录") || m.contains("无可用凭证"))
-                })
+                .filter(|e| e.get("status").and_then(Value::as_str) == Some("fail") && is_permanent_failure(e))
                 .count() as i64;
             let retryable = (failed - failed_permanent).max(0);
             if retryable > 0 {
@@ -599,7 +626,8 @@ fn run_task(key: &str, st: &AppState) -> Result<Value, String> {
         // WorkBuddy 每日成长：成长三开关驱动，抢轮次锁与 UI 路径互斥
         "wb-growth" => {
             let Ok(_round) = crate::commands::workbuddy::try_acquire_wb_round() else {
-                return Err("跳过：已有签到/成长任务在执行中".into());
+                // skipped_busy：对齐 qoder-checkin/wb-checkin 的幂等跳过（防误报通知）
+                return Ok(json!({ "ok": true, "skipped": "已有签到/成长任务在执行中，本轮跳过", "skipped_busy": true }));
             };
             let s = crate::commands::workbuddy::load_settings(st);
             let flags = crate::tasks::wb_checkin::GrowthOpts {
@@ -607,9 +635,24 @@ fn run_task(key: &str, st: &AppState) -> Result<Value, String> {
                 lottery: s.growth_lottery,
                 tasks: s.growth_tasks,
             };
-            // run_growth_round 为 NDJSON 推进式输出（无汇总返回值），调度日志记 ok 概要即可
-            crate::tasks::wb_checkin::run_growth_round(st, &flags, &[], &mut |_| {});
-            Ok(json!({ "ok": true }))
+            // run_growth_round 为 NDJSON 推进式输出（无汇总返回值）。审查修复：失败事件
+            // 此前被空回调丢弃（恒 Ok：当日不重试不通知）——现累计事件，可重试失败返
+            // Err 交 30 分钟冷却重试；永久性凭证失败剔除（对齐 wb-checkin 口径）
+            let mut events: Vec<Value> = Vec::new();
+            crate::tasks::wb_checkin::run_growth_round(st, &flags, &[], &mut |ev| events.push(ev.clone()));
+            let (failed, failed_permanent) = growth_fail_stats(&events);
+            let retryable = (failed - failed_permanent).max(0);
+            if retryable > 0 {
+                return Err(format!("WB 成长：{retryable} 个账号失败（稍后自动重试）"));
+            }
+            // 全部失败且均为永久性（凭证类）时不再 Err 重试（避免注定失败的重试循环），
+            // 但须可观测：summary 落入 last_summary 供日志/UI 展示（此前恒 {"ok":true} 零信息量）
+            let summary = if failed_permanent > 0 {
+                format!("WB 成长完成，{failed_permanent} 个账号永久失败（需重新登录或配置凭证）")
+            } else {
+                "WB 成长完成".to_string()
+            };
+            Ok(json!({ "ok": true, "summary": summary }))
         }
         // WorkBuddy token 兜底续期：与 `--task-run wb-renew` 同款（lazy 24h）
         "wb-renew" => Ok(crate::tasks::wb_checkin::run_renew_only(st, 24)),
@@ -928,6 +971,47 @@ pub fn scheduler_status(st: &AppState) -> Value {
 #[cfg(test)]
 mod sched_plan_tests {
     use super::*;
+
+    /// 失败事件永久性判定（审查收尾回归）：结构化 permanent 优先、文案匹配退化兼容
+    #[test]
+    fn permanent_failure_structured_flag_takes_precedence() {
+        // 结构化标记：文案不含关键词也判永久
+        assert!(is_permanent_failure(&json!({
+            "status": "fail", "permanent": true, "message": "自定义永久失败描述"
+        })));
+        // 文案退化兼容（旧事件无 permanent 字段）
+        assert!(is_permanent_failure(&json!({
+            "status": "fail", "message": "无可用凭证（token 已过期）"
+        })));
+        assert!(is_permanent_failure(&json!({
+            "status": "fail", "message": "需重新登录，已跳过"
+        })));
+        // 可重试失败：无标记且文案不含关键词
+        assert!(!is_permanent_failure(&json!({
+            "status": "fail", "message": "上游 502"
+        })));
+        // permanent:false 不误判（显式否定优先于文案）
+        assert!(!is_permanent_failure(&json!({
+            "status": "fail", "permanent": false, "message": "无可用凭证"
+        })));
+    }
+
+    /// 成长轮失败统计：仅 growth 事件计入；permanent 事件从可重试口径剔除
+    #[test]
+    fn growth_fail_stats_counts_growth_events_only() {
+        let events = vec![
+            json!({"type": "start", "total": 3}),
+            json!({"type": "growth", "status": "fail", "permanent": true, "message": "无可用凭证（x）"}),
+            json!({"type": "growth", "status": "fail", "message": "上游 502"}),
+            json!({"type": "growth", "status": "ok"}),
+            json!({"type": "done", "ok": 2, "failed": 2}),
+        ];
+        let (failed, permanent) = growth_fail_stats(&events);
+        assert_eq!(failed, 2);
+        assert_eq!(permanent, 1);
+        // 空轮次（无账号）
+        assert_eq!(growth_fail_stats(&[]), (0, 0));
+    }
 
     fn task(key: &str) -> &'static SchedTask {
         TASKS.iter().find(|t| t.key == key).unwrap()
