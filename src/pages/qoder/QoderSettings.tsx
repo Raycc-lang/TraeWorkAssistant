@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { Save, RefreshCw, ShieldAlert, SlidersHorizontal } from 'lucide-react';
 import PageHeader from '../../components/PageHeader';
 import SchedulerTasksCard, { type TaskToggleOverride } from '../../components/SchedulerTasksCard';
@@ -10,11 +10,15 @@ import type { QoderSettings } from '../../types';
 
 /**
  * qoder-settings 环境配置（F-80 §5.8，布局对齐 BuddySettings，docker 版裁剪）：
- * 左列 通用配置（自动签到开关）；右列 定时任务（SchedulerTasksCard 统一配置
- * qoder-checkin / qoder-refresh / qoder-credits-snapshot / qoder-catalog-sync）。
- * qoder-checkin 开关绑定 QoderSettings.auto_checkin（单源：同时门控定时签到与启动补签）；
- * 桌面版的客户端路径检测 / Windows 计划任务双轨为 OS 专属，docker 版不含。
+ * 左列 通用配置（自动签到开关 + 多账号签到间隔）；右列 定时任务（SchedulerTasksCard
+ * 统一配置 qoder-checkin / qoder-refresh / qoder-credits-snapshot / qoder-catalog-sync /
+ * qoder-sessions-compact）。qoder-checkin 开关绑定 QoderSettings.auto_checkin
+ * （单源：同时门控定时签到与启动补签）；积分快照与会话流水合并由服务端内置调度器
+ * 统一周期执行（scheduler_cfg），本页仅只读指引、不做本地化配置（2026-10-12 审查
+ * P5：移除后端零消费的 app Settings 假面板）。桌面版的客户端路径检测 / Windows
+ * 计划任务双轨为 OS 专属，docker 版不含。
  */
+
 export default function QoderSettings() {
   const pushToast = useAppStore((s) => s.pushToast);
   const [settings, setSettings] = useState<QoderSettings | null>(null);
@@ -24,11 +28,18 @@ export default function QoderSettings() {
   const [checkinToggleBusy, setCheckinToggleBusy] = useState(false);
   // 多账号签到间隔（qoder_checkin_gap_secs 存 app Settings，随「保存配置」统一提交）
   const [checkinGap, setCheckinGap] = useState(3);
+  // 最近一次持久化/加载的 qoder-settings 快照（ref）：toggleCheckin 整文档写回的基底，
+  // 避免连带持久化未保存的本地编辑（main 3.7.9 防过期快照语义）；写回成功后就地推进
+  // 基底（连续两次单项保存互不回滚）；refresh 成功后、save 成功后的 refresh 也会更新
+  const savedSettingsRef = useRef<QoderSettings | null>(null);
 
   const refresh = useCallback(async () => {
     setRefreshing(true);
     try {
-      setSettings(await api.qoder.settingsGet().catch(() => null));
+      const st = await api.qoder.settingsGet().catch(() => null);
+      setSettings(st);
+      // 同步快照基底（main 3.7.9）：refresh 成功后 savedSettingsRef 就地推进
+      savedSettingsRef.current = st;
       const app = await api.misc.settingsGet().catch(() => null);
       setCheckinGap(app?.qoder_checkin_gap_secs ?? 3);
     } catch (err) {
@@ -48,11 +59,16 @@ export default function QoderSettings() {
       pushToast('warn', '配置尚未加载，无法保存（请刷新重试）');
       return;
     }
+    // 配置未加载时静默返回会让用户误以为保存成功（对齐 BuddyApiService 守卫模式）
+    // 已上移守卫；此处直接落值
     setSaving(true);
     try {
       await withMinDelay(
         Promise.all([
           api.qoder.settingsSet(settings),
+          // app Settings 仅落有后端消费的键（qoder_checkin_gap_secs，models.rs/
+          // qoder_checkin.rs 消费）；积分快照与会话合并调度由 scheduler_cfg 驱动，
+          // 在右侧定时任务卡配置（2026-10-12 审查 P5）
           api.misc.settingsSet({
             ...(await api.misc.settingsGet()),
             qoder_checkin_gap_secs: checkinGap,
@@ -69,15 +85,19 @@ export default function QoderSettings() {
     }
   };
 
-  // qoder-checkin 开关：绑定 auto_checkin 并即时保存（与定时任务卡其他开关交互一致）
+  // qoder-checkin 开关：绑定 auto_checkin 并即时保存（与定时任务卡其他开关交互一致）。
+  // 写回基底用 savedSettingsRef（main 3.7.9 防过期快照）：整文档写回时以最近一次
+  // 持久化快照为基底、UI 仅 patch 本次开关字段，不连带持久化左侧卡内未保存的本地编辑；
+  // 成功后就地推进基底，连续两次单项保存互不回滚
   const toggleCheckin = async (v: boolean) => {
     if (!settings) return;
     const prev = settings;
-    const next = { ...prev, auto_checkin: v };
+    const next = { ...(savedSettingsRef.current ?? settings), auto_checkin: v };
     setSettings(next);
     setCheckinToggleBusy(true);
     try {
       await withMinDelay(api.qoder.settingsSet(next));
+      savedSettingsRef.current = next;
       pushToast('success', v ? '自动签到已启用' : '自动签到已停用');
     } catch (err) {
       setSettings(prev);
@@ -184,13 +204,27 @@ export default function QoderSettings() {
               </div>
             </div>
           </div>
+
+          <div className="my-4 border-t border-slate-100 dark:border-zinc-800" />
+
+          {/* 积分快照 / 会话流水合并（docker 版）：服务端内置调度器统一周期执行，
+              仅右侧定时任务卡可配置（2026-10-12 审查 P5：原四模式/保留窗表单写入
+              的 app Settings 键后端零消费，假面板已裁剪为只读指引） */}
+          <div className="rounded-lg border border-slate-100 bg-slate-50 p-3 text-xs leading-relaxed text-slate-500 dark:border-zinc-800 dark:bg-zinc-900 dark:text-zinc-400">
+            <span className="font-medium text-slate-600 dark:text-zinc-300">积分快照 / 会话流水合并：</span>
+            docker 版由服务端内置调度器统一周期执行——积分快照每日拉取全部账号余额写入快照
+            （积分看板趋势数据源，无账号静默跳过、失败 30 分钟后自动重试）；会话流水每 6 小时
+            将早于保留窗的请求级记录按「日期 + 账号 + 会话说明」合并为单行（积分与 token 合计
+            不变，幂等可重跑）。启停与执行时刻请在右侧「定时任务」卡调整对应任务
+            （qoder-credits-snapshot / qoder-sessions-compact）。
+          </div>
         </section>
 
         {/* 右列：定时任务（开关与执行时刻即时保存，含最近执行状态；推荐配置 = 全部启用 + 默认时刻） */}
         <SchedulerTasksCard
-          taskKeys={['qoder-checkin', 'qoder-refresh', 'qoder-credits-snapshot', 'qoder-catalog-sync']}
+          taskKeys={['qoder-checkin', 'qoder-refresh', 'qoder-credits-snapshot', 'qoder-catalog-sync', 'qoder-sessions-compact']}
           overrides={overrides}
-          desc="服务端内置调度器自动执行，覆盖每日签到 / 凭证定时刷新 / 积分快照 / 模型目录同步。推荐保持全部启用。"
+          desc="服务端内置调度器自动执行，覆盖每日签到 / 凭证定时刷新 / 积分快照 / 模型目录同步 / 会话流水合并。推荐保持全部启用。"
         />
       </div>
     </div>

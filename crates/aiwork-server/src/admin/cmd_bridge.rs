@@ -200,7 +200,7 @@ pub fn dispatch(admin: &AdminState, name: &str, args: Value) -> Result<Value, St
         }
 
         // ==================== shared_groups/tags（共享分组与账号标签，D1-D3） ====================
-        "shared_groups_list" => to_json(shared_groups::shared_groups_list(state)),
+        "shared_groups_list" => shared_groups::shared_groups_list(state).and_then(to_json),
         "shared_groups_create" => {
             let name_ = arg(&args, "name")?;
             let color = arg(&args, "color")?;
@@ -477,7 +477,9 @@ pub fn dispatch(admin: &AdminState, name: &str, args: Value) -> Result<Value, St
             let callback_url = arg(&args, "callback_url")?;
             let account_name = opt_arg(&args, "account_name")?;
             let group_id = opt_arg(&args, "group_id")?;
-            oauth::oauth_login(state, callback_url, account_name, group_id).and_then(to_json)
+            let expect_uid = opt_arg(&args, "expect_uid")?;
+            oauth::oauth_login(state, callback_url, account_name, group_id, expect_uid)
+                .and_then(to_json)
         }
 
         // ==================== workbuddy（WorkBuddy 全域） ====================
@@ -721,6 +723,17 @@ pub fn dispatch(admin: &AdminState, name: &str, args: Value) -> Result<Value, St
             qoder::qoder_sessions_query(state, start, end, model, user_id, page, page_size)
                 .and_then(to_json)
         }
+        // 会话聚合展开明细（移植 main 11d23c1）：sid 空仅按 preview 匹配（失败桶），
+        // 非空按 (session_id OR preview) 双捞历史随机 sid 行。参数键为 snake_case：
+        // 前端经 tauri.ts toSnakeKey 统一转换后桥接（2026-10-12 审查 P2 修复）
+        "qoder_session_detail_query" => {
+            let date = arg(&args, "date")?;
+            let uid = arg(&args, "uid")?;
+            let session_id = opt_arg(&args, "session_id")?.unwrap_or_default();
+            let preview = opt_arg(&args, "preview")?.unwrap_or_default();
+            qoder::qoder_session_detail_query(state, date, uid, session_id, preview)
+                .and_then(to_json)
+        }
 
         // ==================== scheduler（调度器） ====================
         "scheduler_status" => Ok(aiwork_core::scheduler::scheduler_status(state)),
@@ -777,6 +790,7 @@ mod tests {
             jwt_refresh_lock: Arc::new(std::sync::Mutex::new(())),
             qoder_pool_lock: Arc::new(std::sync::Mutex::new(())),
             wb_pool_lock: Arc::new(std::sync::Mutex::new(())),
+            group_defs_lock: Arc::new(std::sync::Mutex::new(())),
             events: std::sync::Arc::new(std::sync::Mutex::new(None)),
         });
         AdminState {

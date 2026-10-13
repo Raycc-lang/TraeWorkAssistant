@@ -48,11 +48,13 @@ enum AllowedNet {
     V6(u128, u128),
 }
 
-/// 进程内配置缓存（热生效）：请求路径只读 Arc 快照，保存时整体替换
+/// 进程内配置缓存（热生效）：请求路径只读 Arc 快照，保存时整体替换。
+/// `data_dir` 使中间件在拒绝请求时能把安全事件落 app.log（中间件拿不到 AppState）
 struct AllowCache {
     enabled: bool,
     trust_proxy: bool,
     nets: Vec<AllowedNet>,
+    data_dir: std::path::PathBuf,
 }
 
 static CACHE: LazyLock<RwLock<Arc<AllowCache>>> = LazyLock::new(|| {
@@ -60,6 +62,7 @@ static CACHE: LazyLock<RwLock<Arc<AllowCache>>> = LazyLock::new(|| {
         enabled: false,
         trust_proxy: false,
         nets: Vec::new(),
+        data_dir: std::path::PathBuf::new(),
     }))
 });
 
@@ -71,6 +74,7 @@ pub fn reload(state: &AppState) {
         enabled: cfg.enabled,
         trust_proxy: cfg.trust_proxy,
         nets,
+        data_dir: state.data_dir.clone(),
     });
     if cfg.enabled {
         let mut msg = format!(
@@ -123,7 +127,27 @@ pub fn config_set(state: &AppState, cfg: IpAllowlistConfig) -> Result<IpAllowlis
         .filter(|s| parse_net(s).is_none())
         .collect();
     if !bad.is_empty() {
-        return Err(format!("无效的 CIDR/IP 条目: {}", bad.join(", ")));
+        // 审查修复：条目原样回显前做长度与字符清洗——用户输入进错误串（会一路透到
+        // UI），控制字符（\r\n 等）会造成日志/展示注入、超长输入会把错误体线性放大。
+        // 每条截断 32 字符，最多列 5 条，并去掉 ASCII 控制字符
+        let shown: Vec<String> = bad
+            .iter()
+            .take(5)
+            .map(|s| {
+                s.chars()
+                    .filter(|c| !c.is_ascii_control())
+                    .take(32)
+                    .collect::<String>()
+            })
+            .collect();
+        let more = if bad.len() > shown.len() {
+            format!(" 等 {} 条", bad.len())
+        } else {
+            String::new()
+        };
+        let msg = format!("无效的 CIDR/IP 条目: {}{}", shown.join(", "), more);
+        aiwork_core::fs_utils::app_log(&state.data_dir, &format!("IP 允许列表保存被拒绝: {msg}"));
+        return Err(msg);
     }
     let cfg = IpAllowlistConfig {
         enabled: cfg.enabled,
@@ -171,6 +195,19 @@ pub(crate) async fn ip_middleware(req: Request, next: Next) -> Response {
     if allowed {
         next.run(req).await
     } else {
+        // 审查修复：拒绝是安全事件，此前完全不落日志——被拦截的来源无从追溯，
+        // 也无法区分「配置写错误伤自己」与「真实探测流量」
+        if !cache.data_dir.as_os_str().is_empty() {
+            aiwork_core::fs_utils::app_log(
+                &cache.data_dir,
+                &format!(
+                    "IP 允许列表拒绝: ip={} path={} trust_proxy={}",
+                    ip.map(|i| i.to_string()).unwrap_or_else(|| "unknown".into()),
+                    req.uri().path(),
+                    cache.trust_proxy,
+                ),
+            );
+        }
         json_response(
             axum::http::StatusCode::FORBIDDEN,
             json!({"ok": false, "error": "来源 IP 不在允许列表内"}),
@@ -347,6 +384,7 @@ mod tests {
             jwt_refresh_lock: Arc::new(std::sync::Mutex::new(())),
             qoder_pool_lock: Arc::new(std::sync::Mutex::new(())),
             wb_pool_lock: Arc::new(std::sync::Mutex::new(())),
+            group_defs_lock: Arc::new(std::sync::Mutex::new(())),
             events: std::sync::Arc::new(std::sync::Mutex::new(None)),
         };
         let saved = config_set(

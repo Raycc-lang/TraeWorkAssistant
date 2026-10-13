@@ -531,6 +531,7 @@ pub async fn api_qoder_catalog_sync(state: &AppState) -> Result<usize, String> {
         jwt_refresh_lock: state.jwt_refresh_lock.clone(),
         qoder_pool_lock: state.qoder_pool_lock.clone(),
         wb_pool_lock: state.wb_pool_lock.clone(),
+        group_defs_lock: state.group_defs_lock.clone(),
         events: state.events.clone(),
     };
     // 阻塞网络请求放入阻塞线程池，避免卡住异步运行时
@@ -580,6 +581,21 @@ pub fn api_keys_save(
         keys,
         auth_disabled: auth_disabled.unwrap_or(prev.auth_disabled),
     };
+    // M3 修复（语义移植）：非环回监听 + （新状态显式关闭鉴权 或 无任何启用 Key）
+    // → 拒绝保存。监听地址与运行时物理同源（对齐 auth.rs 双门禁）：单体版网关常驻
+    // 运行，判定直接走 auth.rs 的运行期环回观测（AIWORK_LISTEN_ADDR，与
+    // aiwork-server 绑定同源），不存在「配置值 vs 实际监听值」分离导致的 fail-open；
+    // CLI 任务模式（网关未随本进程启动）按缺省环回放行，运行期仍有 bearer_auth
+    // 双门禁兜底
+    if !crate::api_server::auth::listen_is_loopback()
+        && (file.auth_disabled || !file.has_enabled())
+    {
+        let addr = std::env::var("AIWORK_LISTEN_ADDR").unwrap_or_default();
+        return Err(format!(
+            "当前网关监听地址为 {addr}（非本机环回），局域网可访问；\
+             出于安全要求必须启用至少一个 API Key 且不可关闭鉴权"
+        ));
+    }
     crate::api_server::api_keys::save(&state.data_dir, &file);
     Ok(())
 }
@@ -591,7 +607,7 @@ pub fn api_keys_org_preview(
     state: &AppState,
     keys: Vec<crate::api_server::api_keys::ApiKeyEntry>,
 ) -> std::collections::HashMap<String, std::collections::HashMap<String, usize>> {
-    use crate::api_server::api_keys::split_pool_tagged;
+    use crate::api_server::api_keys::{parse_bind_pool, split_pool_tagged};
     use std::collections::HashMap;
     let idx = crate::api_server::org_index::get(&state.data_dir);
     let mut out: HashMap<String, HashMap<String, usize>> = HashMap::new();
@@ -606,12 +622,20 @@ pub fn api_keys_org_preview(
                 &idx,
             ));
         }
+        // 与运行时 pool_constraints 分池语义对齐（issue #30）：
+        // - 混合白名单（组/标签已配置 → 展开条目必带前缀；或精确白名单含前缀条目）
+        //   → 裸 uid 防御性归属 buddy（旧数据混入兜底，与运行时一致）
+        // - 非混合（全裸 uid 旧语义）→ 白名单整体作用于 bind_pool 所指池
+        //   （未绑定 = buddy，F-35 旧语义；bind=trae/buddy 各归其池）
+        let mixed = !k.allowed_groups.is_empty()
+            || !k.allowed_tags.is_empty()
+            || k.allowed_accounts.iter().any(|u| split_pool_tagged(u).0.is_some());
+        let legacy_pool = parse_bind_pool(&k.bind_pool).unwrap_or("buddy");
         let mut counts: HashMap<String, usize> = HashMap::new();
         for u in &allowed {
             let pool = match split_pool_tagged(u) {
                 (Some(p), _) => p,
-                // 裸条目防御性归属 buddy（与 pool_constraints 白名单分池语义一致）
-                (None, _) => "buddy",
+                (None, _) => if mixed { "buddy" } else { legacy_pool },
             };
             *counts.entry(pool.to_string()).or_default() += 1;
         }
@@ -687,6 +711,13 @@ pub fn dispatch_policy_set(
     policy: crate::api_server::dispatch::DispatchPolicy,
 ) -> Result<crate::api_server::dispatch::DispatchPolicy, String> {
     crate::api_server::dispatch::save_policy(&state.data_dir, &policy)?;
+    // 网关运行中热应用（issue #91）：配置锁外，与 pool_set 热应用同模式；
+    // 负值由 set_reserve_credits 防御归零。未注册（CLI 模式）时静默跳过
+    if let Some(shared) = crate::api_server::runtime::gateway_shared() {
+        shared.pool.set_reserve_credits(policy.reserve_credits);
+        shared.wb_pool.set_reserve_credits(policy.reserve_credits);
+        shared.qoder_pool.set_reserve_credits(policy.reserve_credits);
+    }
     Ok(crate::api_server::dispatch::load_policy(&state.data_dir))
 }
 
@@ -979,6 +1010,7 @@ mod pool_merge_tests {
             global_region: false,
             credits: None,
             credits_expire_at: None,
+            credits_fetched_at: None,
             needs_relogin: false,
             group_id: String::new(),
         };

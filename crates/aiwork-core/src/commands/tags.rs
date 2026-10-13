@@ -57,7 +57,8 @@ fn known_uids(state: &AppState) -> Option<std::collections::HashSet<String>> {
     let store = crate::store::db(&state.data_dir);
     let mut known = std::collections::HashSet::new();
     // Trae 侧直读 accounts 表 user_id 列（审查 B4：accounts_load 与 vault 凭据回填
-    // 内部 fail-open，且此处只需账号存在性、无需凭据；读失败返回 None 跳过本轮自愈）
+    // 内部 fail-open，且此处只需账号存在性、无需凭据；读失败显式跳过本轮自愈并记
+    // 日志——静默空集会把全部 Trae 绑定误当孤儿清理）
     match store.with_conn(|c| {
         let mut stmt = c.prepare("SELECT user_id FROM accounts")?;
         let rows = stmt
@@ -72,7 +73,13 @@ fn known_uids(state: &AppState) -> Option<std::collections::HashSet<String>> {
                 }
             }
         }
-        Err(_) => return None,
+        Err(e) => {
+            crate::fs_utils::app_log(
+                &state.data_dir,
+                &format!("tags: 孤儿自愈跳过本轮（Trae 账号源读失败，防误删）: {e}"),
+            );
+            return None;
+        }
     }
     for table in ["wb_accounts", "qoder_accounts"] {
         match store.rows_all(table) {
@@ -99,8 +106,9 @@ pub fn tags_list(state: &AppState) -> Vec<TagView> {
     }
     // 孤儿绑定自愈（审查 P5）：指向已不存在账号的绑定行顺带清理 + 记日志
     // （账号删除路径理论上会清绑定，历史数据/并发窗口内可能残留）。源表读失败
-    // 时跳过本轮自愈；单条清理失败仅记日志不影响列表；无孤儿时零写开销
-    if let Some(known) = known_uids(state) {
+    // 跳过本轮自愈；三池账号清单全空（读取降级成空与真空库不可区分）时同样跳过，
+    // 防把全部绑定当孤儿整表误删；单条清理失败仅记日志不影响列表；无孤儿时零写开销
+    if let Some(known) = known_uids(state).filter(|known| !known.is_empty()) {
         let orphans: Vec<String> = uid_by_tag
             .values()
             .flatten()
@@ -143,7 +151,11 @@ pub fn tags_list(state: &AppState) -> Vec<TagView> {
 }
 
 fn create_inner(state: &AppState, name: String, color: String) -> Result<String, String> {
-    let _org = crate::store::docs::org_defs_lock();
+    // 持 group_defs_lock（与分组定义同一把组织定义互斥）：tags 亦为整删全写模型，
+    // 「load→改→save」须整体互斥——仅靠 docs::tags_save 内部锁只串行化写库，
+    // 两并发创建均在锁外 load 同一旧快照、后写覆盖先写丢新标签（与 B1 修的
+    // groups 丢写完全同构）
+    let _guard = state.group_defs_lock.lock().unwrap_or_else(|e| e.into_inner());
     let mut defs = defs_load(state);
     let name = validate_name(&defs, &name, None)?;
     let rand = uuid::Uuid::new_v4().simple().to_string();
@@ -165,7 +177,8 @@ fn update_inner(
     color: Option<String>,
     order: Option<i32>,
 ) -> Result<(), String> {
-    let _org = crate::store::docs::org_defs_lock();
+    // 持 group_defs_lock：RMW 整体互斥（同 create_inner）
+    let _guard = state.group_defs_lock.lock().unwrap_or_else(|e| e.into_inner());
     let mut defs = defs_load(state);
     let new_name = match name.as_deref() {
         Some(n) => Some(validate_name(&defs, n, Some(&id))?),
@@ -199,19 +212,24 @@ pub fn tags_update(
 /// 定义残留，可重试删除，无悬空引用。）
 fn delete_inner(state: &AppState, id: &str) -> Result<(), String> {
     let store = crate::store::db(&state.data_dir);
-    // ① 清绑定
-    crate::store::docs::account_tags_remove_tag(&store, id)?;
-    // ② 删定义（审查修复：defs 表整删全写模型，RMW 需持 org_defs_lock；
-    // ①段为单条绑定清理，不持本锁）
+    // ①清绑定 + ②删定义 纳入同一 group_defs_lock 临界区：绑定恢复入口
+    // （account_tags_set_inner）在同一把锁内校验 tag id 存在性——两段分离时，
+    // 并发 set 在「绑定已清、定义未删」窗口通过校验写回已删标签 → 幽灵绑定复活。
+    // 锁序：group_defs_lock 为叶子锁，临界区内不再嵌套其他锁
     {
-        let _org = crate::store::docs::org_defs_lock();
+        let _guard = state.group_defs_lock.lock().unwrap_or_else(|e| e.into_inner());
+        // ① 清绑定
+        crate::store::docs::account_tags_remove_tag(&store, id)?;
+        // ② 删定义
         let mut defs = defs_load(state);
         defs.retain(|t| t.id != id);
         defs_save(state, &defs)?;
     }
     // ③ 清引用：api_keys.allowed_tags + api_pool 三池标签筛选
-    // Key 引用清理走锁内原子修改（防与并发 UI 保存互覆约束字段）
-    crate::api_server::api_keys::modify(&state.data_dir, |keys_file| {
+    // Key 引用清理走锁内原子修改（防与并发 UI 保存互覆约束字段）。
+    // 审查修复：modify 返回的 bool（是否已变更）此前被丢弃，内部如需整体回滚
+    // 无从得知；改为显式接收并记录，避免「静默丢弃状态」的一贯隐患
+    let keys_changed = crate::api_server::api_keys::modify(&state.data_dir, |keys_file| {
         let mut changed = false;
         for k in keys_file.keys.iter_mut() {
             if k.allowed_tags.iter().any(|t| t == id) {
@@ -221,6 +239,12 @@ fn delete_inner(state: &AppState, id: &str) -> Result<(), String> {
         }
         changed
     });
+    if keys_changed {
+        crate::fs_utils::app_log(
+            &state.data_dir,
+            &format!("删除标签 {id}：已清理 api_keys.allowed_tags 引用"),
+        );
+    }
     // 池筛选引用读改写基线统一走迁移入口（对齐上游 P1 审查修复，同 shared_groups；
     // 审查 B1：api_pool 整文档覆盖写互斥——锁内完成读改写+落盘，热重载放锁外）
     let pool_changed = {
@@ -258,9 +282,16 @@ pub fn tags_delete(state: &AppState, id: String) -> Result<(), String> {
 /// 校验 tag_id 存在；uid 跨池全局唯一（Trae 数字 / wb- / qd- 前缀）。
 /// uid 存在性由调用方负责（前端仅从各池账号列表取值）；账号删除路径经
 /// account_tags_remove_account 清理绑定，不会产生孤儿行。
-fn account_tags_set_inner(state: &AppState, uid: &str, tag_ids: &[String]) -> Result<(), String> {
+pub(crate) fn account_tags_set_inner(
+    state: &AppState,
+    uid: &str,
+    tag_ids: &[String],
+) -> Result<(), String> {
     let store = crate::store::db(&state.data_dir);
-    // tag_id 必须存在（防幽灵标签）
+    // tag_id 必须存在（防幽灵标签）。校验与写入纳入同一 group_defs_lock 临界区：
+    // 锁外校验存在 TOCTOU——校验后、写入前标签可被并发删除（delete_inner 同锁
+    // 清绑定），写入即复活幽灵绑定
+    let _guard = state.group_defs_lock.lock().unwrap_or_else(|e| e.into_inner());
     let defs = defs_load(state);
     for t in tag_ids {
         if !defs.iter().any(|d| &d.id == t) {
@@ -334,6 +365,7 @@ mod tests {
             jwt_refresh_lock: std::sync::Arc::new(std::sync::Mutex::new(())),
             qoder_pool_lock: std::sync::Arc::new(std::sync::Mutex::new(())),
             wb_pool_lock: std::sync::Arc::new(std::sync::Mutex::new(())),
+            group_defs_lock: std::sync::Arc::new(std::sync::Mutex::new(())),
             events: std::sync::Arc::new(std::sync::Mutex::new(None)),
         };
         (d, state)

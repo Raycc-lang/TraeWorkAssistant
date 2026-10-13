@@ -409,8 +409,11 @@ impl UsageFile {
 }
 
 /// 当日日期键（本机时区，YYYY-MM-DD）
+///
+/// 统一走 `fs_utils::today_key()`：此前本函数与会话合并/裁剪各自算一遍 Local 日期，
+/// 任一侧漂移都会让「当日 / 保留窗」边界与已落库行的 date 键错开一天。
 pub fn today_key() -> String {
-    chrono::Local::now().format("%Y-%m-%d").to_string()
+    crate::fs_utils::today_key()
 }
 
 /// Qoder 请求级会话上下文（issue #82 问题5：qoder_sessions 流水行）。
@@ -419,16 +422,20 @@ pub fn today_key() -> String {
 pub struct QoderSessionCtx {
     pub request_id: String,
     pub session_id: String,
+    /// 轮键（信封 chat_record_id；同一段消息+模型+输出上限派生同值，
+    /// 「展开会话看各轮明细」分组用；失败占位恒空）
+    pub record_id: String,
     pub ts: i64,
     pub preview: String,
 }
 
 impl QoderSessionCtx {
-    /// 占位上下文（失败早退/无信封可解析时使用：新 uuid + 空 session_id）
+    /// 占位上下文（失败早退/无信封可解析时使用：新 uuid + 空 session_id/record_id）
     pub fn placeholder(preview: String) -> Self {
         Self {
             request_id: uuid::Uuid::new_v4().to_string(),
             session_id: String::new(),
+            record_id: String::new(),
             ts: chrono::Local::now().timestamp(),
             preview,
         }

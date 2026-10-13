@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { Save, RefreshCw, CalendarClock, ScanSearch } from 'lucide-react';
 import PageHeader from '../../components/PageHeader';
 import SchedulerTasksCard, { type TaskToggleOverride } from '../../components/SchedulerTasksCard';
@@ -26,11 +26,18 @@ export default function BuddySettings() {
   const [checkinToggleBusy, setCheckinToggleBusy] = useState(false);
   // 本机 auth 文件路径（存全局 Settings.wb_auth_file_path，随「保存配置」统一提交）
   const [authPath, setAuthPath] = useState('');
+  // 最近一次持久化/加载的 settings 快照（ref）：toggleCheckin 整文档写回的基底，
+  // 避免连带持久化未保存的本地编辑（main 3.7.9 防过期快照语义）；写回成功后就地
+  // 推进基底（连续两次单项保存互不回滚）；refresh 成功后、save 成功后的 refresh 也会更新
+  const savedSettingsRef = useRef<WorkBuddySettings | null>(null);
 
   const refresh = useCallback(async () => {
     setRefreshing(true);
     try {
-      setSettings(await api.workbuddy.settingsGet().catch(() => null));
+      const st = await api.workbuddy.settingsGet().catch(() => null);
+      setSettings(st);
+      // 最近持久化/加载快照推进（toggleCheckin 写回基底，见 ref 声明处注释）
+      savedSettingsRef.current = st;
       const app = await api.misc.settingsGet().catch(() => null);
       setAuthPath(app?.wb_auth_file_path ?? '');
       // 多账号签到/成长间隔存 app Settings（与签到共用，随「保存配置」统一提交）
@@ -77,15 +84,21 @@ export default function BuddySettings() {
   // 多账号签到/成长间隔（app Settings 侧 state，随「保存配置」统一提交）
   const [checkinGap, setCheckinGap] = useState(3);
 
-  // wb-checkin 开关：绑定 auto_checkin 并即时保存（与定时任务卡其他开关交互一致）
+  // wb-checkin 开关：绑定 auto_checkin 并即时保存（与定时任务卡其他开关交互一致）。
+  // 整文档写回以 savedSettingsRef（最近持久化/加载快照，缺失时回退当前 settings）为
+  // 基底、仅叠加本次开关——不可 spread 实时 settings：其中含签到参数卡已改但未随
+  // 「保存配置」落盘的本地编辑（keepalive_days 等），连带提交违背「随保存配置生效」语义
   const toggleCheckin = async (v: boolean) => {
     if (!settings) return;
     const prev = settings;
-    const next = { ...prev, auto_checkin: v };
-    setSettings(next);
+    const next = { ...(savedSettingsRef.current ?? settings), auto_checkin: v };
+    patch({ auto_checkin: v });
     setCheckinToggleBusy(true);
     try {
       await withMinDelay(api.workbuddy.settingsSet(next));
+      // 成功后就地推进基底快照：settingsSet 为整文档替换，若仍以旧快照为基底，
+      // 连续两次单项保存会把上一次已落盘的字段回滚丢失
+      savedSettingsRef.current = next;
       pushToast('success', v ? '自动签到和成长已启用' : '自动签到和成长已停用');
     } catch (err) {
       setSettings(prev);

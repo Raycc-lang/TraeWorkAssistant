@@ -144,6 +144,10 @@ pub struct ApiSharedState {
     /// 入参 user_id，内部走 refresh_jwt_impl 全防护链路强制刷新并持久化。
     /// None（单测/降级构造）时 401 维持原「note_error + 换号」语义
     pub trae_jwt_refresh: Option<std::sync::Arc<dyn Fn(&str) -> Result<String, String> + Send + Sync>>,
+    /// 跨池回退日志节流表（model|reason → 最近落盘 Unix 秒）：
+    /// 上游 504 期间回退逐请求发生，未节流会让 app.log 被同一行刷爆并产生
+    /// 每请求一次同步文件 IO（审查修复）
+    pub fallback_log_at: Mutex<std::collections::HashMap<String, i64>>,
 }
 
 impl ApiSharedState {
@@ -294,6 +298,7 @@ impl ApiSharedState {
             is_stream,
             ok,
             &session.preview,
+            &session.record_id,
         );
         self.usage_dirty
             .lock()
@@ -771,6 +776,7 @@ mod inflight_tests {
             wb_probe_ts_ms: std::sync::atomic::AtomicI64::new(-1),
             wb_probe_ok: std::sync::atomic::AtomicI64::new(-1),
             trae_jwt_refresh: None,
+            fallback_log_at: Mutex::new(std::collections::HashMap::new()),
         };
         {
             let _g = state.inflight_guard();

@@ -659,9 +659,10 @@ fn redirect_pool_group_ids(
     table: &str,
     id_map: &std::collections::HashMap<String, String>,
 ) -> Result<(), String> {
+    // 读表失败直接上抛（fail-closed）：静默吞错会让后续 UPDATE 跳过整表行，
+    // 分组重定向不完整且无任何报错痕迹——迁移原子性优先于尽力而为
     let rows: Vec<(String, Value)> = store
-        .rows_all(table)
-        .unwrap_or_default()
+        .rows_all(table)?
         .into_iter()
         .filter(|(_, data)| {
             data.get("group_id")
@@ -901,6 +902,7 @@ mod tests {
             jwt_refresh_lock: std::sync::Arc::new(std::sync::Mutex::new(())),
             qoder_pool_lock: std::sync::Arc::new(std::sync::Mutex::new(())),
             wb_pool_lock: std::sync::Arc::new(std::sync::Mutex::new(())),
+            group_defs_lock: std::sync::Arc::new(std::sync::Mutex::new(())),
             events: std::sync::Arc::new(std::sync::Mutex::new(None)),
         };
         crate::vault::migrate_on_startup(&state);

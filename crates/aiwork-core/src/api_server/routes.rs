@@ -17,7 +17,7 @@ use super::efforts;
 use super::retry::{retry_plan, RetryAction};
 use super::sse;
 use super::unified_catalog;
-use super::usage::{extract_tokens, today_key, UsageBucket, KeyId};
+use super::usage::{extract_tokens, KeyId};
 use super::wb_catalog;
 use super::wb_model_route;
 use super::wb_route;
@@ -408,14 +408,28 @@ fn whitelist_check(state: &ApiSharedState, model: &str, proto: Protocol) -> Opti
     if unified_catalog::whitelist_allows(&list, model) {
         return None;
     }
+    // issue #90 修复③a：池前缀模型 id（trae/xxx 等）按裸名准入——dispatch 与
+    // /v1/models 别名条目使用同一前缀语义，启用白名单的部署不得在准入层拦截。
+    // 分层检查：先原始名（覆盖白名单字面量含前缀条目的配置），再裸名兜底；
+    // 拒绝信息保留用户请求的原始名（显示裸名会让人误以为请求的是另一个模型）
+    let bare = dispatch::split_pool_prefix(model).map(|(_, bare)| bare);
+    if let Some(bare) = bare {
+        if unified_catalog::whitelist_allows(&list, bare) {
+            return None;
+        }
+    }
+    // C1（审查修复）：后缀剥离仅按裸名段进行；拒绝信息保留用户请求的原始名
+    // （含前缀）——修复此前 `let model = bare.unwrap_or(model)` 遮蔽导致 404
+    // 文案显示裸名、与上方注释「保留原始名」矛盾的问题（放行/剥离逻辑不变）
+    let stripped = bare.unwrap_or(model);
     // issue #38 实测修复：`-max` / `-thinking` 等入口后缀在 dispatch ② 段才剥离，
     // 白名单须按同一剥离规则对基名放行——否则启用白名单的部署下，Max Mode /
     // 路由后缀入口在准入层就被 404 拦截，整个能力不可用（剥离规则与 dispatch 同源，
     // 基名最终可服务性仍由 dispatch 查模型列表判定，此处仅准入放行）
     let cfg = wb_model_route::load_config(&state.data_dir);
     let bases = [
-        wb_model_route::strip_max_suffix(model),
-        wb_model_route::strip_route_suffix(model, &cfg).map(|(b, _)| b),
+        wb_model_route::strip_max_suffix(stripped),
+        wb_model_route::strip_route_suffix(stripped, &cfg).map(|(b, _)| b),
     ];
     for base in bases.into_iter().flatten() {
         if unified_catalog::whitelist_allows(&list, &base) {
@@ -447,60 +461,16 @@ pub async fn status_page() -> impl IntoResponse {
 }
 
 pub async fn health(State(state): State<Arc<ApiSharedState>>) -> impl IntoResponse {
-    let pool = state.pool.status_list();
-    let wb_pool = state.wb_pool.status_list();
-    let available = pool.iter().filter(|p| !p.disabled && !p.cooling).count();
-    let cooling = pool.iter().filter(|p| p.cooling).count();
-    let disabled = pool.iter().filter(|p| p.disabled).count();
-    let total_credits: f64 = pool.iter().filter_map(|p| p.credits).sum();
-    let total = state.total_requests.load(std::sync::atomic::Ordering::Relaxed);
-    let active = safe_lock(&state.active_uid).clone();
-    let last_err = safe_lock(&state.last_error).clone();
-    let wb_enabled = state.wb_enabled.load(std::sync::atomic::Ordering::Relaxed);
-    let wb_available = wb_pool.iter().filter(|p| !p.disabled && !p.cooling).count();
-    let wb_cooling = wb_pool.iter().filter(|p| p.cooling).count();
-    let wb_disabled = wb_pool.iter().filter(|p| p.disabled).count();
-    let wb_total_credits: f64 = wb_pool.iter().filter_map(|p| p.credits).sum();
-
-    // 今日 token 用量（Trae/WB/Custom 三池合计，读内存用量快照，免磁盘 IO）
-    let today = today_key();
-    let mut prompt_tokens: u64 = 0;
-    let mut completion_tokens: u64 = 0;
-    {
-        let usage = safe_lock(&state.usage);
-        for b in [UsageBucket::Trae, UsageBucket::Wb, UsageBucket::Custom] {
-            if let Some(s) = usage.day_stats(b, &today) {
-                prompt_tokens += s.prompt_tokens;
-                completion_tokens += s.completion_tokens;
-            }
-        }
-    }
-
+    // 收敏（2026-10-12 审查 P2 移植）：/health 在 auth.rs 免鉴权放行（无条件
+    // 豁免，2026-10-12 审查 P1 修复——容器非环回监听下仍需可达，探活依赖），
+    // 原实现透出 total_credits/active_uid/last_error/池账号数/token 汇总
+    // ——非环回监听时局域网内无 Key 即可抓取账号与积分画像，与「非环回强制
+    // 鉴权」防线矛盾。探活只需存活布尔；完整诊断由需鉴权的 GET /status 承载
+    // （字段超集，含双池账号明细与 token 分池统计）
+    let _ = &state;
     Json(json!({
         "status": "ok",
         "running": true,
-        "total_requests": total,
-        "active_uid": active,
-        "last_error": last_err,
-        "tokens_today": {
-            "prompt": prompt_tokens,
-            "completion": completion_tokens,
-        },
-        "pool": {
-            "total_accounts": pool.len(),
-            "available": available,
-            "cooling": cooling,
-            "disabled": disabled,
-            "total_credits": (total_credits * 100.0).round() / 100.0,
-        },
-        "wb": {
-            "enabled": wb_enabled,
-            "total_accounts": wb_pool.len(),
-            "available": wb_available,
-            "cooling": wb_cooling,
-            "disabled": wb_disabled,
-            "total_credits": (wb_total_credits * 100.0).round() / 100.0,
-        }
     }))
 }
 
@@ -573,6 +543,30 @@ pub async fn status(State(state): State<Arc<ApiSharedState>>) -> impl IntoRespon
     // WB 池画像（T2.3/F-32；inflight 为 F-77 账号级实时并发）
     let wb_pool = state.wb_pool.status_list();
     let wb_enabled = state.wb_enabled.load(std::sync::atomic::Ordering::Relaxed);
+    let wb_available = wb_pool.iter().filter(|p| !p.disabled && !p.cooling).count();
+    let wb_cooling = wb_pool.iter().filter(|p| p.cooling).count();
+    let wb_disabled = wb_pool.iter().filter(|p| p.disabled).count();
+    let wb_total_credits: f64 = wb_pool.iter().filter_map(|p| p.credits).sum();
+
+    // 今日 token 用量（四池合计，读内存用量快照，免磁盘 IO；/gw-status 状态页
+    // 数据源——/health 收敏后不再携带 token 汇总，由本端点承载）
+    let today = super::usage::today_key();
+    let mut prompt_tokens: u64 = 0;
+    let mut completion_tokens: u64 = 0;
+    {
+        let usage = safe_lock(&state.usage);
+        for b in [
+            super::usage::UsageBucket::Trae,
+            super::usage::UsageBucket::Wb,
+            super::usage::UsageBucket::Custom,
+            super::usage::UsageBucket::Qoder,
+        ] {
+            if let Some(s) = usage.day_stats(b, &today) {
+                prompt_tokens += s.prompt_tokens;
+                completion_tokens += s.completion_tokens;
+            }
+        }
+    }
     let wb_accounts: Vec<Value> = wb_pool.iter().map(|p| {
         json!({
             "uid": p.uid, "name": p.name, "credits": p.credits,
@@ -608,6 +602,10 @@ pub async fn status(State(state): State<Arc<ApiSharedState>>) -> impl IntoRespon
         // F-77：per-account 并发列表（busy 账号实时画像）
         "active_accounts": active_accounts,
         "last_error": last_err,
+        "tokens_today": {
+            "prompt": prompt_tokens,
+            "completion": completion_tokens,
+        },
         "summary": {
             "total_accounts": total_accounts,
             "available": available,
@@ -619,6 +617,10 @@ pub async fn status(State(state): State<Arc<ApiSharedState>>) -> impl IntoRespon
         "wb": {
             "enabled": wb_enabled,
             "total_accounts": wb_pool.len(),
+            "available": wb_available,
+            "cooling": wb_cooling,
+            "disabled": wb_disabled,
+            "total_credits": (wb_total_credits * 100.0).round() / 100.0,
             "accounts": wb_accounts,
             "model_cooldowns": model_cooldowns,
             "sticky_sessions": state.wb_sticky.len(),
@@ -643,6 +645,10 @@ pub async fn models(State(state): State<Arc<ApiSharedState>>) -> impl IntoRespon
     let qoder_enabled = state.qoder_enabled.load(std::sync::atomic::Ordering::Relaxed);
     let qoder_ok = state.qoder_pool.has_selectable();
     let data_dir = state.data_dir.clone();
+    // issue #90 修复③a：来源标识开关（dispatch_policy.model_source_labels）——
+    // 开启后为多源同名模型附带池前缀别名条目（trae/xxx / buddy/xxx / qoder/xxx），
+    // 客户端（如 CC Switch）可在同名模型间区分来源池（三家倍率与效果不同）
+    let source_labels = dispatch::load_policy(&data_dir).model_source_labels;
     let list = tokio::task::spawn_blocking(move || {
         // issue #26：对外目录经全局白名单过滤（管理端 api_unified_models 不过滤）
         unified_catalog::unified_models_whitelisted_ex(
@@ -656,7 +662,7 @@ pub async fn models(State(state): State<Arc<ApiSharedState>>) -> impl IntoRespon
     .await
     .unwrap_or_default();
     // wb_enabled=false：仅 Buddy 源的模型过滤，双源模型保留（仍可由 Trae 源服务 §3.4）
-    let data: Vec<Value> = list
+    let mut data: Vec<Value> = list
         .iter()
         .filter(|m| wb_enabled || !m.sources.iter().all(|s| s.pool == "buddy"))
         .map(|m| {
@@ -681,6 +687,34 @@ pub async fn models(State(state): State<Arc<ApiSharedState>>) -> impl IntoRespon
             })
         })
         .collect();
+    // issue #90 修复③a：多源同名模型的池前缀别名条目（开关开启时追加，不改写
+    // 原有 id——已有客户端零影响）。带前缀 id 请求经 resolve_target 锁定该池，
+    // 白名单按裸名放行（whitelist_check 同步剥离）；别名条目随基础条目白名单
+    // 过滤结果派生，不重复过滤
+    if source_labels {
+        for m in list.iter().filter(|m| m.sources.len() >= 2) {
+            for s in m.sources.iter().filter(|s| s.pool != "custom") {
+                data.push(json!({
+                    "id": format!("{}/{}", s.pool, m.id),
+                    "object": "model",
+                    "created": 1753600000,
+                    "owned_by": "unified",
+                    "display": format!("[{}] {}", s.pool, m.display),
+                    "rate": s.rate,
+                    "context_length": m.context_length,
+                    "max_tokens": m.max_tokens,
+                    "supports_image": m.supports_image,
+                    "supported_efforts": m.efforts,
+                    "max_mode": m.max_mode,
+                    "sources": m.sources,
+                    // 别名标记：客户端可据此折叠展示；source_pool = 该 id 实际锁定的池
+                    "alias_of": m.id,
+                    "source_pool": s.pool,
+                    "manual": m.manual,
+                }));
+            }
+        }
+    }
     Json(json!({ "object": "list", "data": data }))
 }
 
@@ -2992,6 +3026,7 @@ mod tests {
             wb_probe_ts_ms: std::sync::atomic::AtomicI64::new(-1),
             wb_probe_ok: std::sync::atomic::AtomicI64::new(-1),
             trae_jwt_refresh: None,
+            fallback_log_at: std::sync::Mutex::new(std::collections::HashMap::new()),
             trae_enabled: std::sync::atomic::AtomicBool::new(true),
             qoder_pool: super::super::pool::ApiPool::new(),
             qoder_enabled: std::sync::atomic::AtomicBool::new(true),
@@ -3046,6 +3081,27 @@ mod tests {
         let bytes = axum::body::to_bytes(denied.into_body(), usize::MAX).await.unwrap();
         let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(v["error"]["code"], "model_not_found");
+    }
+
+    /// 审查 C1 + issue #90 修复③a：池前缀模型按裸名准入（与 /v1/models 别名
+    /// 条目同一前缀语义）；被拒时拒绝信息保留用户请求的原始名（含前缀），
+    /// 不得显示裸名（遮蔽回归防护）
+    #[tokio::test]
+    async fn whitelist_check_prefix_admission_keeps_original_name_in_denial() {
+        let f = wl_fixture("prefix");
+        unified_catalog::save_whitelist(&f.dir, &["glm-5.3".to_string()]).unwrap();
+        // 前缀模型按裸名准入
+        assert!(whitelist_check(&f.state, "trae/glm-5.3", Protocol::OpenAi).is_none());
+        // 非名单前缀模型 → 404 且消息保留原始前缀名
+        let denied = whitelist_check(&f.state, "trae/kimi-k3", Protocol::OpenAi).unwrap();
+        assert_eq!(denied.status(), StatusCode::NOT_FOUND);
+        let bytes = axum::body::to_bytes(denied.into_body(), usize::MAX).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let msg = v["error"]["message"].as_str().unwrap();
+        assert!(
+            msg.contains("model trae/kimi-k3 is not in"),
+            "拒绝信息应保留原始前缀名: {msg}"
+        );
     }
 
     // ==================== issue #54：Claude Code 分类器模型兜底 ====================

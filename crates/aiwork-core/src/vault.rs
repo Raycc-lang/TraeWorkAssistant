@@ -231,16 +231,19 @@ pub fn load_accounts(state: &AppState) -> AccountsFile {
         let Some(uid) = a.user_id.as_deref().filter(|u| !u.is_empty()) else {
             continue;
         };
-        if !a.jwt.trim().is_empty() {
-            continue; // JSON 明文优先
-        }
         if let Ok(Some(v)) = client.store().get(uid.as_bytes()) {
             if let Ok(entry) = serde_json::from_slice::<SecretEntry>(&v) {
-                if !entry.jwt.is_empty() {
+                // JWT：JSON 明文优先（更新鲜，如 MITM 新捕获），无明文才回填 vault
+                if a.jwt.trim().is_empty() && !entry.jwt.trim().is_empty() {
                     a.jwt = entry.jwt;
                 }
-                if a.refresh_token.as_deref().map_or(true, |s| s.is_empty())
-                    && !entry.refresh_token.is_empty()
+                // RT：与 JWT 独立判断——JSON 无明文即回填 vault。
+                // 不能因 JWT 有捕获明文就跳过整个账号，否则代理捕获写回明文 JWT
+                // 后，OAuth 登录拿到的 vault RT 永远回填不上，账号会恒显「无 Refresh」。
+                // 审查修复：判定统一 trim（与上面 jwt 臂口径一致）——空白串（上游脏
+                // 数据常见）会被当作「已有 RT」而跳过回填
+                if a.refresh_token.as_deref().map_or(true, |s| s.trim().is_empty())
+                    && !entry.refresh_token.trim().is_empty()
                 {
                     a.refresh_token = Some(entry.refresh_token);
                 }

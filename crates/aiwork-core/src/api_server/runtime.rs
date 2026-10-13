@@ -58,7 +58,7 @@ pub(crate) fn load_pool_file(data_dir: &std::path::Path) -> ApiPoolFile {
 /// 「load_pool_file → 修改 → kv_set」复合段并发时，旧副本整文档写回会互相
 /// 覆盖丢更新。所有此类复合段必须持本锁；纯读（load_pool_file）无需持锁。
 /// 锁序约定：叶子锁——现有写点均在池锁/org 锁释放后获取本锁；严禁持本锁
-/// 再取任何池锁或 org_defs_lock。启动迁移（kv api_pool 首次落库）在 server
+/// 再取任何池锁或 group_defs_lock。启动迁移（kv api_pool 首次落库）在 server
 /// bind 前完成，无并发窗口，不取本锁。
 static POOL_CFG_LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
 
@@ -208,6 +208,17 @@ pub fn build_shared(state: &AppState) -> Arc<ApiSharedState> {
     pool.set_strategy(strategy);
     let wb_pool = ApiPool::new();
     let qoder_pool = ApiPool::new();
+    // 冷却/禁用标记落 app.log（F-80）：三池注入 (data_dir, 池标签)，
+    // note_error 打冷却/禁用时同步写 `account cooldown: pool=…` 便于排查跨池回退链路
+    pool.set_log_ctx(&state.data_dir, "trae");
+    wb_pool.set_log_ctx(&state.data_dir, "buddy");
+    qoder_pool.set_log_ctx(&state.data_dir, "qoder");
+    // 账号保留剩余积分（issue #91）：调度策略统一配置，启动时三池应用
+    //（credits=0 时无过滤；Qoder 池 credits 恒 None 不受影响，保持口径一致仍设置）
+    let reserve_credits = crate::api_server::dispatch::load_policy(&state.data_dir).reserve_credits;
+    pool.set_reserve_credits(reserve_credits);
+    wb_pool.set_reserve_credits(reserve_credits);
+    qoder_pool.set_reserve_credits(reserve_credits);
     let (pool_count, wb_uids_len, wb_accounts_total) =
         apply_pool_snapshot(state, &pool, &wb_pool, &qoder_pool);
 
@@ -370,6 +381,7 @@ pub fn build_shared(state: &AppState) -> Arc<ApiSharedState> {
             })
                 as std::sync::Arc<dyn Fn(&str) -> Result<String, String> + Send + Sync>)
         },
+        fallback_log_at: Mutex::new(std::collections::HashMap::new()),
     });
 
     // per-pool 三参数热应用（F-76②/F-77 拆分版）：账号并发上限 / 池粘性 TTL /
@@ -392,6 +404,93 @@ pub fn build_shared(state: &AppState) -> Arc<ApiSharedState> {
     shared
         .qoder_sticky
         .set_explicit_ttl(pool_file.qoder_sticky_ttl_secs as i64);
+
+    // 启动积分保鲜（issue #91 缓存问题；审查 C3）：池内存在陈旧/缺时间戳的
+    // 积分快照时后台刷新一次——reserve 过滤对陈旧快照 fail-open，刷新拨新后
+    // 自动恢复生效。三池口径：
+    //   Trae 池：refresh_remaining_credits_impl 逐账号刷新，经 push_credits 回写拨新；
+    //   WB 池：wb_credits_snapshot_task 快照后按 ok=true 账号经 update_credits 拨新
+    //     （只更新余额+时间戳，不触碰运行期健康状态；此前 WB 池无运行期拨新
+    //     路径，陈旧快照会一直 fail-open）；
+    //   Qoder 池：sync_from_qoder 恒 credits=None（倍率计费无余额概念），
+    //     reserve 对其结构性不生效，无保鲜需求（仅标注）。
+    // 静默失败不影响启动流程。docker 适配：build_shared 仅 aiwork-server 启动
+    // 调用一次（热重载走 reload_pools_after_change），此处一次性保鲜与 main 的
+    // do_start 语义等价；Trae 臂回写依赖 gateway_shared() 注册，线程开头轮询等待。
+    {
+        let st2 = state.clone();
+        let shared2 = shared.clone();
+        std::thread::spawn(move || {
+            // 等待网关注册（GATEWAY OnceLock 由 aiwork-server 启动流程写入），上限 30s；
+            // Trae 臂 refresh_remaining_credits_impl 内部经 push_credits_if_running →
+            // gateway_shared() 回写拨新，须注册就绪后才执行
+            let mut registered = false;
+            for _ in 0..300 {
+                if gateway_shared().is_some() {
+                    registered = true;
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            if !registered {
+                return; // runtime 未就绪（启动中途失败）
+            }
+            let trae_stale = shared2.pool.has_stale_credits();
+            let wb_stale = shared2.wb_pool.has_stale_credits();
+            if !trae_stale && !wb_stale {
+                return;
+            }
+            fs_utils::app_log(&st2.data_dir, "API服务启动-积分保鲜: 检测到陈旧积分快照, 后台刷新中");
+            if trae_stale {
+                match crate::commands::accounts::refresh_remaining_credits_impl(&st2) {
+                    Ok(n) => fs_utils::app_log(
+                        &st2.data_dir,
+                        &format!("API服务启动-积分保鲜: Trae池刷新完成 accounts={}", n),
+                    ),
+                    Err(e) => fs_utils::app_log(
+                        &st2.data_dir,
+                        &format!("API服务启动-积分保鲜: Trae池刷新失败(不影响使用) {}", e),
+                    ),
+                }
+            }
+            if wb_stale {
+                match crate::commands::workbuddy::wb_credits_snapshot_task(&st2) {
+                    Ok(parsed) => {
+                        // 仅 ok=true 账号拨新，失败账号保留旧值防误清
+                        //（对齐 write_back_pool_balances 的到期回写口径）
+                        let mut m: std::collections::HashMap<String, f64> =
+                            std::collections::HashMap::new();
+                        if let Some(accounts) = parsed.get("accounts").and_then(|v| v.as_array()) {
+                            for acc in accounts {
+                                let ok = acc
+                                    .get("ok")
+                                    .and_then(serde_json::Value::as_bool)
+                                    .unwrap_or(true);
+                                if !ok {
+                                    continue;
+                                }
+                                if let (Some(uid), Some(bal)) = (
+                                    acc.get("user_id").and_then(|v| v.as_str()),
+                                    acc.get("balance").and_then(|v| v.as_f64()),
+                                ) {
+                                    m.insert(uid.to_string(), bal);
+                                }
+                            }
+                        }
+                        shared2.wb_pool.update_credits(&m);
+                        fs_utils::app_log(
+                            &st2.data_dir,
+                            &format!("API服务启动-积分保鲜: WB池拨新完成 accounts={}", m.len()),
+                        );
+                    }
+                    Err(e) => fs_utils::app_log(
+                        &st2.data_dir,
+                        &format!("API服务启动-积分保鲜: WB池刷新失败(不影响使用) {}", e),
+                    ),
+                }
+            }
+        });
+    }
 
     shared
 }
@@ -444,6 +543,15 @@ pub fn apply_pool_snapshot(
     let tag_map = crate::store::docs::account_tags_map(&store::db(&state.data_dir));
     let trae_tag_filter =
         crate::api_server::org_index::tag_uid_set(&pool_file.trae_tag_ids, &tag_map);
+    // 积分快照文件级采集时间（issue #91 缓存保鲜）：串 → unix 秒。
+    // 一次刷新全量写入 credits 与 updated_at，文件级时间戳对全体条目生效；
+    // 池据此判断 reserve 过滤新鲜度（陈旧快照 fail-open，见 pool.rs）。
+    // 走 fs_utils::parse_ts_loose：本机写入的是 **无时区偏移的本地裸串**
+    // （now_iso/now_ts），严格 rfc3339 解析恒失败会让 reserve 过滤结构性失效
+    let credits_fetched_at = credits_file
+        .updated_at
+        .as_deref()
+        .and_then(fs_utils::parse_ts_loose);
     let trae_accounts: Vec<_> = match &trae_tag_filter {
         Some(set) => accounts
             .accounts
@@ -460,6 +568,7 @@ pub fn apply_pool_snapshot(
         &groups_file.membership,
         &cooldowns_file.cooldowns,
         &pool_credits,
+        credits_fetched_at,
         &merge_pool_expire_times(&credits_file),
         &device_map,
     );
@@ -577,6 +686,10 @@ struct WbAcctLite {
     /// 最早积分包到期（issue #28 调度口径透传）；老数据缺省 None
     #[serde(default)]
     credits_expire_at: Option<i64>,
+    /// 积分快照采集时间（issue #91 保鲜）：wb_accounts 表 rfc3339 时间戳，
+    /// 池装配时换算 unix 秒供池判断 reserve 过滤新鲜度；老数据缺省 None
+    #[serde(default)]
+    credits_fetched_at: Option<String>,
 }
 
 /// 宽容字符串字段提取（对齐 fs_utils::dig 语义的本地 helper）
@@ -616,6 +729,12 @@ pub fn wb_upstream_accounts(state: &AppState) -> Vec<WbSyncAccount> {
             global_region: domain.contains(".workbuddy.ai"),
             credits: a.credits_balance,
             credits_expire_at: a.credits_expire_at,
+            // 走 fs_utils::parse_ts_loose：WB 侧 fetched_at 为 now_ts() 空格分隔裸串
+            // （无时区偏移），严格 rfc3339 恒失败 → reserve 过滤永不生效
+            credits_fetched_at: a
+                .credits_fetched_at
+                .as_deref()
+                .and_then(fs_utils::parse_ts_loose),
             needs_relogin: a.needs_relogin,
             group_id: a.group_id.clone(),
         });
@@ -665,6 +784,14 @@ pub fn qoder_upstream_accounts(state: &AppState) -> Vec<crate::api_server::pool:
             uid,
             access_token,
             group_id: as_str(fs_utils::dig(a, &["group_id"])).unwrap_or_default(),
+            // issue #91 三池统一：Qoder 余额快照（credits_fetch / qoder-credits-snapshot
+            // 回写 QoderAccount.credits_balance + credits_fetched_at）入池，使 reserve
+            // 保留额过滤在 Qoder 池同样生效。旧数据无字段 → None → fail-open
+            credits: a.get("credits_balance").and_then(Value::as_f64),
+            credits_fetched_at: a
+                .get("credits_fetched_at")
+                .and_then(Value::as_str)
+                .and_then(fs_utils::parse_ts_loose),
         });
     }
     out
@@ -717,6 +844,7 @@ mod tests {
             global_region: false,
             credits: None,
             credits_expire_at: None,
+            credits_fetched_at: None,
             needs_relogin: false,
             group_id: String::new(),
         }];

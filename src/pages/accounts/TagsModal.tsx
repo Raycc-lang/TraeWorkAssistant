@@ -38,6 +38,11 @@ export function TagsModal({
       tags.forEach((t) => {
         if (!(t.id in next)) next[t.id] = t.name;
       });
+      // 清理已删除标签的残留输入值（防 state 无限累积）
+      const live = new Set(tags.map((t) => t.id));
+      for (const id of Object.keys(next)) {
+        if (!live.has(id)) delete next[id];
+      }
       return next;
     });
   }, [tags]);

@@ -658,7 +658,35 @@ pub fn oauth_parse_callback(
 /// - 请求头：仅 Content-Type + x-cloudide-token: ""（空串；真实客户端 m() 方法原样）
 /// - 响应：Result.Token / Result.RefreshToken
 /// 保留旧形态变体作兜底探测（协议固化验证后移除）。
+/// 交换端点 host 白名单（审查 m9）：host 来自用户粘贴的回调 URL 参数，直接拼接为
+/// ExchangeToken 端点——AuthCode + PKCE CodeVerifier 均属安全令牌，必须限定官方
+/// API 域，防伪造回调把令牌发往任意第三方主机。host 口径与默认值
+/// （OAUTH_EXCHANGE_URL，api.trae.com.cn 为主路径）一致。
+const EXCHANGE_HOST_ALLOWLIST: [&str; 3] = ["api.trae.com.cn", "api.trae.cn", "api.trae.com"];
+
+fn validate_exchange_host(host: &str) -> Result<(), String> {
+    // 形如 "https://api.trae.com.cn"（可带路径/尾斜杠）；无 scheme 时按裸域处理
+    let bare = host
+        .split("://")
+        .nth(1)
+        .unwrap_or(host)
+        .trim_end_matches('/')
+        .split('/')
+        .next()
+        .unwrap_or("");
+    let host_only = bare.rsplit('@').next().unwrap_or(bare).to_ascii_lowercase();
+    let host_only = host_only.split(':').next().unwrap_or("");
+    if EXCHANGE_HOST_ALLOWLIST.contains(&host_only) {
+        Ok(())
+    } else {
+        Err(format!(
+            "回调 URL 的 host 参数不在官方 API 域白名单内（{host_only}），已拒绝交换以防令牌外发"
+        ))
+    }
+}
+
 fn exchange_code(code: &str, verifier: Option<&str>, device_id: &str, host: &str, data_dir: &std::path::Path) -> Result<(String, String), String> {
+    validate_exchange_host(host)?;
     let client_id = oauth_client().client_id.clone();
     let code_v = code.to_string();
     let verifier_v = verifier.unwrap_or("").to_string();
@@ -1404,7 +1432,22 @@ pub fn oauth_login(
     callback_url: String,
     account_name: Option<String>,
     group_id: Option<String>,
+    // 重新登录模式：指定目标账号 uid。授权账号 uid 与之不一致时拒绝落库，
+    // 防止浏览器里登错账号导致凭证合到其他账号/误新增
+    expect_uid: Option<String>,
 ) -> Result<OAuthLoginResult, String> {
+    // 重新登录模式的副作用基线：`bound_device_id` 在 token 交换内部即被持久化
+    // （`persist_bound_device_id` 深埋在交换/刷新闭包内无法延后到 uid 校验之后），
+    // 故 uid 校验不通过时必须回滚该全局 kv——否则浏览器登错账号会把**他人**的
+    // 设备指纹写成本机全局回退值，污染后续全部账号的刷新链路
+    // （20403 Token device not match）。仅重登模式读一次 kv，普通登录零额外开销。
+    let bound_before = if expect_uid.is_some() {
+        let dev: OAuthDevice = crate::store::db(&state.data_dir).kv_get("oauth_device");
+        dev.bound_device_id
+    } else {
+        None
+    };
+
     // 1. 解析回调 URL
     let callback_info = oauth_parse_callback(state, callback_url)?;
 
@@ -1444,6 +1487,54 @@ pub fn oauth_login(
         .clone()
         .or_else(|| jwt_info.user_id.clone())
         .ok_or_else(|| "无法从回调或 JWT 中获取 user_id".to_string())?;
+
+    // 重新登录防呆：行内「重新登录」携带目标账号 uid，浏览器误登其他账号时拒绝。
+    //
+    // 审查修复（两处）:
+    // ① **以 JWT 解析 uid 为权威**：回调 URL 由用户手动粘贴，`userId` 参数外部可控；
+    //    原实现优先取回调参数，`expect_uid` 等于与一个可伪造值比对——构造带目标
+    //    uid 的回调即可绕过防呆、把他人凭证写进目标账号。现改为：JWT 有 uid 时以
+    //    JWT 为准；且 JWT 与回调声明不一致同样拒绝（两者都指向同一账号才算登对）。
+    // ② 空串/纯空白视为「未指定」：`cmd_bridge::opt_arg` 对 "" 返回 Some("")，
+    //    原先会让重登 100% 失败并报「账号不一致」，排查方向完全被带偏。
+    let expect_uid = expect_uid.as_deref().map(str::trim).filter(|s| !s.is_empty());
+    if let Some(expected) = expect_uid {
+        let jwt_uid = jwt_info.user_id.as_deref().filter(|s| !s.is_empty());
+        let actual = jwt_uid.unwrap_or(user_id.as_str());
+        let declared = callback_info.user_id.as_deref().filter(|s| !s.is_empty());
+        let mismatched = expected != actual
+            || matches!((jwt_uid, declared), (Some(j), Some(d)) if j != d);
+        if mismatched {
+            // 回滚副作用（见函数开头 bound_before 说明）：bound_device_id 是全局 kv，
+            // 不回滚会让登错账号的设备指纹污染全体账号的后续刷新
+            let store = crate::store::db(&state.data_dir);
+            let mut dev: OAuthDevice = store.kv_get("oauth_device");
+            if dev.bound_device_id != bound_before {
+                dev.bound_device_id = bound_before;
+                if let Err(e) = store.kv_set("oauth_device", &dev) {
+                    fs_utils::app_log(
+                        &state.data_dir,
+                        &format!("[OAuth] 重新登录 uid 不一致，回滚 BoundDeviceID 失败（需人工核对 kv oauth_device）: {e}"),
+                    );
+                }
+            }
+            let tail = |s: &str| {
+                s.chars().rev().take(6).collect::<Vec<_>>().into_iter().rev().collect::<String>()
+            };
+            // 清理在途会话：与成功落库路径同源（1644-1650），否则陈旧 PKCE verifier
+            // 与会话设备会残留到下次登录被误用
+            {
+                let mut guard = LAST_OAUTH_STATE.lock().unwrap_or_else(|e| e.into_inner());
+                *guard = None;
+            }
+            return Err(format!(
+                "登录账号与目标账号不一致：本次授权的账号 uid 尾号 {}，目标账号 uid 尾号 {}。\
+                 已取消（未写入账号凭证、已回滚本次登录产生的设备绑定），请确认浏览器中登录的是同一账号后重试（若浏览器当前为其他账号，请先退出登录）",
+                tail(actual),
+                tail(expected)
+            ));
+        }
+    }
 
     // 4.5 issue #76 次因修复：新 JWT 绑定本次登录设备，立即回写 device_map——
     // 签到/积分查询经 get_device_for/resolve_device 取该设备，x-device-id 与 JWT
@@ -1539,12 +1630,14 @@ pub fn oauth_login(
     // 明确选择分组时同步写入 membership（合并路径此前静默丢弃所选分组）；
     // 未选分组时保持原分组不变。
     if let Some(g) = group_id {
-        // 审查修复：membership 表整删全写模型，RMW 持 org_defs_lock 防并发丢更新
-        let _org = crate::store::docs::org_defs_lock();
+        // 持 group_defs_lock：membership RMW 与并发分组增删/导入互斥防丢更新；
+        // invalidate 在锁 drop 后执行
+        let _defs = state.group_defs_lock.lock().unwrap_or_else(|e| e.into_inner());
         let mut groups: crate::models::GroupsFile =
             crate::store::docs::groups_load(&crate::store::db(&state.data_dir));
         groups.membership.insert(user_id.clone(), g);
         crate::store::docs::groups_save(&crate::store::db(&state.data_dir), &groups)?;
+        drop(_defs);
         // 成员关系变更 → Key 组/标签展开索引失效（与其余全部写路径对齐，
         // 不依赖 TTL 5s 兜底）
         crate::api_server::org_index::invalidate(&state.data_dir);

@@ -6,16 +6,33 @@
 
 ---
 
-## [1.4.10] · 2026-10-12 · issue #93：/v1/responses namespace 工具组支持
+## [1.4.10] · 2026-10-12 · 移植 main 3.7.9/3.7.10：调度保留剩余积分 + Qoder 冷却回退 + OAuth 行内重登
+
+> 合并点 `main@b59eb4b` → `main@af5c59e`（15 个提交，手工语义移植，未 merge）。已含移植后全面审查的修复（兼容性、数据保真、并发与安全）。
+
+### 新增
+
+- **行内重新 OAuth 登录**：无/失效 refresh_token 的账号可在账号页一键重登；`expect_uid` 以 JWT 解析 uid 为权威校验（回调 URL 参数外部可控，不可信），不匹配即拒绝并回滚本次写入。
+- **调度保留剩余积分（issue #91）**：三池统一应用 `reserve_credits`——快照积分 ≤ 保留额且 `credits_fetched_at` 超 24h 视为陈旧降权（无时间戳 fail-open）；策略保存热应用至运行中网关；启动时检测陈旧快照后台保鲜（Trae 拉余额、WB 拨官网快照）。**存量兼容**：既有策略记录/存量安装沿用 0，仅全新安装默认 50。
+- **issue #90：Qoder 5xx/504 模型级渐进冷却与跨池回退**：30s 起翻倍、上限 10 分钟，冷却窗口内不再逐账号硬打上游；模型目录新增来源池标识与跨池命名归一（前端展示「来源：Trae/WB/Qoder」）；冷却/禁用标记落 app.log（`pool=` 上下文，回退日志节流）。
+- **Qoder 会话聚合展示与定时合并**：新增 `qoder-sessions-compact` 定时任务（每 6h 合并 3 天前的历史流水），CLI/调度卡片双入口；仅合并多行会话组，单行组保留请求级明细，失败会话以 `MIN(ok)` 如实标记。
+- **issue #93**：`/v1/responses` 不再丢弃 `type=="namespace"` 工具组——展平为 `<ns>__<inner>` 编码名转发，请求/响应两侧还原 `{name, namespace}`；无 namespace 组的请求不受影响。
 
 ### 修复与加固
 
-- **issue #93**：`/v1/responses` 转换器静默丢弃 `type=="namespace"` 工具组，Codex 子代理（spawn_agent/wait_agent）与 MCP REPL 工具不可用。现展平为 `<ns>__<inner>` 编码名 function 转发，请求/响应（流式与非流式）两侧均还原 `{name, namespace}` 双字段；拆分开关按 tools 是否含编码名自动判定，无 namespace 组的请求不受影响，qoder/custom 上游不感知。
-- **配套加固**：双重前缀守卫、`tool_choice` 裸名解析、编码名碰撞去重、组级 description 保留。
+- **credits_fetched_at 解析断点（审查发现，阻塞）**：本地时间串过不了严格 rfc3339 解析，保留额过滤与 24h 陈旧判定曾结构性失效；新增 `fs_utils::parse_ts_loose` 统一解析并补回归测试，同时修复「每次启动恒触发全池保鲜刷新」。
+- **vault 回填（04214ba）**：JWT 与 refresh_token 回填独立判断，修复代理捕获明文 JWT 后 RT 恒不回填；回填判定统一 trim。
+- **数据与容错**：WB 积分回填失败不再清旧值；会话合并幂等防重（`agg:` 前缀大小写两侧同口径 + `(date,uid,preview)` 副索引）；`shared_groups_list` 读失败 fail-closed；多处静默失败补日志。
+- **稳定性批（3.7.9）**：`/health` 收敏；新增 `group_defs_lock` 补齐分组定义写互斥；迁移/导入韧性；看板口径修复。
+- **安全**：IP 白名单拒绝落审计日志、错误回显清洗控制字符并截断；identity 错误脱敏进 `last_error`。
+
+### 跳过（桌面/OS 专属 / docs-only）
+
+- `409be09`/`d09fd63` 为 docs-only 跳过。
 
 ### 验证
 
-- `cargo test -p aiwork-core` 620 通过（含 7 项新增回归）。
+- `cargo test -p aiwork-core -p aiwork-server` 654 通过（7 忽略）· `tsc` 0 错误 · `vitest` 61 通过。
 
 ---
 

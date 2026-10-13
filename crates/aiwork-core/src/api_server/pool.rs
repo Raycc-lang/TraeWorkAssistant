@@ -65,6 +65,12 @@ impl PoolStrategy {
     }
 }
 
+/// reserve 过滤新鲜度门槛（issue #91 缓存问题）：积分快照采集时间距今超过
+/// 该值视为陈旧，reserve 过滤失效（fail-open）——陈旧「高积分」快照照样会
+/// 调度秃号，fail-closed 反而额外误杀；恢复靠启动保鲜（网关启动后台刷新）
+/// 与运行期 update_credits 拨新。24h 与 trae-credits-snapshot daily 模式对齐
+const RESERVE_STALE_SECS: i64 = 24 * 3600;
+
 /// 池中单个账号的运行时状态
 pub struct PoolEntry {
     pub uid: String,
@@ -72,6 +78,9 @@ pub struct PoolEntry {
     pub jwt: String,
     pub credits: Option<f64>,
     pub credits_expire_at: Option<i64>,
+    /// 积分快照采集时间（Unix 秒，issue #91 缓存保鲜）：
+    /// None = 无时间信息（升级前旧数据/无快照），reserve 过滤同样不生效
+    pub credits_fetched_at: Option<i64>,
     pub disabled: bool,
     pub err_count: i32,
     /// 冷却截止时间（Unix 秒），0 表示无冷却
@@ -111,6 +120,16 @@ impl PoolEntry {
             return false;
         }
         true
+    }
+
+    /// reserve 过滤是否生效（issue #91 缓存问题）：积分快照存在且新鲜
+    /// （≤ RESERVE_STALE_SECS）才生效；缺失（None）/陈旧/未来时间戳均视为
+    /// 陈旧 → fail-open。零积分（c<=0）过滤不经过此门槛，保持既有无条件行为
+    fn reserve_filter_active(&self, now: i64) -> bool {
+        match self.credits_fetched_at {
+            Some(t) => t <= now && now - t <= RESERVE_STALE_SECS,
+            None => false,
+        }
     }
 
     /// 账号五态机（F-29 v1.2）：Available / QuotaProtection / RateLimited /
@@ -162,6 +181,13 @@ pub struct ApiPool {
     /// inflight ≥ 上限的账号视为 busy 不参与候选；全部 busy 时降级取
     /// inflight 最小者（不过载拒绝，保证请求不失败）
     concurrency_limit: std::sync::atomic::AtomicU32,
+    /// 账号保留剩余积分阈值（issue #91，dispatch_policy_set 热应用）：
+    /// f64 bits 存储；剩余积分 ≤ 阈值的账号不参与调度（0 = 不过滤）。
+    /// 防止账号积分被调度耗尽后连免费模型也不可用
+    reserve_credits: std::sync::atomic::AtomicU64,
+    /// 冷却/禁用标记的 app.log 观测上下文：(data_dir, 池标签)。
+    /// 网关启动装配三池（trae/buddy/qoder）时注入；None（测试/未启动）不落日志
+    log_ctx: Mutex<Option<(std::path::PathBuf, String)>>,
 }
 
 /// 安全获取 Mutex 锁：若锁被毒化（panic 导致），仍恢复内部数据继续运行
@@ -177,7 +203,15 @@ impl ApiPool {
             recent_pick: Mutex::new((String::new(), 0)),
             inflight: Mutex::new(HashMap::new()),
             concurrency_limit: std::sync::atomic::AtomicU32::new(1),
+            reserve_credits: std::sync::atomic::AtomicU64::new(0.0f64.to_bits()),
+            log_ctx: Mutex::new(None),
         }
+    }
+
+    /// 装配冷却/禁用标记的日志上下文：池标签 + 数据目录（网关启动时调用）；
+    /// 未装配（测试/未启动网关）时 note_error 不落 app.log，无副作用
+    pub fn set_log_ctx(&self, data_dir: &std::path::Path, label: &str) {
+        *safe_lock(&self.log_ctx) = Some((data_dir.to_path_buf(), label.to_string()));
     }
 
     /// 设置账号并发上限（F-77，pool_set 热应用；0 = 不限）
@@ -189,6 +223,35 @@ impl ApiPool {
     /// 账号并发上限当前值
     pub fn concurrency_limit(&self) -> u32 {
         self.concurrency_limit.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// 设置账号保留剩余积分阈值（issue #91，dispatch_policy_set 热应用）：
+    /// 负值防御归零（0 = 关闭过滤）
+    pub fn set_reserve_credits(&self, v: f64) {
+        self.reserve_credits
+            .store(v.max(0.0).to_bits(), std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// 账号保留剩余积分阈值当前值
+    pub fn reserve_credits(&self) -> f64 {
+        f64::from_bits(self.reserve_credits.load(std::sync::atomic::Ordering::Relaxed))
+    }
+
+    /// 是否存在积分快照陈旧/缺时间戳的账号（issue #91 启动保鲜判定）：
+    /// 此类账号 reserve 过滤 fail-open 不生效，由启动后台刷新拨新恢复。
+    ///
+    /// reserve = 0（过滤关闭）时直接返回 false：此时「新鲜度」对调度无任何影响，
+    /// 不该为它触发全池上游拉取（此前因 credits_fetched_at 解析失败恒 true，
+    /// 导致每次网关启动都跑一轮 Trae/WB 全量刷新，属非预期网络副作用）
+    pub fn has_stale_credits(&self) -> bool {
+        if self.reserve_credits() <= 0.0 {
+            return false;
+        }
+        let entries = safe_lock(&self.entries);
+        let now = now_ts();
+        entries
+            .values()
+            .any(|e| e.credits.is_some() && !e.reserve_filter_active(now))
     }
 
     /// 账号在途计数共享句柄（F-77）：InflightGuard 取号后 bind_account 使用；
@@ -214,10 +277,13 @@ impl ApiPool {
     }
 
     /// 健康账号池画像（智能调度因子，dispatch::smart_pool_order 数据源）：
-    /// (最早积分到期时间, 健康账号剩余积分总和)；无到期数据 → None
+    /// (最早积分到期时间, 健康账号剩余积分总和)；无到期数据 → None。
+    /// 积分总和不计「新鲜快照且低于保留阈值」的账号（issue #91）——被 reserve
+    /// 过滤的账号实际不可调度；陈旧快照 fail-open 与 selectable 口径一致（计入）
     pub fn stats(&self) -> (Option<i64>, f64) {
         let entries = safe_lock(&self.entries);
         let now = now_ts();
+        let reserve = self.reserve_credits();
         let mut earliest: Option<i64> = None;
         let mut total = 0.0;
         for e in entries.values() {
@@ -225,8 +291,10 @@ impl ApiPool {
                 continue;
             }
             if let Some(c) = e.credits {
-                if c > 0.0 {
-                    total += c;
+                if c > reserve || !e.reserve_filter_active(now) {
+                    // 运行期 update_credits 可能写入负值（上游异常/退费），未夹取会
+                    // 把「健康账号积分总和」拉低甚至拉负，污染 smart 排序的积分因子
+                    total += c.max(0.0);
                 }
             }
             if let Some(exp) = e.credits_expire_at {
@@ -249,6 +317,7 @@ impl ApiPool {
         membership: &HashMap<String, String>,
         cooldowns: &HashMap<String, CooldownEntry>,
         remaining_credits: &HashMap<String, f64>,
+        credits_fetched_at: Option<i64>,
         expire_times: &HashMap<String, i64>,
         device_map: &DeviceMap,
     ) {
@@ -304,6 +373,9 @@ impl ApiPool {
                         jwt: jwt_clean,
                         credits: remaining_credits.get(uid).copied(),
                         credits_expire_at: expire_times.get(uid).copied(),
+                        // 快照文件级采集时间（issue #91 缓存保鲜）：一次刷新
+                        // 全量写入 credits 与 updated_at，时间戳对全体条目生效
+                        credits_fetched_at,
                         disabled,
                         err_count: cd.error_count,
                         until: cd.until,
@@ -334,11 +406,15 @@ impl ApiPool {
     /// 不触碰冷却/inflight/禁用等运行态（与 sync_from_accounts 全量重建互补——
     /// 后者会重置 hard_until/last_used 等运行状态）。未提及的账号保持原值。
     /// 修复「秃号内存中 credits>0 永远 selectable、策略持续命中同一账号」。
+    /// 回写同时拨新快照时间戳（issue #91 缓存保鲜）：新数据即新鲜，
+    /// reserve 过滤自动恢复生效
     pub fn update_credits(&self, credits: &HashMap<String, f64>) {
         let mut entries = safe_lock(&self.entries);
+        let now = now_ts();
         for (uid, c) in credits {
             if let Some(e) = entries.get_mut(uid) {
                 e.credits = Some(*c);
+                e.credits_fetched_at = Some(now);
             }
         }
     }
@@ -364,6 +440,7 @@ impl ApiPool {
                     jwt: a.token.clone(),
                     credits: a.credits,
                     credits_expire_at: a.credits_expire_at,
+                    credits_fetched_at: a.credits_fetched_at,
                     disabled: a.needs_relogin,
                     err_count: 0,
                     until: 0,
@@ -407,8 +484,9 @@ impl ApiPool {
                     uid: a.uid.clone(),
                     name: a.name.clone(),
                     jwt: a.access_token.clone(),
-                    credits: None,
+                    credits: a.credits,
                     credits_expire_at: None,
+                    credits_fetched_at: a.credits_fetched_at,
                     disabled: a.needs_relogin,
                     err_count: 0,
                     until: 0,
@@ -439,7 +517,11 @@ impl ApiPool {
         let entries = safe_lock(&self.entries);
         let now = now_ts();
         let tried = HashSet::new();
-        entries.get(uid).filter(|e| selectable(e, &tried, now)).map(|e| PickedAccount {
+        let reserve = self.reserve_credits();
+        entries
+            .get(uid)
+            .filter(|e| selectable(e, &tried, now, reserve))
+            .map(|e| PickedAccount {
             uid: e.uid.clone(),
             jwt: e.jwt.clone(),
             device_id: e.device_id.clone(),
@@ -493,9 +575,10 @@ impl ApiPool {
         let mut entries = safe_lock(&self.entries);
         let strategy = *safe_lock(&self.strategy);
         let now = now_ts();
+        let reserve = self.reserve_credits();
         let all_cands: Vec<&PoolEntry> = entries
             .values()
-            .filter(|e| selectable(e, tried, now))
+            .filter(|e| selectable(e, tried, now, reserve))
             .filter(|e| allowed.map_or(true, |a| a.contains(&e.uid)))
             .collect();
         // F-77 busy 过滤 + 全 busy 降级
@@ -599,13 +682,14 @@ impl ApiPool {
             return Some((sticky, None));
         }
         // 粘性账号 busy：判定其他健康候选（同 allowed 约束；首轮无 tried）是否存在空闲
+        let reserve = self.reserve_credits();
         let (has_other, has_idle) = {
             let entries = safe_lock(&self.entries);
             let now = now_ts();
             let tried = HashSet::new();
             entries
                 .values()
-                .filter(|e| e.uid != sticky_uid && selectable(e, &tried, now))
+                .filter(|e| e.uid != sticky_uid && selectable(e, &tried, now, reserve))
                 .filter(|e| allowed.map_or(true, |a| a.contains(&e.uid)))
                 .fold((false, false), |(any, idle), e| {
                     (any || true, idle || inflight_of(e, &inflight) < limit)
@@ -630,7 +714,7 @@ impl ApiPool {
         let tried = HashSet::new();
         let idle: Vec<&PoolEntry> = entries
             .values()
-            .filter(|e| e.uid != sticky_uid && selectable(e, &tried, now))
+            .filter(|e| e.uid != sticky_uid && selectable(e, &tried, now, reserve))
             .filter(|e| allowed.map_or(true, |a| a.contains(&e.uid)))
             .filter(|e| inflight_of(e, &inflight) < limit)
             .collect();
@@ -690,26 +774,43 @@ impl ApiPool {
         }
     }
 
-    /// 记录错误并冷却（T2.2 错误三态 + 分级冷却）
+    /// 记录错误并冷却（T2.2 错误三态 + 分级冷却）。
+    /// 冷却/禁用标记发生时同步落一条 app.log（F-80 可观测）：
+    /// `account cooldown: pool=<池> acct=<名称> uid=<uid> kind=<错误分类> action=<处置>`，
+    /// 排查「账号何时、为何被打冷却→选池 no_healthy_account→跨池回退」链路时可直接定位
     pub fn note_error(&self, uid: &str, kind: ErrKind) {
         let mut entries = safe_lock(&self.entries);
+        let mut cooldown_ev: Option<(String, String)> = None;
         if let Some(e) = entries.get_mut(uid) {
             e.failures = e.failures.saturating_add(1);
+            let mut action: Option<String> = None;
             match kind {
                 ErrKind::SessionDead | ErrKind::Forbidden => {
                     e.disabled = true;
                     e.reason = kind.as_str().to_string();
+                    action = Some("action=disabled".to_string());
                 }
                 ErrKind::HardCredit => {
                     // 积分耗尽：冷却到次日 04:00，到期自动恢复探测（F-29 v1.2）
-                    e.hard_until = next_0400(now_ts());
+                    let until = next_0400(now_ts());
+                    e.hard_until = until;
                     e.reason = "hard_credit".to_string();
                     e.err_count = 0;
+                    action = Some(format!(
+                        "action=hard_cooldown until={} (下个04:00)",
+                        fmt_local_ts(until)
+                    ));
                 }
                 ErrKind::PlanLimit | ErrKind::SoftRate | ErrKind::NotFound => {
-                    e.until = now_ts() + kind.cooldown_duration().as_secs() as i64;
+                    let secs = kind.cooldown_duration().as_secs() as i64;
+                    let until = now_ts() + secs;
+                    e.until = until;
                     e.reason = kind.as_str().to_string();
                     e.err_count = 0;
+                    action = Some(format!(
+                        "action=cooldown secs={secs} until={}",
+                        fmt_local_ts(until)
+                    ));
                     // P2 修复10：不重置 cb_trips——熔断记忆只应在 note_success 重置，
                     // 否则 Server 熔断记忆被非 Server 错误意外清零
                 }
@@ -718,12 +819,35 @@ impl ApiPool {
                     if e.err_count >= 3 {
                         // 熔断器：30m 起指数递增（×2/次），封顶 6h
                         let exp = 30 * 60u64 << e.cb_trips.min(4);
-                        e.until = now_ts() + exp.min(6 * 3600) as i64;
+                        let capped = exp.min(6 * 3600);
+                        let until = now_ts() + capped as i64;
+                        e.until = until;
                         e.reason = "consecutive_errors".to_string();
                         e.err_count = 0;
                         e.cb_trips = e.cb_trips.saturating_add(1);
+                        action = Some(format!(
+                            "action=circuit_breaker secs={capped} until={}",
+                            fmt_local_ts(until)
+                        ));
                     }
                 }
+            }
+            if let Some(a) = action {
+                cooldown_ev = Some((e.name.clone(), a));
+            }
+        }
+        drop(entries);
+        // F-80：log_ctx 未装配（测试/未启动）时静默跳过，不产生日志副作用
+        if let Some((name, ev)) = cooldown_ev {
+            let ctx = safe_lock(&self.log_ctx).clone();
+            if let Some((dir, label)) = ctx {
+                crate::fs_utils::app_log(
+                    &dir,
+                    &format!(
+                        "account cooldown: pool={label} acct={name} uid={uid} kind={} {ev}",
+                        kind.as_str(),
+                    ),
+                );
             }
         }
     }
@@ -793,7 +917,8 @@ impl ApiPool {
         let entries = safe_lock(&self.entries);
         let now = now_ts();
         let tried = HashSet::new();
-        entries.values().any(|e| selectable(e, &tried, now))
+        let reserve = self.reserve_credits();
+        entries.values().any(|e| selectable(e, &tried, now, reserve))
     }
 
     /// 同 [has_selectable]，附加 Key 级 uid 白名单过滤（issue #25 资源池绑定）：
@@ -812,10 +937,11 @@ impl ApiPool {
         let entries = safe_lock(&self.entries);
         let now = now_ts();
         let tried = HashSet::new();
+        let reserve = self.reserve_credits();
         let mut total = 0usize;
         let mut in_allowed = 0usize;
         for e in entries.values() {
-            if selectable(e, &tried, now) {
+            if selectable(e, &tried, now, reserve) {
                 total += 1;
                 if allowed.map_or(true, |a| a.contains(&e.uid)) {
                     in_allowed += 1;
@@ -829,6 +955,7 @@ impl ApiPool {
     pub fn diagnose(&self) -> Vec<PoolDiagnosis> {
         let entries = safe_lock(&self.entries);
         let now = now_ts();
+        let reserve = self.reserve_credits();
         entries
             .values()
             .map(|e| {
@@ -840,24 +967,30 @@ impl ApiPool {
                     format!("hard_credit(until_0400={}s)", e.hard_until - now)
                 } else if e.until > 0 && now < e.until {
                     format!("cooldown(until={} remaining={}s)", e.until, e.until - now)
-                } else if let Some(exp) = e.credits_expire_at {
-                    if exp > 0 && exp < now {
-                        "credits_expired".to_string()
-                    } else if exp > 0 {
-                        if let Some(c) = e.credits {
-                            if c <= 0.0 {
-                                "zero_credits".to_string()
-                            } else {
-                                "healthy".to_string()
-                            }
-                        } else {
-                            "healthy(no_credits_info)".to_string()
-                        }
-                    } else {
-                        "healthy(no_expiry)".to_string()
-                    }
+                } else if matches!(e.credits_expire_at, Some(exp) if exp > 0 && exp < now) {
+                    "credits_expired".to_string()
                 } else {
-                    "healthy(no_expiry_info)".to_string()
+                    // 审查修复：零积分 / 保留额判定必须与 selectable() 同序且独立
+                    // 于「是否有到期时间」——此前嵌套在 `exp > 0` 分支内，无到期信息
+                    // 的低积分账号会被标成 healthy(no_expiry_info)，与真实
+                    // （已被 selectable 过滤）口径相悖，NoHealthy 排障被误导
+                    match e.credits {
+                        Some(c) if c <= 0.0 => "zero_credits".to_string(),
+                        Some(c) if c <= reserve => {
+                            // 保留积分阈值过滤（issue #91）：陈旧快照
+                            // fail-open 不生效（缓存问题），标注供排查
+                            if e.reserve_filter_active(now) {
+                                format!("low_credits(reserve={})", reserve)
+                            } else {
+                                "healthy(credits_stale_fail_open)".to_string()
+                            }
+                        }
+                        Some(_) if !matches!(e.credits_expire_at, Some(exp) if exp > 0) => {
+                            "healthy(no_expiry)".to_string()
+                        }
+                        Some(_) => "healthy".to_string(),
+                        None => "healthy(no_credits_info)".to_string(),
+                    }
                 };
                 PoolDiagnosis {
                     uid: e.uid.clone(),
@@ -910,6 +1043,9 @@ pub struct WbSyncAccount {
     pub credits: Option<f64>,
     /// 最早积分包到期（Unix 秒，Buddy 不分包类型，issue #28）；None = 无到期约束
     pub credits_expire_at: Option<i64>,
+    /// 积分快照采集时间（Unix 秒，issue #91 缓存保鲜）：条目级时间戳
+    /// （WB credits_fetch 缓存回写）；None = 无时间信息，reserve 过滤不生效
+    pub credits_fetched_at: Option<i64>,
     pub needs_relogin: bool,
     /// 所属 Buddy 分组 id（空 = 未分组）；池分组筛选在装配层按此过滤
     pub group_id: String,
@@ -928,10 +1064,17 @@ pub struct QoderSyncAccount {
     pub needs_relogin: bool,
     /// 账号分组 id（qoder_groups 分组体系）：池装配层按 qoder_group_ids 过滤时使用
     pub group_id: String,
+    /// 余额快照（qoder-credits-snapshot / credits_fetch 回写 QoderAccount.credits_balance）：
+    /// issue #91 三池统一——此前 Qoder 臂恒 None，reserve 保留额过滤在 Qoder 池
+    /// 完全失效（与 CHANGELOG「三池统一应用」声明不符）
+    pub credits: Option<f64>,
+    /// 余额快照采集时间（Unix 秒；None = 无快照/旧数据，reserve 过滤 fail-open）
+    pub credits_fetched_at: Option<i64>,
 }
 
 /// 候选过滤：healthy + 未 tried + 积分未过期 + 非零积分 + 非 hard_credit 冷却
-fn selectable(e: &PoolEntry, tried: &HashSet<String>, now: i64) -> bool {
+/// `reserve`：账号保留剩余积分阈值（issue #91，≥ 0；0 = 仅过滤零积分）
+fn selectable(e: &PoolEntry, tried: &HashSet<String>, now: i64, reserve: f64) -> bool {
     if tried.contains(&e.uid) || !e.healthy(now) {
         return false;
     }
@@ -941,9 +1084,13 @@ fn selectable(e: &PoolEntry, tried: &HashSet<String>, now: i64) -> bool {
             return false;
         }
     }
-    // 跳过零通用积分账号（通用积分耗尽，llm_utils_chat 无法使用）
+    // 跳过零通用积分账号（通用积分耗尽，llm_utils_chat 无法使用）；
+    // 账号保留剩余积分（issue #91）：剩余 ≤ 阈值同样不调度——但仅当积分
+    // 快照新鲜。陈旧快照 fail-open（缓存问题）：陈旧「高积分」照样会调度
+    // 秃号，fail-closed 只会额外误杀；保鲜由启动刷新与 update_credits 拨新
+    // （reserve=0 时等价原零积分过滤）
     if let Some(c) = e.credits {
-        if c <= 0.0 {
+        if c <= 0.0 || (c <= reserve && e.reserve_filter_active(now)) {
             return false;
         }
     }
@@ -1097,6 +1244,16 @@ fn now_ts() -> i64 {
         .unwrap_or(0)
 }
 
+/// Unix 秒 → 固定东八区时间展示（与 next_0400 的 local_ts 约定同源），
+/// 供冷却日志 until 可读化；解析失败回退原始数值
+fn fmt_local_ts(ts: i64) -> String {
+    use chrono::TimeZone;
+    chrono::FixedOffset::east_opt(8 * 3600)
+        .and_then(|tz| tz.timestamp_opt(ts, 0).single())
+        .map(|d| d.format("%Y-%m-%d %H:%M").to_string())
+        .unwrap_or_else(|| ts.to_string())
+}
+
 /// 确定性派生 hex 字符串（与原 device_proxy.py 的 _seeded_stream 算法一致，accounts::derive_device 同源）
 /// 用于从 uid 生成 machine_id，保证同一账号始终得到同一设备标识
 pub(crate) fn seeded_hex(n: usize, seed: &str, salt: &str) -> String {
@@ -1156,10 +1313,44 @@ mod tests {
             &HashMap::new(),
             &HashMap::new(),
             &credits,
+            Some(now_ts()),
             &expires,
             &HashMap::new(),
         );
         pool
+    }
+
+    // ==================== F-80：冷却/禁用标记落 app.log ====================
+
+    #[test]
+    fn cooldown_event_logged_when_ctx_assembled() {
+        let dir = std::env::temp_dir().join(format!("aiwa_f80_on_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let pool = build_pool(&[("uid_a", 10.0, 0)]);
+        pool.set_log_ctx(&dir, "trae");
+        pool.note_error("uid_a", ErrKind::Forbidden);
+        let line = std::fs::read_to_string(dir.join("logs").join("app.log")).unwrap();
+        assert!(
+            line.contains(
+                "account cooldown: pool=trae acct=uid_a uid=uid_a kind=Forbidden action=disabled"
+            ),
+            "实际日志: {line}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn cooldown_event_not_logged_without_ctx() {
+        let dir = std::env::temp_dir().join(format!("aiwa_f80_off_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let pool = build_pool(&[("uid_a", 10.0, 0)]);
+        // 未装配 log_ctx（测试/未启动网关）：note_error 不产生日志副作用
+        pool.note_error("uid_a", ErrKind::Forbidden);
+        assert!(
+            !dir.join("logs").join("app.log").exists(),
+            "未装配 log_ctx 不应产生日志文件"
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -1214,6 +1405,88 @@ mod tests {
         // 白名单全在池外：命中=0
         let miss: HashSet<String> = ["uid_x".to_string()].into_iter().collect();
         assert_eq!(pool.selectable_stats_in(Some(&miss)), (2, 0));
+    }
+
+    #[test]
+    fn reserve_credits_skips_low_balance_accounts() {
+        // issue #91 账号保留剩余积分：剩余 ≤ 阈值的账号不参与取号与健康预检
+        let pool = build_pool(&[
+            ("uid_low", 30.0, 4_000_001_000),
+            ("uid_ok", 100.0, 4_000_001_000),
+        ]);
+        // 阈值 0（默认）：零积分过滤语义，两账号均可选
+        assert_eq!(pool.selectable_stats_in(None), (2, 2));
+        pool.set_reserve_credits(50.0);
+        // 低余额账号被过滤，仅剩 uid_ok；取号跳过 uid_low
+        assert_eq!(pool.selectable_stats_in(None), (1, 1));
+        let picked = pool.pick_excluding_constrained(&HashSet::new(), None, None).unwrap();
+        assert_eq!(picked.uid, "uid_ok");
+        assert!(pool.pick_by_uid("uid_low").is_none());
+        // 智能调度数据源同步感知：积分总和不计保留阈值以下账号
+        assert_eq!(pool.stats().1, 100.0);
+        // 诊断输出 low_credits 原因（NoHealthy 排查）
+        let low = pool.diagnose().into_iter().find(|d| d.uid == "uid_low").unwrap();
+        assert!(low.reason.starts_with("low_credits"));
+        // 阈值归零恢复可选
+        pool.set_reserve_credits(0.0);
+        assert_eq!(pool.selectable_stats_in(None), (2, 2));
+    }
+
+    #[test]
+    fn reserve_credits_boundary_inclusive() {
+        // 语义「低于或等于切换账号」：剩余 == 阈值即过滤
+        let pool = build_pool(&[("uid_edge", 50.0, 4_000_001_000)]);
+        pool.set_reserve_credits(50.0);
+        assert!(!pool.has_selectable());
+        // 高于阈值 0.01 即可选
+        let pool2 = build_pool(&[("uid_edge", 50.01, 4_000_001_000)]);
+        pool2.set_reserve_credits(50.0);
+        assert!(pool2.has_selectable());
+    }
+
+    #[test]
+    fn reserve_credits_stale_snapshot_fail_open() {
+        // issue #91 缓存问题：reserve 过滤仅对新鲜积分快照生效。
+        // 陈旧快照 fail-open（不误杀），保鲜靠启动刷新与 update_credits 拨新
+        let pool = build_pool(&[("uid_low", 30.0, 4_000_001_000)]);
+        pool.set_reserve_credits(50.0);
+        // 新鲜快照：低余额被过滤
+        assert_eq!(pool.selectable_stats_in(None), (0, 0));
+        assert!(pool.has_stale_credits() == false, "build_pool 拨新后不应判陈旧");
+
+        // 快照陈旧（>24h）：fail-open 恢复可选；stats 口径同步（计入 total）
+        let now = now_ts();
+        {
+            let mut entries = safe_lock(&pool.entries);
+            for e in entries.values_mut() {
+                e.credits_fetched_at = Some(now - RESERVE_STALE_SECS - 60);
+            }
+        }
+        assert!(pool.has_stale_credits());
+        assert_eq!(pool.selectable_stats_in(None), (1, 1));
+        assert!(pool.has_selectable());
+        assert_eq!(pool.stats().1, 30.0);
+        // 诊断标注陈旧 fail-open（NoHealthy 排查）
+        let low = pool.diagnose().into_iter().find(|d| d.uid == "uid_low").unwrap();
+        assert!(
+            low.reason.contains("credits_stale"),
+            "reason={}",
+            low.reason
+        );
+
+        // 无时间戳（升级前旧数据）同样 fail-open
+        {
+            let mut entries = safe_lock(&pool.entries);
+            for e in entries.values_mut() {
+                e.credits_fetched_at = None;
+            }
+        }
+        assert_eq!(pool.selectable_stats_in(None), (1, 1));
+
+        // update_credits 拨新时间戳：过滤自动恢复
+        pool.update_credits(&[("uid_low".to_string(), 30.0)].into_iter().collect());
+        assert!(!pool.has_stale_credits());
+        assert_eq!(pool.selectable_stats_in(None), (0, 0));
     }
 
     #[test]
@@ -1319,6 +1592,7 @@ mod tests {
             &membership,
             &HashMap::new(),
             &HashMap::new(),
+            None,
             &HashMap::new(),
             &HashMap::new(),
         );
@@ -1341,6 +1615,7 @@ mod tests {
             &membership,
             &HashMap::new(),
             &HashMap::new(),
+            None,
             &HashMap::new(),
             &HashMap::new(),
         );
@@ -1367,6 +1642,7 @@ mod tests {
             &HashMap::new(),
             &HashMap::new(),
             &credits,
+            Some(now_ts()),
             &HashMap::new(),
             &HashMap::new(),
         );
@@ -1418,7 +1694,8 @@ mod tests {
         // 直接对 pick_weighted 纯函数做断言（不依赖随机落点）
         let e_a = crate::api_server::pool::PoolEntry {
             uid: "a".into(), name: String::new(), jwt: String::new(),
-            credits: Some(100.0), credits_expire_at: None, disabled: false,
+            credits: Some(100.0), credits_expire_at: None,
+            credits_fetched_at: Some(now_ts()), disabled: false,
             err_count: 0, until: 0, reason: String::new(),
             device_id: String::new(), machine_id: String::new(),
             hard_until: 0, last_used: 1000, successes: 0, failures: 0, cb_trips: 0,
@@ -1429,7 +1706,8 @@ mod tests {
             last_used: 1000 - 3 * 3600, // 闲置 3 小时
             ..crate::api_server::pool::PoolEntry {
                 uid: "b".into(), name: String::new(), jwt: String::new(),
-                credits: Some(100.0), credits_expire_at: None, disabled: false,
+                credits: Some(100.0), credits_expire_at: None,
+                credits_fetched_at: Some(now_ts()), disabled: false,
                 err_count: 0, until: 0, reason: String::new(),
                 device_id: String::new(), machine_id: String::new(),
                 hard_until: 0, last_used: 0, successes: 0, failures: 0, cb_trips: 0,
@@ -1472,6 +1750,7 @@ mod tests {
             jwt: String::new(),
             credits: Some(credits),
             credits_expire_at: None,
+            credits_fetched_at: Some(now_ts()),
             disabled: false,
             err_count: 0,
             until: 0,
@@ -1615,6 +1894,7 @@ mod tests {
                 global_region: true,
                 credits: Some(50.0),
                 credits_expire_at: None,
+                credits_fetched_at: None,
                 needs_relogin: false,
                 group_id: String::new(),
             }],
@@ -1632,7 +1912,8 @@ mod tests {
             &[crate::api_server::pool::WbSyncAccount {
                 uid: "wb-x".into(), name: String::new(), token: "tk".into(),
                 domain: String::new(), enterprise_id: String::new(),
-                global_region: false, credits: None, credits_expire_at: None, needs_relogin: true,
+                global_region: false, credits: None, credits_expire_at: None,
+                credits_fetched_at: None, needs_relogin: true,
                 group_id: String::new(),
             }],
             &["wb-x".to_string()],
@@ -1654,6 +1935,7 @@ mod tests {
                 global_region: false,
                 credits: Some(10.0),
                 credits_expire_at: Some(1_234_567_890),
+                credits_fetched_at: None,
                 needs_relogin: false,
                 group_id: String::new(),
             }],
@@ -1678,6 +1960,8 @@ mod tests {
                     machine_id: "mid".into(),
                     needs_relogin: false,
                     group_id: String::new(),
+                    credits: None,
+                    credits_fetched_at: None,
                 },
                 crate::api_server::pool::QoderSyncAccount {
                     uid: "qd-dead".into(),
@@ -1686,6 +1970,8 @@ mod tests {
                     machine_id: String::new(),
                     needs_relogin: true,
                     group_id: String::new(),
+                    credits: None,
+                    credits_fetched_at: None,
                 },
                 // 空令牌账号不入池（无法签名）
                 crate::api_server::pool::QoderSyncAccount {
@@ -1695,6 +1981,8 @@ mod tests {
                     machine_id: String::new(),
                     needs_relogin: false,
                     group_id: String::new(),
+                    credits: None,
+                    credits_fetched_at: None,
                 },
             ],
             &["qd-1".to_string(), "qd-dead".to_string(), "qd-empty".to_string()],
@@ -1716,6 +2004,8 @@ mod tests {
                 machine_id: String::new(),
                 needs_relogin: true,
                 group_id: String::new(),
+                credits: None,
+                credits_fetched_at: None,
             }],
             &["qd-dead".to_string()],
         );
@@ -1735,6 +2025,8 @@ mod tests {
                 machine_id: String::new(),
                 needs_relogin: false,
                 group_id: String::new(),
+                credits: None,
+                credits_fetched_at: None,
             }],
             &["q1".to_string()],
         );

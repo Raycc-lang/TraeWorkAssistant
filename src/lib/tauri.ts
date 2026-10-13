@@ -51,6 +51,7 @@ import type {
   UnifiedModel,
   UsageDayView,
   UsageHistoryResult,
+  UsageSessionView,
   UsageSessionsResult,
   WbActivityInfo,
   WbCheckinRecord,
@@ -694,8 +695,14 @@ export const api = {
     getLoginUrl: () => invoke<OAuthLoginUrl>('oauth_get_login_url'),
     parseCallback: (callbackUrl: string) =>
       invoke('oauth_parse_callback', { callbackUrl }),
-    login: (callbackUrl: string, accountName?: string, groupId?: string) =>
-      invoke<OAuthLoginResult>('oauth_login', { callbackUrl, accountName, groupId }),
+    login: (callbackUrl: string, accountName?: string, groupId?: string, expectUid?: string) =>
+      invoke<OAuthLoginResult>('oauth_login', {
+        callbackUrl,
+        accountName,
+        groupId,
+        // 重新登录模式：目标账号 uid，后端校验不一致则拒绝落库
+        expectUid: expectUid ?? null,
+      }),
   },
   // ---- WorkBuddy（Web 版保留：账号/分组/签到/积分/设置/导入导出/OAuth/用量）----
   workbuddy: {
@@ -835,6 +842,14 @@ export const api = {
         userId: opts.userId ?? null,
         page: opts.page ?? null,
         pageSize: opts.pageSize ?? null,
+      }),
+    /** Qoder 会话展开明细（按会话行代表键查请求级行；键口径 = session_id ∪ preview） */
+    sessionDetail: (opts: { date: string; uid: string; sessionId: string; preview: string }) =>
+      invoke<UsageSessionView[]>('qoder_session_detail_query', {
+        date: opts.date,
+        uid: opts.uid,
+        sessionId: opts.sessionId,
+        preview: opts.preview,
       }),
     /**
      * 账号池导出（M4；includeCredentials=true 必须提供 password——凭证经 AES-256-GCM

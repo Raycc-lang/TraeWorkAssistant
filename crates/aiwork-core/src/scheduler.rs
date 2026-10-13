@@ -67,14 +67,22 @@ const TASKS: &[SchedTask] = &[
     // 页面常驻时快照停留在最后打开时刻。看板数据同步类任务（可 hourly）；daily
     // 模式用内置 23:50（不与积分同步共占配置时刻，天然错峰 10 分钟）
     SchedTask { key: "trae-usage-sync", name: "Trae 消耗明细同步", hhmm: "23:50" },
-    // F-80 Qoder 积分快照（移植 main）：每日 HH:MM；空池静默空转不计失败
-    SchedTask { key: "qoder-credits-snapshot", name: "Qoder 积分快照", hhmm: "23:40" },
+    // F-80 Qoder 积分数据同步（移植 main）：与 Buddy/Trae 同款四模式（off/hourly/
+    // daily/every_hours，scheduler_cfg.task_modes 可改；daily 用内置 23:40）；
+    // 空池静默空转不计失败
+    SchedTask { key: "qoder-credits-snapshot", name: "Qoder 积分数据同步", hhmm: "23:40" },
     // F-80 Qoder 模型目录同步（移植 main p3-3）：真签名拉 model/list → adopt_remote
     // 替换缓存；空池/无凭证静默跳过不计失败，时刻经 scheduler_cfg.task_times 可改
     SchedTask { key: "qoder-catalog-sync", name: "Qoder 模型目录同步", hhmm: "05:50" },
     // F-80 Qoder 凭证 6h 兜底刷新（移植 main）：固定每 6 小时（hhmm 不参与判定）；
     // 空池空转；与 UI 路径经跨进程锁互斥（任务内部处理）
     SchedTask { key: "qoder-refresh", name: "Qoder 凭证定时刷新", hhmm: "06:00" },
+    // Qoder 会话流水定时合并（移植 main）：每 6 小时把「保留窗之前」（默认 3 天，
+    // QODER_SESSIONS_COMPACT_AFTER_DAYS）的请求级流水按 (date, uid, preview) 合并为
+    // 单行（幂等自愈，积分合计不变；历史行 session_id 为随机值，按 preview 归并才
+    // 对旧行生效）。展示层另有读时聚合（qoder_sessions_query 两遍归并），本任务只
+    // 负责压缩历史行体积
+    SchedTask { key: "qoder-sessions-compact", name: "Qoder 会话流水定时合并", hhmm: "04:30" },
 ];
 
 /// 启动调度线程（server main 调用；启动 90s 后首跑，避开启动高峰）
@@ -101,9 +109,14 @@ const HOURLY_INTERVAL_MS: i64 = 60 * 60_000;
 /// 客户端 token 惰性窗 7h > 6h 调度间隔，任一 tick 必落窗内，确保过期令牌被续）
 const REFRESH_INTERVAL_HOURS: i64 = 6;
 
+/// qoder-sessions-compact 档位（移植 main）：每 6 小时合并一次「当天之前」的会话
+/// 流水（当天数据由查询层读时聚合即时呈现，无等待诉求）
+const COMPACT_INTERVAL_HOURS: i64 = 6;
+
 /// 可配置「每小时/每N小时」模式的任务（看板数据同步类，移植 main@c8e855b 的 credits 语义）：
 /// 仅这些任务接受 scheduler_cfg.task_modes 的 hourly/every_hours 值，其余任务恒为每日模式
-const HOURLY_CAPABLE: &[&str] = &["wb-credits-snapshot", "trae-credits-snapshot", "trae-usage-sync"];
+const HOURLY_CAPABLE: &[&str] =
+    &["wb-credits-snapshot", "trae-credits-snapshot", "trae-usage-sync", "qoder-credits-snapshot"];
 
 /// 单任务的生效调度计划：Skip=关闭；Daily=每日 HH:MM（到点+当日未跑，启动补跑）；
 /// Hourly=每小时（距上次成功执行 ≥1h，无记录=首次立即跑）；
@@ -127,6 +140,10 @@ fn sched_plan(cfg: &Value, t: &SchedTask, extra_enabled: bool) -> SchedPlan {
     // Qoder 凭证兜底刷新（移植 main）：固定每 6 小时，hhmm 不参与判定
     if t.key == "qoder-refresh" {
         return SchedPlan::EveryHours(REFRESH_INTERVAL_HOURS);
+    }
+    // Qoder 会话流水定时合并（移植 main）：固定每 6 小时，hhmm 不参与判定
+    if t.key == "qoder-sessions-compact" {
+        return SchedPlan::EveryHours(COMPACT_INTERVAL_HOURS);
     }
     if HOURLY_CAPABLE.contains(&t.key) {
         match effective_task_mode_from(cfg, t.key).as_str() {
@@ -684,6 +701,17 @@ fn run_task(key: &str, st: &AppState) -> Result<Value, String> {
         // Qoder Token 定时刷新：与 `--task-run qoder-refresh` 同款（6h 周期，lazy 7h 惰性门；
         // 有账号刷新失败时返 Err，交由调度器 30 分钟冷却重试；抢不到跨进程锁返回 skipped_busy）
         "qoder-refresh" => crate::tasks::qoder_refresh::run_task(st),
+        // Qoder 会话流水定时合并：把早于保留窗的请求行按 (date, uid, preview) 合并
+        // 单行（幂等自愈；纯本地 SQLite 无网络依赖，失败返 Err 交 30 分钟冷却重试）。
+        // 保留窗天数：本分支无 settings 字段，直接采用 docs 层常量（默认 3 天）
+        "qoder-sessions-compact" => {
+            let days = crate::store::docs::QODER_SESSIONS_COMPACT_AFTER_DAYS;
+            let (merged, deleted) = crate::store::docs::qoder_sessions_compact(
+                &crate::store::db(&st.data_dir),
+                days,
+            )?;
+            Ok(json!({ "ok": true, "merged": merged, "deleted": deleted, "days": days }))
+        }
         // Qoder 模型目录同步：与 `--task-run qoder-catalog-sync` 同款（真签名拉
         // model/list → adopt_remote；空池/无凭证空转，网络失败返 Err 冷却重试）
         "qoder-catalog-sync" => crate::tasks::qoder_catalog::run_task(st),
@@ -963,6 +991,28 @@ mod sched_plan_tests {
         ));
     }
 
+    /// qoder-sessions-compact 固定每 6 小时（移植 main）：不受 task_times/task_modes
+    /// 影响，时刻配置不参与判定；停用时仍按 Skip 处理
+    #[test]
+    fn qoder_sessions_compact_is_every6h() {
+        let cfg = json!({
+            "task_times": { "qoder-sessions-compact": "03:10" },
+            "task_modes": { "qoder-sessions-compact": "hourly" },
+        });
+        match sched_plan(&cfg, task("qoder-sessions-compact"), true) {
+            SchedPlan::EveryHours(h) => assert_eq!(h, COMPACT_INTERVAL_HOURS),
+            other => panic!("qoder-sessions-compact 应为 EveryHours 计划，实际 {other:?}"),
+        }
+        assert!(matches!(
+            sched_plan(
+                &json!({ "disabled_tasks": ["qoder-sessions-compact"] }),
+                task("qoder-sessions-compact"),
+                true
+            ),
+            SchedPlan::Skip
+        ));
+    }
+
     /// 看板同步任务的调度计划（issue #82）：默认 every_hours 每 2 小时；
     /// hourly/daily 生效；非法值回 every_hours；间隔小时数可手工设置并 clamp；
     /// off 关闭
@@ -998,6 +1048,11 @@ mod sched_plan_tests {
         // wb 缺省同为 every_hours 每 2 小时
         assert!(matches!(
             sched_plan(&json!({}), task("wb-credits-snapshot"), true),
+            SchedPlan::EveryHours(2)
+        ));
+        // qoder 缺省同为 every_hours 每 2 小时（移植 main：积分快照加入四模式族）
+        assert!(matches!(
+            sched_plan(&json!({}), task("qoder-credits-snapshot"), true),
             SchedPlan::EveryHours(2)
         ));
         // 手工间隔生效 + 越界 clamp（1..=24）
@@ -1048,6 +1103,7 @@ mod sched_backoff_tests {
             jwt_refresh_lock: std::sync::Arc::new(std::sync::Mutex::new(())),
             qoder_pool_lock: std::sync::Arc::new(std::sync::Mutex::new(())),
             wb_pool_lock: std::sync::Arc::new(std::sync::Mutex::new(())),
+            group_defs_lock: std::sync::Arc::new(std::sync::Mutex::new(())),
             events: std::sync::Arc::new(std::sync::Mutex::new(None)),
         }
     }

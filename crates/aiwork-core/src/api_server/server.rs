@@ -173,10 +173,17 @@ mod tests {
 /// 频控红线：单次单请求、不重试、不批量，探活流量可忽略。
 fn spawn_wb_health_probe(state: Arc<ApiSharedState>) {
     use std::sync::atomic::Ordering;
+    // 与 spawn_persistence_flusher 同构：持 Weak 引用，服务停止、共享状态被释放后
+    // 线程自动退出（重启服务重建新线程），避免反复启动/停止累积线程与整份共享状态。
+    let weak = Arc::downgrade(&state);
+    drop(state);
     std::thread::spawn(move || {
         // T5.1/F-37：启动即做一次上游目录动态替换（best effort，失败不影响启动——
-        // 本地静态兜底目录保持不动）；取任一健康 WB 账号的凭证拉取
-        {
+        // 本地静态兜底目录保持不动）；取任一健康 WB 账号的凭证拉取。
+        // 强引用升级仅限块内临时（2026-10-12 审查 P3 修复，对齐蓝本）：严禁把
+        // state 提出本块绑定到闭包顶层——线程自持强引用会令下方循环内的
+        // weak.upgrade 恒成功，「服务停止自动退出」失效成线程泄漏
+        if let Some(state) = weak.upgrade() {
             let picked = state.wb_pool.pick_excluding_constrained(
                 &std::collections::HashSet::new(),
                 None,
@@ -216,6 +223,10 @@ fn spawn_wb_health_probe(state: Arc<ApiSharedState>) {
                 .map(|d| d.subsec_nanos() as u64 % 60)
                 .unwrap_or(0);
             std::thread::sleep(std::time::Duration::from_secs(300 + jitter));
+            // 服务停止后（共享状态释放）退出线程，避免泄漏
+            let Some(state) = weak.upgrade() else {
+                return;
+            };
             let agent = ureq::AgentBuilder::new()
                 .timeout(std::time::Duration::from_secs(10))
                 .build();

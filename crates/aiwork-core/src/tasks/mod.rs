@@ -94,6 +94,19 @@ pub fn run_cli_task(name: &str, state: &AppState) -> i32 {
         "qoder-refresh" => qoder_refresh::run_task(state),
         // Qoder 模型目录每日同步（调度器/CLI 共用；空池/无凭证空转，p3-3 收尾）
         "qoder-catalog-sync" => qoder_catalog::run_task(state),
+        // Qoder 会话流水定时合并（移植 main；保留窗 3 天，幂等可重入）
+        "qoder-sessions-compact" => crate::store::docs::qoder_sessions_compact(
+            &crate::store::db(&state.data_dir),
+            crate::store::docs::QODER_SESSIONS_COMPACT_AFTER_DAYS,
+        )
+        .map(|(merged, deleted)| {
+            serde_json::json!({
+                "ok": true,
+                "merged": merged,
+                "deleted": deleted,
+                "days": crate::store::docs::QODER_SESSIONS_COMPACT_AFTER_DAYS
+            })
+        }),
         // 刷新全部账号剩余积分（credits_daily 快照按日重算）
         "refresh-credits" => crate::commands::accounts::refresh_remaining_credits_impl(state)
             .map(|n| serde_json::json!({ "refreshed": n, "snapshot": "credits_daily.json" })),

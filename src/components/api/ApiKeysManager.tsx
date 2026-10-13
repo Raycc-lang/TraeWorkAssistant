@@ -114,15 +114,17 @@ export default function ApiKeysManager({
     setNewKeyValue('ck_' + [...buf].map((b) => b.toString(16).padStart(2, '0')).join('').slice(0, 32));
   }, []);
 
-  const saveKeys = async (next: ApiKeyEntry[], msg: string, nextAuthDisabled?: boolean) => {
+  const saveKeys = async (next: ApiKeyEntry[], msg: string, nextAuthDisabled?: boolean): Promise<boolean> => {
     setKeysSaving(true);
     try {
       await api.apiServer.keysSave(next, nextAuthDisabled);
       setApiKeys(next);
       if (nextAuthDisabled !== undefined) setAuthDisabled(nextAuthDisabled);
       toast('success', msg);
+      return true;
     } catch (e) {
       toast('error', `保存 Key 失败：${String(e).slice(0, 120)}`);
+      return false;
     } finally {
       setKeysSaving(false);
     }
@@ -146,7 +148,7 @@ export default function ApiKeysManager({
     );
   };
 
-  const addKey = () => {
+  const addKey = async () => {
     const name = newKeyName.trim();
     if (!name) {
       toast('error', '请填写 Key 名称');
@@ -177,11 +179,14 @@ export default function ApiKeysManager({
       allowed_tags: [],
       daily_stats: [],
     };
-    void saveKeys([...apiKeys, entry], `Key「${name}」已添加`);
-    setNewKeyName('');
-    setNewKeyLimit(0);
-    setNewBindPool('');
-    generateKeyValue();
+    // 保存成功后才清空表单：失败时保留用户已填的名称/限额，免重填
+    const ok = await saveKeys([...apiKeys, entry], `Key「${name}」已添加`);
+    if (ok) {
+      setNewKeyName('');
+      setNewKeyLimit(0);
+      setNewBindPool('');
+      generateKeyValue();
+    }
   };
 
   const toggleKey = (id: string) => {
@@ -332,11 +337,14 @@ export default function ApiKeysManager({
     };
   }, [editKey, editGroups, editTags, editAllowed]);
 
-  const updateKeyLimit = (id: string, limit: number) => {
+  const updateKeyLimit = (id: string, limit: number, revert?: () => void) => {
     const v = Math.max(0, Math.floor(limit) || 0);
     const cur = apiKeys.find((k) => k.id === id);
     if (!cur || cur.daily_limit === v) return;
-    void saveKeys(apiKeys.map((k) => k.id === id ? { ...k, daily_limit: v } : k), '限额已更新');
+    void saveKeys(apiKeys.map((k) => k.id === id ? { ...k, daily_limit: v } : k), '限额已更新').then((ok) => {
+      // 保存失败（uncontrolled 输入框已显示新值）→ 回写原值，保持显示与持久化一致
+      if (!ok) revert?.();
+    });
   };
 
   // 复制成功按钮级反馈（不依赖 toast，通知方式设为 none/system 时也可见）
@@ -591,7 +599,10 @@ export default function ApiKeysManager({
                             toast('error', '日限额需为非负整数，已还原原值');
                             return;
                           }
-                          updateKeyLimit(k.id, parseInt(raw, 10));
+                          const input = e.target;
+                          updateKeyLimit(k.id, parseInt(raw, 10), () => {
+                            input.value = String(k.daily_limit);
+                          });
                         }}
                         title="0 表示不限；失焦自动保存"
                       />

@@ -1,22 +1,30 @@
 import { useEffect, useState } from 'react';
-import { Copy, ExternalLink } from 'lucide-react';
+import { AlertTriangle, Copy, ExternalLink } from 'lucide-react';
 import { Modal } from '../../components/ui';
 import { api } from '../../lib/tauri';
 import { useAppStore } from '../../store';
 import { copyText } from '../../lib/clipboard';
 import type { GroupView } from '../../types';
 
+/** 重新登录模式目标：为指定已有账号重新 OAuth 获取凭证 */
+export interface ReloginTarget {
+  userId: string;
+  accountName: string;
+}
+
 /**
  * OAuth 登录弹窗（Web 版·纯粘贴模式，ADR-3）：
  * 浏览器无法监听本机回环回调，改为三步引导——
  * ① 打开 Trae 授权页 → ② 浏览器完成登录（回调页「无法连接」为预期现象）→ ③ 粘贴地址栏完整 URL 提交。
  * 服务端走既有 oauth.parse_callback + oauth_login 流程落库。
+ * 传入 relogin 即为「重新登录」模式：账号名只读、隐藏分组、后端校验 uid 必须一致。
  */
 export function OAuthLoginModal({
   open,
   onClose,
   groups,
   onLogin,
+  relogin = null,
 }: {
   open: boolean;
   onClose: () => void;
@@ -25,7 +33,10 @@ export function OAuthLoginModal({
     callbackUrl: string,
     accountName?: string,
     groupId?: string,
+    expectUid?: string,
   ) => Promise<void>;
+  /** 传入即为「重新登录」模式：账号名只读、隐藏分组、后端校验 uid 必须一致 */
+  relogin?: ReloginTarget | null;
 }) {
   const [callbackUrl, setCallbackUrl] = useState('');
   const [accountName, setAccountName] = useState('');
@@ -43,8 +54,16 @@ export function OAuthLoginModal({
       setBusy(false);
       setOpening(false);
       setLoginUrl('');
+    } else if (relogin) {
+      // 重新登录模式：账号名预填为目标账号（只读展示），不带分组
+      setCallbackUrl('');
+      setAccountName(relogin.accountName);
+      setGid('');
+      setBusy(false);
+      setOpening(false);
+      setLoginUrl('');
     }
-  }, [open]);
+  }, [open, relogin?.userId, relogin?.accountName]);
 
   // 步骤①：获取授权页链接并新窗口打开（链接保留在状态里供「复制链接」复用）
   const openLoginPage = async () => {
@@ -78,6 +97,7 @@ export function OAuthLoginModal({
         callbackUrl.trim(),
         accountName.trim() || undefined,
         gid || undefined,
+        relogin?.userId,
       );
     } finally {
       setBusy(false);
@@ -88,7 +108,7 @@ export function OAuthLoginModal({
     <Modal
       open={open}
       onClose={onClose}
-      title="OAuth 登录"
+      title={relogin ? '重新登录（更新凭证）' : 'OAuth 登录'}
       footer={
         <>
           <button onClick={onClose} className="btn-ghost" disabled={busy || opening}>
@@ -105,6 +125,24 @@ export function OAuthLoginModal({
       }
     >
       <div className="space-y-4">
+        {/* 重新登录模式提示：目标账号只读展示，登错账号由后端按 uid 拦截 */}
+        {relogin && (
+          <div className="space-y-2">
+            <div className="flex items-start gap-2 rounded-md bg-sky-50 px-3 py-2 text-sm text-sky-700 dark:bg-sky-500/10 dark:text-sky-300">
+              <AlertTriangle size={16} className="mt-0.5 shrink-0" />
+              <span>
+                将为账号「<b>{relogin.accountName}</b>」（uid 尾号 {relogin.userId.slice(-6)}）
+                重新获取 JWT 与 refresh_token。请在打开的页面中登录<b>同一个账号</b>，
+                授权成功后自动更新该账号凭证，<b>不会新增账号</b>、分组与备注不变。
+              </span>
+            </div>
+            <p className="text-xs text-slate-500 dark:text-zinc-400">
+              若浏览器当前登录的是其他账号，请先在页面里退出后再登录目标账号；
+              登错账号会被自动拦截（uid 不一致直接取消，不改动任何数据）。
+              浏览器仍有 Trae 登录态时通常只需点一下「确认授权」，无需重新扫码。
+            </p>
+          </div>
+        )}
         {/* 三步说明 */}
         <ol className="space-y-2.5 text-sm text-slate-600 dark:text-zinc-300">
           <li className="flex items-start gap-2">
@@ -138,31 +176,35 @@ export function OAuthLoginModal({
         </ol>
 
         {/* 账号备注与分组 */}
-        <div className="grid gap-3 sm:grid-cols-2">
+        <div className={relogin ? 'grid gap-3' : 'grid gap-3 sm:grid-cols-2'}>
           <div>
-            <label className="label">账号备注名（可选）</label>
+            <label className="label">账号备注名{relogin ? '' : '（可选）'}</label>
             <input
               value={accountName}
               onChange={(e) => setAccountName(e.target.value)}
               className="input"
               placeholder="例如：me_1676"
+              readOnly={!!relogin}
+              disabled={!!relogin}
             />
           </div>
-          <div>
-            <label className="label">分组（可选）</label>
-            <select
-              value={gid}
-              onChange={(e) => setGid(e.target.value)}
-              className="input"
-            >
-              <option value="">不分组</option>
-              {groups.map((g) => (
-                <option key={g.id} value={g.id}>
-                  {g.name}
-                </option>
-              ))}
-            </select>
-          </div>
+          {!relogin && (
+            <div>
+              <label className="label">分组（可选）</label>
+              <select
+                value={gid}
+                onChange={(e) => setGid(e.target.value)}
+                className="input"
+              >
+                <option value="">不分组</option>
+                {groups.map((g) => (
+                  <option key={g.id} value={g.id}>
+                    {g.name}
+                  </option>
+                ))}
+              </select>
+            </div>
+          )}
         </div>
 
         {/* 回调 URL 粘贴框 */}

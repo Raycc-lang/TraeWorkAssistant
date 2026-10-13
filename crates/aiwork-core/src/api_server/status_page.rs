@@ -5,10 +5,11 @@
 //! 设计约束：
 //! - 无前端构建依赖：HTML/CSS/JS 以常量内嵌本模块，`GET /gw-status` 直接返回，
 //!   不引入静态文件服务与资产目录（桌面版数据目录结构保持不变）
-//! - 数据源全部复用既有端点：`/health`（免鉴权，含今日 token 汇总与双池 KPI）+
+//! - 数据源复用既有端点：`/health`（免鉴权，收敏后仅存活布尔，作探活点亮）+
 //!   `/status`、`/v1/models`（鉴权语义不变）；页面不新增任何后端路由与数据面
-//! - 鉴权策略零变化：`/gw-status` 与 `/health` 同等免鉴权（仅展示探活级汇总，
-//!   账号明细/模型目录仍需 API Key，浏览器无 Key 时对应区块提示输入）
+//! - 鉴权策略适配：`/gw-status` 免鉴权（静态页）；`/health` 收敏后不再携带
+//!   诊断字段，KPI 汇总改从需鉴权的 `/status` 拉取——无 Key 时探活圆点可亮、
+//!   统计卡显示占位提示，账号明细/模型目录仍需 API Key
 //! - 移动端适配：KPI 双列网格、表格横向滚动、输入框 16px 防 iOS 聚焦缩放
 
 /// 网关状态页（单文件，无外部资源引用，CSP 友好）
@@ -127,12 +128,38 @@ function authMsg(msg) {
 }
 
 async function loadHealth() {
+  // 免鉴权探活：/health 收敏后仅存活布尔，仅作圆点点亮；不可达才整页降级
   try {
-    const h = await j('/health');
+    await j('/health');
     $('dot').classList.add('on');
-    const p = h.pool || {}, w = h.wb || {}, t = h.tokens_today || {};
+  } catch (e) {
+    $('dot').classList.remove('on');
+    $('kpis-ov').innerHTML = kpi('网关状态', '不可达', 'bad');
+    $('kpis-trae').innerHTML = '';
+    $('sec-wb').style.display = 'none';
+    $('sec-err').style.display = 'none';
+    return;
+  }
+  // 收敏适配：KPI 数据改从需鉴权的 /status 拉（字段超集；summary/wb/tokens_today）
+  if (!key()) {
     $('kpis-ov').innerHTML =
-      kpi('总请求', fmtN(h.total_requests ?? 0), '', h.total_requests ?? 0) +
+      kpi('总请求', '—', '', '填入网关 API Key 查看统计') +
+      kpi('今日输入 token', '—', '', '填入网关 API Key 查看统计') +
+      kpi('今日输出 token', '—', '', '填入网关 API Key 查看统计');
+    $('kpis-trae').innerHTML =
+      kpi('可用账号', '—', '', '填入网关 API Key 查看统计') +
+      kpi('冷却 / 禁用', '—', '', '填入网关 API Key 查看统计') +
+      kpi('通用积分合计', '—', '', '填入网关 API Key 查看统计');
+    $('sec-wb').style.display = 'none';
+    $('sec-err').style.display = 'none';
+    return;
+  }
+  try {
+    const s = await j('/status');
+    authMsg(null);
+    const p = s.summary || {}, w = s.wb || {}, t = s.tokens_today || {};
+    $('kpis-ov').innerHTML =
+      kpi('总请求', fmtN(s.total_requests ?? 0), '', s.total_requests ?? 0) +
       kpi('今日输入 token', fmtN(t.prompt ?? 0), '', t.prompt ?? 0) +
       kpi('今日输出 token', fmtN(t.completion ?? 0), '', t.completion ?? 0);
     $('kpis-trae').innerHTML =
@@ -146,13 +173,18 @@ async function loadHealth() {
         kpi('冷却 / 禁用', `${w.cooling ?? 0} / ${w.disabled ?? 0}`, (w.cooling ?? 0) + (w.disabled ?? 0) > 0 ? 'warn' : '') +
         kpi('池总积分', fmtC(w.total_credits));
     } else $('sec-wb').style.display = 'none';
-    $('sec-err').style.display = h.last_error ? '' : 'none';
-    if (h.last_error) $('lasterr').textContent = h.last_error;
+    $('sec-err').style.display = s.last_error ? '' : 'none';
+    if (s.last_error) $('lasterr').textContent = s.last_error;
   } catch (e) {
-    $('dot').classList.remove('on');
-    $('kpis-ov').innerHTML = kpi('网关状态', '不可达', 'bad');
+    if (e.code === 401) {
+      authMsg('API Key 校验失败（HTTP 401）：请确认填入的是网关已启用的 API Key（管理面「API Keys」页可创建/查看），而不是管理面登录令牌；Key 被禁用同样返回 401。');
+    } else {
+      authMsg('统计数据加载失败：' + e.message);
+    }
+    $('kpis-ov').innerHTML = kpi('总请求', '—') + kpi('今日输入 token', '—') + kpi('今日输出 token', '—');
     $('kpis-trae').innerHTML = '';
     $('sec-wb').style.display = 'none';
+    $('sec-err').style.display = 'none';
   }
 }
 

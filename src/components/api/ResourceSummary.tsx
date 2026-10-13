@@ -94,6 +94,8 @@ function DispatchCenterCard({
   // per_model 新增绑定行（本地输入态，添加时才落 policy）
   const [newPerModelName, setNewPerModelName] = useState('');
   const [newPerModelOrder, setNewPerModelOrder] = useState(POOL_ORDERS[0]);
+  // 账号保留剩余积分（issue #91）输入草稿：null = 未编辑（展示 policy 生效值），onBlur 才落盘
+  const [reserveDraft, setReserveDraft] = useState<number | null>(null);
 
   useEffect(() => {
     api.apiServer
@@ -160,6 +162,9 @@ function DispatchCenterCard({
       // 审查 F2：乱序返回的旧响应丢弃，不 setState（仅最后一次请求生效）
       if (seq !== saveSeqRef.current) return;
       setPolicy(next);
+      // 审查修复（UX 硬性标准）：写操作成功同样要有可见反馈——此前仅失败 toast，
+      // 保存成功在 UI 上无任何提示（数值本身就是旧值→新值的静默变化）
+      toast('success', '调度策略已保存');
     } catch (e) {
       if (seq !== saveSeqRef.current) return;
       toast('error', `调度策略保存失败：${String(e).slice(0, 120)}`);
@@ -274,9 +279,51 @@ function DispatchCenterCard({
             />
             首选池不可用时跨池回退
           </label>
+          {/* issue #90 修复③a：多源同名模型来源标识（/v1/models 池前缀别名条目） */}
+          <label
+            className="flex items-center gap-1.5 text-slate-500 dark:text-zinc-400"
+            title="/v1/models 为多源同名模型附带 trae/xxx、buddy/xxx、qoder/xxx 别名条目，客户端可按前缀点名指定池（三家同名模型倍率与效果不同）；关闭时目录保持原形态"
+          >
+            <input
+              type="checkbox"
+              checked={policy.model_source_labels}
+              onChange={(e) => void savePolicy({ model_source_labels: e.target.checked })}
+            />
+            模型目录标注来源池
+          </label>
+          <label
+            className="flex items-center gap-2"
+            title="剩余积分低于或等于该值的账号暂停调度（切换其他账号），防止积分被耗尽后免费模型也不可用；0 = 关闭"
+          >
+            <span className="text-slate-400 dark:text-zinc-500">账号保留剩余积分</span>
+            <input
+              type="number"
+              className={`${selectCls} w-20`}
+              min={0}
+              step={1}
+              value={reserveDraft ?? policy.reserve_credits}
+              disabled={saving}
+              onChange={(e) => {
+                // 空串：Number('') = 0 会静默把保留额改成「关闭」，此处按空草稿
+                // 处理交由 blur 判定（清空 = 恢复当前值，不改配置）
+                setReserveDraft(e.target.value === '' ? null : (Number.isFinite(Number(e.target.value)) ? Number(e.target.value) : 0));
+              }}
+              onBlur={() => {
+                const v = reserveDraft;
+                if (v != null && v !== policy.reserve_credits) {
+                  void savePolicy({ reserve_credits: Math.max(0, v) });
+                }
+                setReserveDraft(null);
+              }}
+            />
+            <span className="text-slate-400 dark:text-zinc-500">积分</span>
+          </label>
         </div>
         <p className="mt-1.5 text-[11px] text-slate-400 dark:text-zinc-500">
           智能调度按请求模型对可用池排序：积分先到期优先 → 免费 / 倍率小优先 → 剩余积分多优先；全并列时按上方优先级序。
+        </p>
+        <p className="mt-1 text-[11px] text-slate-400 dark:text-zinc-500">
+          账号保留剩余积分：剩余 ≤ 阈值的账号暂停调度（默认 50，0 = 关闭），防止积分被调度耗尽后免费模型也不可用。
         </p>
 
         {/* ②+ per_model 模型绑定（DispatchPolicy.per_model）：显式为单个模型固定

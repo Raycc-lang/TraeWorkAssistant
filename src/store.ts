@@ -122,7 +122,12 @@ interface AppState {
   cooldownClear: (userId: string) => Promise<void>;
   refreshJwt: (userId: string, force?: boolean) => Promise<void>;
   saveSettings: (patch: Partial<Settings>) => Promise<void>;
-  oauthLogin: (callbackUrl: string, accountName?: string, groupId?: string) => Promise<void>;
+  oauthLogin: (
+    callbackUrl: string,
+    accountName?: string,
+    groupId?: string,
+    expectUid?: string,
+  ) => Promise<void>;
 
   pushToast: (kind: ToastKind, msg: string) => void;
   dismissToast: (id: number) => void;
@@ -207,6 +212,14 @@ function defaultSettings(): Settings {
     trae_checkin_gap_secs: 3,
     wb_checkin_gap_secs: 3,
     qoder_checkin_gap_secs: 3,
+    // Qoder 调度默认值（对齐 main；docker 后端调度走 scheduler_cfg，settings_get
+    // 暂不回传这些字段，QoderSettings 等组件读取时按此兜底）
+    qoder_checkin_hhmm: '10:15',
+    qoder_credits_sync_hhmm: '23:40',
+    qoder_credits_sync_enabled: true,
+    qoder_credits_sync_mode: 'every_hours',
+    qoder_credits_sync_hours: '2',
+    qoder_token_renew_enabled: true,
   };
 }
 
@@ -722,9 +735,9 @@ export const useAppStore = create<AppState>((set, get) => ({
       throw err;
     }
   },
-  oauthLogin: async (callbackUrl, accountName, groupId) => {
+  oauthLogin: async (callbackUrl, accountName, groupId, expectUid) => {
     try {
-      const result = await api.oauth.login(callbackUrl, accountName, groupId);
+      const result = await api.oauth.login(callbackUrl, accountName, groupId, expectUid);
       await get().refreshAccounts();
       // 同 uid 合并场景如实提示「更新已有账号」而非「已添加」（issue #80）
       if (result.merged) {

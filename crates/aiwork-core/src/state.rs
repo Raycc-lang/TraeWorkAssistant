@@ -205,6 +205,13 @@ pub struct AppState {
     /// （命令线程/后台刷新线程/调度器三方并发）持锁执行，防旧副本整文档覆盖
     /// 丢账号（lost-update）；长窗口网络调用（回填/续期）在锁外完成后短临界区写回
     pub wb_pool_lock: Arc<Mutex<()>>,
+    /// 组织定义（groups / tags 行文档表）读-改-写互斥：shared_groups 的
+    /// create/update/delete、tags 的 create/update/delete、qoder 导入的 defs
+    /// 合并、account_tags_set 的校验+写入全部持锁执行，杜绝并发「load→save」
+    /// 互相覆盖（丢新分组/丢新标签/复活已删项）与「校验后删除」幽灵 TOCTOU。
+    /// 锁序固定「池锁 → defs锁」：需要双锁的路径（qoder 导入、账号 move 复检）
+    /// 先持池锁再持本锁（单向嵌套）；本锁为叶子锁，之下不再嵌套其他锁
+    pub group_defs_lock: Arc<Mutex<()>>,
     /// 事件广播通道（Web 版事件出口）：scheduler 等后台模块 emit 看板刷新等
     /// 软通知，aiwork-server 的 admin events（WS/SSE）订阅转发给前端。
     /// None（启动早期/未注入）时 emit 静默丢弃——事件不参与业务正确性
@@ -248,6 +255,7 @@ impl AppState {
             jwt_refresh_lock: Arc::new(Mutex::new(())),
             qoder_pool_lock: Arc::new(Mutex::new(())),
             wb_pool_lock: Arc::new(Mutex::new(())),
+            group_defs_lock: Arc::new(Mutex::new(())),
             events: Arc::new(Mutex::new(None)),
         })
     }
@@ -260,6 +268,7 @@ impl AppState {
             jwt_refresh_lock: Arc::new(Mutex::new(())),
             qoder_pool_lock: Arc::new(Mutex::new(())),
             wb_pool_lock: Arc::new(Mutex::new(())),
+            group_defs_lock: Arc::new(Mutex::new(())),
             events: Arc::new(Mutex::new(None)),
         }
     }

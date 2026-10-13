@@ -11,7 +11,8 @@ use super::usage::KeyId;
 use super::ApiSharedState;
 
 /// API Key 鉴权中间件：
-/// - /health 跳过鉴权
+/// - /health 跳过鉴权（无条件豁免：响应已收敏为 status/running 存活布尔，完整诊断在需鉴权的 /status；
+///   容器 HEALTHCHECK 与状态页探活均无凭据直打本端点，环回条件豁免会在 0.0.0.0 监听下失效）
 /// - Key 注册表存 vault（加密），内存权威副本 + flusher 落盘（批次 E），
 ///   支持 Authorization: Bearer <key>（OpenAI 风格）或 x-api-key: <key>（Anthropic 风格）
 /// - 存在启用 Key 时必须鉴权；无任何启用 Key 时：auth_disabled=true（显式关闭鉴权）放行记 anonymous，
@@ -25,10 +26,14 @@ pub async fn bearer_auth(
     mut request: Request,
     next: Next,
 ) -> Response {
-    // 网关状态页免鉴权：页面为静态 HTML，/health 仅输出聚合探活级汇总
-    // （池计数 / 通用积分合计 / 今日 token 三池合计，无账号级明细）；
-    // 账号明细与模型目录由浏览器另行请求鉴权端点获得
-    if request.uri().path() == "/gw-status" || request.uri().path() == "/health" {
+    // 网关状态页免鉴权：页面为静态 HTML。/health 无条件豁免（2026-10-12 审查
+    // P1 修复）：响应已收敏为存活布尔（见 routes::health），无泄漏面；容器
+    // HEALTHCHECK（Dockerfile）与状态页探活圆点均无凭据直打 /health，而容器
+    // 强制 0.0.0.0 非环回监听（docker-compose）——若按「仅环回豁免」，非环回
+    // 下鉴权强制生效，开箱即 401：容器恒 unhealthy、状态页整页降级「不可达」。
+    // 完整诊断仍在需鉴权的 GET /status，豁免不扩大暴露面。/gw-status 为静态
+    // HTML，维持豁免
+    if matches!(request.uri().path(), "/gw-status" | "/health") {
         return next.run(request).await;
     }
 

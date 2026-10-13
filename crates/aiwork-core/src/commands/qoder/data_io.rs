@@ -405,11 +405,11 @@ pub fn qoder_accounts_import(
     let store = crate::store::db(&state.data_dir);
     // P0 需求①：分组定义统一读共享 groups 表；导出载荷携带的 groups（旧版无此
     // 字段则跳过）按 id 幂等合并进共享定义——本地已有同 id 分组保留本地定义
-    //（用户可能已改名），仅补缺失。持池锁执行防读改写竞争。
-    // 审查修复：defs 表整删全写模型，RMW 全程加持 org_defs_lock（锁序「池→本」
-    // 单向嵌套的合法情形：此处已持 qoder_pool_lock）
+    //（用户可能已改名），仅补缺失。持池锁 + group_defs_lock 双锁执行（锁序
+    // 池锁→defs锁）：与并发导入互斥防池覆盖丢账号；与并发 shared_groups
+    // create/update/delete 互斥防 defs「load→save」互相覆盖丢新分组。
     let defs: Vec<crate::models::Group> = {
-        let _org = crate::store::docs::org_defs_lock();
+        let _defs_guard = state.group_defs_lock.lock().unwrap_or_else(|e| e.into_inner());
         let mut defs: Vec<crate::models::Group> = crate::store::docs::group_defs_load(&store);
         if let Some(groups) = payload.get("groups").and_then(Value::as_array) {
             let mut defs_changed = false;
@@ -436,8 +436,15 @@ pub fn qoder_accounts_import(
     // 凭证已落库而池条目丢失，产生列表不可见、移除接口原先拒绝清理的孤儿凭证。
     // 调序后最坏情况是凭证单条失败（rejected 聚合、重新导入可补齐），语义不变
     let mut cred_writes: Vec<(String, crate::tasks::qoder_common::QoderCreds)> = Vec::new();
-    // 标签绑定恢复（P2 需求③）：仅本机已存在的 tag id，未知 id 忽略不自动创建
-    let tag_defs = crate::store::docs::tags_load(&store);
+    // 标签绑定恢复（P2 需求③）：仅本机已存在的 tag id，未知 id 忽略不自动创建。
+    // defs 短锁内读取：与并发标签增删的 RMW 快照一致
+    let tag_defs = {
+        let _defs = state
+            .group_defs_lock
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::store::docs::tags_load(&store)
+    };
     let mut tag_bindings: Vec<(String, Vec<String>)> = Vec::new();
     let mut tags_ignored = 0usize;
     for a in accounts {
@@ -475,20 +482,33 @@ pub fn qoder_accounts_import(
         }
     }
     save_pool(state, &pool)?;
-    // 标签绑定落 account_tags 表（uid 键跨池通用）。审查 P1：单条失败聚合进
-    // rejected 不中断——原实现 `?` 中断会跳过后续凭证回写 + invalidate + reload，
-    // 账号已入池而成半成品状态；tags_restored 只计成功写入，失败条目重新导入可补齐
+    // 标签绑定落 account_tags 表（uid 键跨池通用）：走 account_tags_set_inner
+    // （持 group_defs_lock 校验标签存在性）而非盲写——收集→落库窗口内被并发
+    // 删除的标签按「未知标签忽略」记数（并入 tags_ignored 汇总日志），不再写入
+    // 指向已删标签的幽灵绑定。持池锁期间取 defs 锁（锁序池锁→defs锁）。
+    // 其余落库失败仍聚合进 rejected 不中断（同前口径），tags_restored 只计成功
     let mut tags_restored = 0usize;
     for (uid, ids) in &tag_bindings {
-        match crate::store::docs::account_tags_set(&store, uid, ids) {
-            Ok(()) => tags_restored += 1,
+        match crate::commands::tags::account_tags_set_inner(state, uid, ids) {
+            Ok(()) => tags_restored += ids.len(),
+            Err(e) if e.starts_with("标签不存在") => {
+                tags_ignored += ids.len();
+                fs_utils::app_log(
+                    &state.data_dir,
+                    &format!("qoder 导入: 标签绑定跳过（落库时标签已被并发删除，按未知标签忽略）uid={uid}: {e}"),
+                );
+            }
             Err(e) => rejected.push(serde_json::json!({
                 "id": uid,
-                "reason": format!("账号已入池，但标签绑定恢复失败：{e}（重新导入可补齐）"),
+                "reason": format!("账号已入池，但标签绑定落库失败：{e}（重新导入可补齐）"),
             })),
         }
     }
     crate::api_server::org_index::invalidate(&state.data_dir);
+    // 明示不修（2026-10-12 审查 P6）：导入对既有账号的分组/标签绑定覆盖为
+    // 「导入文件权威」语义——导出文件是账号元数据的完整快照，导入即恢复快照
+    // （与 WB/Trae 导入口径一致）；需保留本地改动应走「本地改后不重导」。
+    // 如未来改为「本地优先」，三池须同步改，避免口径分裂。
     for (final_id, creds) in cred_writes {
         // 单账号凭证落库失败不中断整体（部分导入比整体中断更糟）：
         // 聚合进 rejected 继续导入；账号信息已入池，重新导入可补齐凭证
@@ -505,7 +525,7 @@ pub fn qoder_accounts_import(
     fs_utils::app_log(
         &state.data_dir,
         &format!(
-            "qoder: 账号池导入 新增 {added} / 更新 {updated} / 带凭证 {with_cred} / 标签绑定恢复 {tags_restored}（未知标签忽略 {tags_ignored}）/ 拒绝 {}{}",
+            "qoder: 账号池导入 新增 {added} / 更新 {updated} / 带凭证 {with_cred} / 拒绝 {} / 标签绑定恢复 {tags_restored}（未知标签忽略 {tags_ignored}）{}",
             rejected.len(),
             if plaintext_credentials { " / 明文凭证文件（迁移提示）" } else { "" },
         ),

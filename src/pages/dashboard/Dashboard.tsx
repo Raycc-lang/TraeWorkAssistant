@@ -510,6 +510,14 @@ export default function CreditsDashboard({ platform }: { platform: 'trae' | 'bud
 
   const today = localDate(new Date());
 
+  // Trae 筛选态「今日新增」按账号明细推导结果（skippedDates = 老快照行缺 accounts
+  // 明细被跳过的日数，仅历史迁移前行会命中，今日恒有明细）。提升为独立 memo 供
+  // KPI 数值与 earnedHint 口径标注共用，避免为取标注重复推导
+  const traeFilteredEarned = useMemo(
+    () => (visibleUids ? traeEarnedByDateFiltered(creditsDaily, visibleUids) : null),
+    [creditsDaily, visibleUids],
+  );
+
   // ---- Trae KPI（口径对齐原积分看板）----
   const traeKpi = useMemo<PlatformKpi>(() => {
     const nowSec = Date.now() / 1000;
@@ -534,8 +542,8 @@ export default function CreditsDashboard({ platform }: { platform: 'trae' | 'bud
     const snap = creditsDaily.find((s) => s.date === today);
     // 审查修复：有账号筛选时按筛选口径取数（快照 accounts 明细，与积分统计 Tab 同源），
     // 无明细的老快照按过滤跳过；无筛选时保持原快照口径
-    const todayEarned = visibleUids
-      ? (traeEarnedByDateFiltered(creditsDaily, visibleUids).byDate.get(today) ?? 0)
+    const todayEarned = traeFilteredEarned
+      ? (traeFilteredEarned.byDate.get(today) ?? 0)
       : snap && snap.earned > 0
         ? snap.earned
         : 0;
@@ -557,7 +565,7 @@ export default function CreditsDashboard({ platform }: { platform: 'trae' | 'bud
       todayConsumed,
       expiring7d: expiring,
     };
-  }, [visibleAccounts, visibleUids, creditsDaily, visibleUsage, today]);
+  }, [visibleAccounts, traeFilteredEarned, creditsDaily, visibleUsage, today]);
 
   // Trae「可用积分总数」卡细分（对齐原积分看板 totalHint）；账号无通用/Work 字段时回退通用文案
   const traeTotalHint = useMemo(() => {
@@ -685,7 +693,9 @@ export default function CreditsDashboard({ platform }: { platform: 'trae' | 'bud
   const qoderTodaySnap = qoderSnapshots.find((s) => s.date === today);
   const qoderLastSnapDate = qoderSnapshots.reduce<string | null>((acc, s) => (!acc || s.date > acc ? s.date : acc), null);
   const earnedHint = isTrae
-    ? undefined
+    ? filtersActive && traeFilteredEarned && traeFilteredEarned.skippedDates > 0
+      ? '筛选口径 · 部分老快照日缺账号明细未计入推导'
+      : undefined
     : isQoder
       ? qoderTodaySnap?.earned != null
         ? '口径：当日签到奖励合计'
@@ -827,6 +837,16 @@ export default function CreditsDashboard({ platform }: { platform: 'trae' | 'bud
               title="当前数据源为聚合口径（无账号维度），筛选仅作用于 KPI 与到期日历；消耗/Token 明细不做静默截断"
             >
               该数据源不支持账号级筛选
+            </span>
+          )}
+          {/* 会话明细 Tab：顶部筛选仅收窄账号候选下拉、不进查询参数（后端 user_id 单值）——
+              此前徽标豁免会话 Tab，用户误以为已按组过滤。明示语义断层（2026-10-12 审查） */}
+          {filtersActive && tab === 'sessions' && (
+            <span
+              className="inline-flex items-center rounded-full bg-amber-100 px-2.5 py-0.5 text-[11px] font-medium text-amber-700 dark:bg-amber-900/40 dark:text-amber-300"
+              title="顶部分组/账号筛选仅收窄会话页的账号候选下拉，不直接过滤查询结果；请使用会话页内的筛选行（时间/账号/模型）过滤"
+            >
+              顶部筛选仅收窄账号候选，会话结果按页内筛选过滤
             </span>
           )}
           <button className="btn-outline" onClick={() => void refresh(true)} disabled={loading}>

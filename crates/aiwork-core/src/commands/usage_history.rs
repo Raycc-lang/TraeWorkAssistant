@@ -286,8 +286,11 @@ fn fetch_chunk(
             "usage_type": [USAGE_TYPE],
         });
         let resp = web_usage_post(agent, jwt, USAGE_URL, body)?;
+        // total 字段缺失时不写入哨兵 0（G9）：保持 None，终止条件按满页判断继续
         if total.is_none() {
-            total = Some(resp.get("total").and_then(Value::as_u64).unwrap_or(0) as usize);
+            if let Some(n) = resp.get("total").and_then(Value::as_u64) {
+                total = Some(n as usize);
+            }
         }
         let arr = resp
             .get("user_usage_group_by_sessions")
@@ -687,6 +690,9 @@ pub struct UsageSessionView {
     pub cache_read_tokens: u64,
     pub cache_write_tokens: u64,
     pub preview: String,
+    /// 轮键（Qoder 侧 chat_record_id；Trae/Buddy 上游无此字段恒空）。
+    /// 同一段消息 + 同一模型 + 同一输出上限派生同值——「展开会话看各轮」分组用
+    pub record_id: String,
 }
 
 #[derive(Serialize, Clone, Default)]
@@ -763,6 +769,7 @@ pub fn usage_sessions_query(
                     cache_read_tokens: r.cache_read_tokens,
                     cache_write_tokens: r.cache_write_tokens,
                     preview: r.preview.clone(),
+                    record_id: String::new(),
                 });
             }
         }

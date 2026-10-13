@@ -28,6 +28,7 @@ const TASK_DESC: Record<string, string> = {
   'qoder-refresh': '每 6 小时为全部账号续期登录凭证（固定周期，不受时刻配置影响）',
   'qoder-credits-snapshot': '积分余额每日快照，补齐积分看板消耗趋势',
   'qoder-catalog-sync': '同步 Qoder 上游模型目录（不消耗积分），供网关模型映射使用',
+  'qoder-sessions-compact': '每 6 小时合并历史会话流水为聚合行（固定周期，保留近 3 天请求级明细）',
 };
 
 /** 可配置「每小时/每N小时」模式的任务（看板数据同步类，与服务端 HOURLY_CAPABLE 对齐） */

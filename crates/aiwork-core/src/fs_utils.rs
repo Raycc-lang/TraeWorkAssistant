@@ -95,8 +95,67 @@ pub fn now_ts() -> String {
     chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string()
 }
 
-pub fn today_prefix() -> String {
+/// 宽松时间解析到 Unix 秒（`credits_fetched_at` 等时间戳字段的唯一入口）。
+///
+/// 背景（issue #91 审查）：本机生产的时间戳串多为 `chrono::Local` 裸串
+/// （`now_iso()` → `2026-09-15T10:00:00`、`now_ts()` → `2026-09-15 10:00:00`），
+/// **不带时区偏移**，而 `DateTime::parse_from_rfc3339` 强制要求偏移 → 恒失败。
+/// 此前 `api_server/runtime.rs` 只走 rfc3339 一臂，导致 reserve 过滤与 24h 陈旧
+/// 判定在生产环境结构性失效（单测直接构造 `Some(i64)` 掩盖了该问题）。
+///
+/// 解析顺序（由严到宽）：rfc3339 → 带小数秒/无小数秒的 naive 串（按本机
+/// Local 时区解释，与写入侧 `chrono::Local` 同口径）→ 纯日期（当天 23:59:59）。
+/// 无法识别返回 None（调用方按「无时间信息」fail-open 处理）。
+pub fn parse_ts_loose(s: &str) -> Option<i64> {
+    use chrono::TimeZone;
+    let s = s.trim();
+    if s.is_empty() {
+        return None;
+    }
+    if let Ok(d) = chrono::DateTime::parse_from_rfc3339(s) {
+        return Some(d.timestamp());
+    }
+    for fmt in [
+        "%Y-%m-%d %H:%M:%S%.f",
+        "%Y-%m-%dT%H:%M:%S%.f",
+        "%Y-%m-%d %H:%M:%S",
+        "%Y-%m-%dT%H:%M:%S",
+        "%Y-%m-%d %H:%M",
+        "%Y-%m-%dT%H:%M",
+    ] {
+        if let Ok(d) = chrono::NaiveDateTime::parse_from_str(s, fmt) {
+            return chrono::Local.from_local_datetime(&d).single().map(|t| t.timestamp());
+        }
+    }
+    // 纯日期：按当天 23:59:59 计（避免凌晨 0 点把当日快照误判为「已过期」）
+    if let Ok(d) = chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d") {
+        return chrono::Local
+            .from_local_datetime(&d.and_hms_opt(23, 59, 59)?)
+            .single()
+            .map(|t| t.timestamp());
+    }
+    None
+}
+
+/// 业务日期（YYYY-MM-DD）：日期串生产与消费的**唯一**入口。
+///
+/// 此前 `usage.rs::today_key()`、`today_prefix()`、`qoder_sessions_compact()`、
+/// `qoder_sessions_prune()` 四处各自 `chrono::Local::now().date_naive()`，
+/// 任一侧漂移都会让「当日/保留窗」边界与已落库行的 date 键错开一天。
+///
+/// 时区说明：以本机 Local 为准（与已落库的历史 date 键同口径，升级不断裂）。
+/// docker 部署若需与桌面（默认 UTC+8）保持同一日界，请在容器设置 `TZ=Asia/Shanghai`。
+pub fn today_key() -> String {
     chrono::Local::now().format("%Y-%m-%d").to_string()
+}
+
+/// 业务日期（chrono 形态，`today_key()` 的同源版本，供需要日期算术的调用方使用）
+pub fn business_today() -> chrono::NaiveDate {
+    chrono::Local::now().date_naive()
+}
+
+pub fn today_prefix() -> String {
+    today_key()
 }
 
 /// 按保留天数清理日志文件（proxy / checkin / switcher / app）。
@@ -244,5 +303,42 @@ mod fs_path_tests {
             path(&n, &["ResponseMetadata", "Error", "Code"]).and_then(|x| x.as_i64()),
             Some(20403)
         );
+    }
+
+    /// issue #91 回归：`credits_fetched_at` 链路一度只走严格 rfc3339 解析，而本机
+    /// 生产的偏偏是 `now_iso()`/`now_ts()` 的**无偏移本地裸串** → 恒 None →
+    /// reserve 保留额过滤与 24h 陈旧判定在生产环境结构性失效（单测直接构造
+    /// `Some(i64)` 掩盖）。此处锁定「本机写入 → 能解析回时间戳」这条真实链路。
+    #[test]
+    fn parse_ts_loose_accepts_locally_produced_naive_strings() {
+        // now_iso(): 2026-09-15T10:00:00（无偏移）——rfc3339 解析必失败的那一种
+        assert!(chrono::DateTime::parse_from_rfc3339("2026-09-15T10:00:00").is_err());
+        assert_eq!(
+            parse_ts_loose("2026-09-15T10:00:00"),
+            parse_ts_loose("2026-09-15 10:00:00"),
+            "两种分隔符应等价"
+        );
+        // now_ts(): 空格分隔裸串
+        assert!(parse_ts_loose("2026-09-15 10:00:00").is_some());
+        // 往返：本机 now_iso()/now_ts() 产出必须可解析（正是生产端的形态）
+        assert!(parse_ts_loose(&now_iso()).is_some(), "now_iso() 必须可解析");
+        assert!(parse_ts_loose(&now_ts()).is_some(), "now_ts() 必须可解析");
+        // 带偏移 / Z 结尾仍走严格臂
+        let with_z = parse_ts_loose("2026-09-15T10:00:00Z");
+        let with_off = parse_ts_loose("2026-09-15T10:00:00+08:00");
+        assert!(with_z.is_some() && with_off.is_some());
+        assert_eq!(with_z.unwrap() - with_off.unwrap(), 8 * 3600);
+        // 小数秒
+        assert!(parse_ts_loose("2026-09-15T10:00:00.500").is_some());
+        // 纯日期回退当日 23:59:59（不得被判为 Nil）
+        assert!(parse_ts_loose("2026-09-15").is_some());
+        // 非法输入 fail-open：None（不得 panic）
+        for bad in ["", "   ", "not-a-time", "2026/09/15 10:00"] {
+            assert!(parse_ts_loose(bad).is_none() || !bad.trim().is_empty());
+        }
+        assert_eq!(parse_ts_loose(""), None);
+        assert_eq!(parse_ts_loose("not-a-time"), None);
+        // 前后空白容忍
+        assert!(parse_ts_loose("  2026-09-15 10:00:00  ").is_some());
     }
 }

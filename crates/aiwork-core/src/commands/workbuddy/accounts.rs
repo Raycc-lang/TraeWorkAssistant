@@ -179,11 +179,23 @@ pub fn workbuddy_account_remove(state: &AppState, user_id: String, delete_snapsh
         // 且账号列表徽标虽随池删除消失，孤儿目录持续占用磁盘。
         let slot = state.data_dir.join("data").join("profiles_workbuddy").join(&user_id);
         if slot.is_dir() {
-            let _ = std::fs::remove_dir_all(&slot);
+            // 审查修复：删除失败此前完全静默（用户点了「连同快照删除」却仍占磁盘
+            // 且无从得知），统一补 app_log
+            if let Err(e) = std::fs::remove_dir_all(&slot) {
+                fs_utils::app_log(
+                    &state.data_dir,
+                    &format!("WorkBuddy 账号 {user_id} 快照槽清理失败（路径 {}）: {e}", slot.display()),
+                );
+            }
         }
         let slot_cb = state.data_dir.join("data").join("profiles_codebuddy").join(&user_id);
         if slot_cb.is_dir() {
-            let _ = std::fs::remove_dir_all(&slot_cb);
+            if let Err(e) = std::fs::remove_dir_all(&slot_cb) {
+                fs_utils::app_log(
+                    &state.data_dir,
+                    &format!("WorkBuddy 账号 {user_id} CodeBuddy 快照槽清理失败（路径 {}）: {e}", slot_cb.display()),
+                );
+            }
         }
     }
     // 被删账号是 CodeBuddy CLI 当前号 → 清理轮换状态残留（active_account_id），
@@ -191,7 +203,12 @@ pub fn workbuddy_account_remove(state: &AppState, user_id: String, delete_snapsh
     let mut st = load_cli_rotate_state(state);
     if st.active_account_id.as_deref() == Some(user_id.as_str()) {
         st.active_account_id = None;
-        let _ = save_cli_rotate_state(state, &st);
+        if let Err(e) = save_cli_rotate_state(state, &st) {
+            fs_utils::app_log(
+                &state.data_dir,
+                &format!("WorkBuddy 账号 {user_id} 轮换状态清理失败: {e}"),
+            );
+        }
     }
     Ok(())
 }
@@ -660,10 +677,24 @@ pub fn workbuddy_accounts_import(state: &AppState, payload: serde_json::Value) -
     // 循环内 upsert_token_store 与池锁无嵌套，持锁调用无死锁（同 qoder data_io 先例）
     let _guard = state.wb_pool_lock.lock().unwrap_or_else(|e| e.into_inner());
     let mut pool = load_pool(state);
-    // 标签绑定恢复（P2 需求③）：读入文件中的 tags，循环结束后按最终账号 id
-    // 落 account_tags 表（仅本机已存在的 tag id，未知 id 忽略不自动创建）。
-    // 收集逻辑下沉共享（审查 P7）：crate::commands::tags::collect_import_tags
-    let tag_defs = crate::store::docs::tags_load(&crate::store::db(&state.data_dir));
+    // 标签绑定恢复（P2 需求③）+ 幽灵分组防御（对齐 qoder 导入侧）：两个 defs
+    // 读取同在 group_defs_lock 短锁内（2026-10-12 审查 P6 修复，对齐蓝本锁纪律，
+    // 与并发标签/分组增删的 RMW 快照一致）。tag_defs 供循环结束后按最终账号 id
+    // 落 account_tags 表（仅本机已存在的 tag id，未知 id 忽略不自动创建，收集
+    // 逻辑下沉共享 crate::commands::tags::collect_import_tags）；valid_group_ids
+    // 兜底新增条目指向不存在分组的 group_id（异机导入未随载荷携带定义/本地已删
+    // 分组）回落「未分组」——聚合落空的幽灵引用不如显式未分组
+    let (tag_defs, valid_group_ids) = {
+        let _defs = state.group_defs_lock.lock().unwrap_or_else(|e| e.into_inner());
+        let db = crate::store::db(&state.data_dir);
+        let tag_defs = crate::store::docs::tags_load(&db);
+        let valid_group_ids: std::collections::HashSet<String> =
+            crate::store::docs::group_defs_load(&db)
+                .into_iter()
+                .map(|g| g.id)
+                .collect();
+        (tag_defs, valid_group_ids)
+    };
     let mut tag_bindings: Vec<(String, Vec<String>)> = Vec::new();
     let mut tags_ignored = 0usize;
     // 凭证写入先收集、落池成功后再执行（审查 P2）：原实现循环内直接落库，某条
@@ -720,6 +751,13 @@ pub fn workbuddy_accounts_import(state: &AppState, payload: serde_json::Value) -
             }
             continue;
         }
+        // 新增条目 group_id 指向不存在分组 → 回落「未分组」（空串）
+        let entry_gid = a.get("group_id").and_then(|v| v.as_str()).unwrap_or_default().to_string();
+        let entry_gid = if entry_gid.is_empty() || valid_group_ids.contains(&entry_gid) {
+            entry_gid
+        } else {
+            String::new()
+        };
         pool.accounts.push(WorkBuddyAccount {
             id: id.clone(),
             uid: entry_uid,
@@ -728,7 +766,7 @@ pub fn workbuddy_accounts_import(state: &AppState, payload: serde_json::Value) -
             edition_type: a.get("edition_type").and_then(|v| v.as_str()).unwrap_or_default().to_string(),
             access_token_expires_at: a.get("access_token_expires_at").and_then(|v| v.as_i64()),
             refresh_token_expires_at: a.get("refresh_token_expires_at").and_then(|v| v.as_i64()),
-            group_id: a.get("group_id").and_then(|v| v.as_str()).unwrap_or_default().to_string(),
+            group_id: entry_gid,
             note: a.get("note").and_then(|v| v.as_str()).unwrap_or_default().to_string(),
             auth_saved_at: Some(chrono::Utc::now().timestamp()),
             ..Default::default()
@@ -753,24 +791,36 @@ pub fn workbuddy_accounts_import(state: &AppState, payload: serde_json::Value) -
             })),
         }
     }
-    // 标签绑定落 account_tags 表（uid 键跨池通用；池锁仍持有——账号与标签同批恢复）。
-    // 审查 P1 同口径：单条失败聚合进 rejected 不中断，tags_restored 只计成功写入
-    let store = crate::store::db(&state.data_dir);
+    // 标签绑定落 account_tags 表（uid 键跨池通用；池锁仍持有——账号与标签同批恢复）：
+    // 走 account_tags_set_inner（持 group_defs_lock 校验标签存在性）而非盲写——
+    // 收集→落库窗口内被并发删除的标签按「未知标签忽略」记数 + 日志，不再写入
+    // 指向已删标签的幽灵绑定。持池锁期间取 defs 锁（锁序池锁→defs锁）
     let mut tags_restored = 0usize;
     for (uid, ids) in &tag_bindings {
-        match crate::store::docs::account_tags_set(&store, uid, ids) {
-            Ok(()) => tags_restored += 1,
+        match crate::commands::tags::account_tags_set_inner(&state, uid, ids) {
+            Ok(()) => tags_restored += ids.len(),
+            Err(e) if e.starts_with("标签不存在") => {
+                tags_ignored += ids.len();
+                fs_utils::app_log(
+                    &state.data_dir,
+                    &format!("workbuddy 导入: 标签绑定跳过（落库时标签已被并发删除，按未知标签忽略）uid={uid}: {e}"),
+                );
+            }
             Err(e) => rejected.push(serde_json::json!({
                 "id": uid,
-                "reason": format!("账号已入池，但标签绑定恢复失败：{e}（重新导入可补齐）"),
+                "reason": format!("账号已入池，但标签绑定落库失败：{e}（重新导入可补齐）"),
             })),
         }
     }
     fs_utils::app_log(
         &state.data_dir,
-        &format!("workbuddy: 账号库导入 新增 {added} / 更新 {updated} / 带凭证 {with_cred} / 标签绑定恢复 {tags_restored}（未知标签忽略 {tags_ignored}）/ 拒绝 {}", rejected.len()),
+        &format!("workbuddy: 账号库导入 新增 {added} / 更新 {updated} / 带凭证 {with_cred} / 拒绝 {} / 标签绑定恢复 {tags_restored}（未知标签忽略 {tags_ignored}）", rejected.len()),
     );
     crate::api_server::org_index::invalidate(&state.data_dir);
+    // 网关池热重载（对齐 Trae accounts_import / qoder data_io 口径）：新增/更新
+    // 账号凭证后不重载，运行中的网关看不到新凭证。先释放池锁（锁序纪律）
+    drop(_guard);
+    crate::api_server::runtime::reload_pools_after_change(state);
     // skipped 保留为旧版前端兼容字段：旧语义「同 id 跳过」已改为按 uid 原位合并（updated）
     Ok(serde_json::json!({
         "added": added,
