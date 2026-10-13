@@ -75,7 +75,7 @@ impl CaAuthority {
         let not_before = OffsetDateTime::now_utc() - Duration::days(1);
         // rcgen 0.14：new() 接受字符串 SAN，内部自动识别 IP 地址
         let mut params = CertificateParams::new(vec![host.to_string()])
-            .map_err(|e| format!("leaf certificate params invalid for {host}: {e}"))?;
+            .map_err(|e| format!("叶子证书参数构造失败（host={host}）: {e}"))?;
         params.distinguished_name.push(DnType::CommonName, host);
         params.not_before = not_before;
         params.not_after = not_before + Duration::days(3650);
@@ -86,17 +86,17 @@ impl CaAuthority {
 
         let cert = params
             .signed_by(&self.leaf_key, &self.issuer)
-            .map_err(|e| format!("failed to sign leaf certificate for {host}: {e}"))?;
+            .map_err(|e| format!("叶子证书签发失败（host={host}）: {e}"))?;
 
         let cfg = ServerConfig::builder_with_provider(Arc::clone(&self.provider))
             .with_safe_default_protocol_versions()
-            .map_err(|e| format!("protocol versions: {e}"))?
+            .map_err(|e| format!("TLS 协议版本配置失败: {e}"))?
             .with_no_client_auth()
             .with_single_cert(
                 vec![CertificateDer::from(cert)],
                 PrivatePkcs8KeyDer::from(self.leaf_key.serialize_der()).into(),
             )
-            .map_err(|e| format!("failed to build server config for {host}: {e}"))?;
+            .map_err(|e| format!("服务端配置构建失败（host={host}）: {e}"))?;
         // 不广播 ALPN（对齐 Python 版 ssl.SSLContext 默认行为——ServerHello 不带
         // ALPN 扩展，客户端一律回落 HTTP/1.1）。差异修复 2026-09-15：此前显式广播
         // ALPN=[http/1.1]，对只提供 h2 的客户端（豆包 cronet/ttnet 原生栈对其 API
@@ -415,7 +415,7 @@ mod tests {
         assert!(tmp.join("ca.cer").exists());
         // 再次加载：兼容自生成的 PEM
         let ca2 = ensure_ca(&tmp).expect("reload");
-        let _ = ca2.gen_server_config("api.trae.cn");
+        ca2.gen_server_config("api.trae.cn").expect("leaf config");
 
         let cfg = ca.gen_server_config("api.trae.cn").expect("leaf config");
         // 不广播 ALPN：对齐 Python 版行为（客户端回落 HTTP/1.1）

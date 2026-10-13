@@ -13,14 +13,6 @@ use chrono::{Datelike, Local, Timelike};
 /// 仅将格式化后的行推入内存队列（µs 级、零磁盘 IO），由专用写入线程
 /// 每 100ms（或被唤醒时）批量落盘。读路径（read_log/search_log/list_dates）
 /// 先同步排空队列再读文件，保证「写后读」一致（测试与 UI 依赖此语义）。
-/// 行内 [HH:MM:SS] 时间戳（审查 L：与 today_filename 同源 chrono Local——
-/// 此前固定 UTC+8 手算，非东八区机器上行内时间与文件日期可相差 7-8 小时
-/// 甚至跨日，排障时间线对不上）
-fn local_hms() -> (u32, u32, u32) {
-    let lt = Local::now().time();
-    (lt.hour(), lt.minute(), lt.second())
-}
-
 pub struct ApiLogger {
     dir: PathBuf,
     /// 队列 + 文件句柄同锁互斥（写入线程与读路径排空共用一把锁，保证一致）
@@ -70,6 +62,13 @@ impl ApiLogger {
         // 使用 chrono 本地时间获取精确日期
         let now = Local::now();
         format!("api_{:04}-{:02}-{:02}.log", now.year(), now.month(), now.day())
+    }
+
+    /// 行内时间戳 HH:MM:SS，取本地时区（与文件名 today_filename 同源）。
+    /// 审查修复：原实现 epoch+8h 手算固定东八区，非东八区环境跨日与文件名错位
+    fn local_hms() -> (u32, u32, u32) {
+        let t = Local::now().time();
+        (t.hour(), t.minute(), t.second())
     }
 
     /// 入队一条日志（异步化热路径：仅内存操作，磁盘 IO 由写入线程承担）
@@ -161,7 +160,7 @@ impl ApiLogger {
         acct_name: &str,
         error: Option<&str>,
     ) {
-        let (h, m, s) = local_hms();
+        let (h, m, s) = Self::local_hms();
 
         // 审查 P2-6：按 Unicode 字符截断（原字节切片落点多字节字符内会 panic）
         let uid_short: String = uid.chars().take(12).collect();
@@ -189,7 +188,7 @@ impl ApiLogger {
     /// 记录调度事件日志（F-77）：sticky_yield 让位 / busy 降级取号 / 对冲接管等，
     /// 单行 `[SCHED]` 前缀写入当日日志，供用量页日志检索与调度行为观测
     pub fn log_sched_event(&self, event: &str) {
-        let (h, m, s) = local_hms();
+        let (h, m, s) = Self::local_hms();
         let line = format!("[{:02}:{:02}:{:02}] [SCHED] {}\n", h, m, s, event);
         self.enqueue(line);
     }
@@ -203,7 +202,7 @@ impl ApiLogger {
         status: u16,
         error: Option<&str>,
     ) {
-        let (h, m, s) = local_hms();
+        let (h, m, s) = Self::local_hms();
 
         // 审查 P2-6：按 Unicode 字符截断（原字节切片落点多字节字符内会 panic）
         let uid_short: String = uid.chars().take(12).collect();

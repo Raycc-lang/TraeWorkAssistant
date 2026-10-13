@@ -30,7 +30,9 @@ pub fn read_json<T: serde::de::DeserializeOwned + Default>(path: &Path) -> T {
 /// state.rs 同源规则（platform::app_support_root：Windows=%APPDATA%、macOS=
 /// $HOME/Library/Application Support）定位数据目录；定位失败或写日志失败均
 /// 静默放弃（日志失败不影响读取主流程）。
-pub(crate) fn app_log_default(msg: &str) {
+/// 审查修复（main 侧并入）：改为公开，供无 data_dir 上下文的一次性降级观测
+/// （如 Qoder 原生风控身份解析失败时落 app.log）。
+pub fn app_log_default(msg: &str) {
     if let Ok(root) = crate::platform::app_support_root() {
         app_log(&root.join(crate::state::DATA_DIR_NAME), msg);
     }

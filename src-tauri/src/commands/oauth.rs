@@ -496,7 +496,8 @@ pub fn oauth_get_login_url(state: State<AppState>) -> Result<OAuthLoginUrl, Stri
     let (pkce_verifier, code_challenge) = pkce_pair()?;
 
     // 主机名兜底（F-75 M2-2.5）：Windows 读 COMPUTERNAME；mac 无此环境变量，
-    // 恒落 "Windows-PC"——改 scutil --get ComputerName 取值（失败回落 macOS-Device）
+    // 恒落 "Windows-PC"——改 scutil --get ComputerName 取值（scutil 失败回退
+    // hostname 命令，仍失败回落 macOS-Device）
     let hostname = host_fallback();
     fn host_fallback() -> String {
         #[cfg(windows)]
@@ -513,7 +514,16 @@ pub fn oauth_get_login_url(state: State<AppState>) -> Result<OAuthLoginUrl, Stri
                 .filter(|o| o.status.success())
                 .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
                 .filter(|s| !s.is_empty())
-                .unwrap_or_else(|| "macOS-Device".into())
+                .unwrap_or_else(|| {
+                    // main 侧改进：scutil 失败回退 hostname 命令取真实主机名
+                    crate::platform::cmd::sys_command("hostname")
+                        .output()
+                        .ok()
+                        .filter(|o| o.status.success())
+                        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+                        .filter(|s| !s.is_empty())
+                        .unwrap_or_else(|| "macOS-Device".into())
+                })
         }
         #[cfg(not(any(windows, target_os = "macos")))]
         {
@@ -1085,6 +1095,11 @@ fn mask_sensitive(v: &mut serde_json::Value) {
         SENSITIVE.iter().any(|s| kl.contains(s))
     }
     fn mask_str(s: &str) -> String {
+        // 审查修复：短纯数字串（≤12 位）为错误码等业务标识（如 Error.Code="20101"），
+        // 打码会毁掉排障关键信息——豁免不打码；真实凭证（token/jwt 等）远长于此，不受影响
+        if !s.is_empty() && s.len() <= 12 && s.bytes().all(|b| b.is_ascii_digit()) {
+            return s.to_string();
+        }
         let head: String = s.chars().take(6).collect();
         format!("{head}…(len={})", s.chars().count())
     }

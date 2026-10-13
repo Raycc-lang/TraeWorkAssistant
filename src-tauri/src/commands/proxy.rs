@@ -136,10 +136,12 @@ pub async fn do_start(
     // 兜底：端口为 0 时退化为固定端口 8899，避免注入 TRAE 的代理地址无效（见 store.ts 同款兜底）
     let port = if port == 0 { 8899 } else { port };
     // 记录本次使用的端口：cleanup_stale_local_proxy 据此识别「指向已停止本地代理的残留系统代理」
-    // 审查 L：写失败不再静默——该文件是残留清理链与 bypass::mitm_port 的依据，
-    // 失败须落日志留痕（下次启动的残留识别将失效）
     if let Err(e) = std::fs::write(state.data_dir.join("last_proxy_port.txt"), port.to_string()) {
-        crate::fs_utils::app_log(&state.data_dir, &format!("[代理] last_proxy_port.txt 写入失败（残留清理依据缺失）: {e}"));
+        // 审查修复：写失败静默会让残留清理链失去依据且无感知，落 app.log 留痕
+        fs_utils::app_log(
+            &state.data_dir,
+            &format!("last_proxy_port.txt 写入失败（残留死代理清理依据缺失）: {e}"),
+        );
     }
     let proxy_addr = format!("127.0.0.1:{port}");
 
