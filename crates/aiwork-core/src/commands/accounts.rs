@@ -642,6 +642,21 @@ pub fn account_delete(
     // 同步清理 vault 中的凭据记录（失败仅记录日志，不阻断删除）
     crate::vault::remove_secret(state, &user_id);
 
+    // 设备指纹随账号生命周期删除：清 device_map 与 per-account synthetic 身份。
+    // 只做这两项即可让“删除后重新 OAuth”得到全新设备；其他账号数据保持既有
+    // 删除口径，不借本修复扩大清理范围。
+    {
+        let _dm = crate::store::docs::DEVICE_MAP_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let store = crate::store::db(&state.data_dir);
+        let mut map = crate::store::docs::device_map_load(&store);
+        if map.remove(&user_id).is_some() {
+            let _ = crate::store::docs::device_map_save(&store, &map);
+        }
+    }
+    crate::commands::oauth::remove_account_synthetic_device(state, &user_id);
+
     // 持 group_defs_lock：membership RMW（load→改→save）与并发分组增删/导入
     // 互斥防丢更新（groups_save 为 groups+group_members 整删全写）；
     // 共享标签清理与本函数末尾的 invalidate 均在锁外执行

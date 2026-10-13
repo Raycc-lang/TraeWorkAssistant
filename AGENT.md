@@ -182,6 +182,7 @@ $AIWORK_DATA_DIR（Docker: /app/data）
 
 - JWT 默认约 13 天过期；带 refresh_token 的账号走 48h lazy 续期（调度任务 05:30 兜底）；refresh_token 被吊销只能重新 OAuth。
 - Trae OAuth 为**粘贴回调模式**：浏览器跳 `http://127.0.0.1:17388/authorize` 停在「无法连接」页是**预期现象**，用户复制地址栏 URL 粘贴回 Web UI。
+- Web-only 容器无本机 Trae 设备凭证时，OAuth 每登录会话生成一套 synthetic 设备；AuthCode 交换先匹配 pending 身份，成功后按 uid 持久化并覆盖 `device_map`。删除账号同步清理 `device_map` 与 per-account synthetic 身份。
 - LLM 上游请求 ureq 直连，不读系统/环境代理（容器内行为确定）。
 - 调度按本地时间 HH:MM 触发，容器需 `TZ=Asia/Shanghai`。
 - API 模型同步重放官网配置接口；内置模型（glm-5.3-flash 等）需 llm_utils_chat 以 `function=solo_agent` 补齐。
