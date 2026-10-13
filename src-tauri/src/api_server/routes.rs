@@ -852,7 +852,8 @@ pub async fn responses_api(
     }
 
     // Responses → OpenAI chat 内部格式（纯投影，失败即 400）
-    // 同时收集请求侧展平编码名集合，供回程 {name, namespace} 还原白名单（审查 #4）
+    // 同时收集请求侧展平编码名集合（审查 #4/F4：encoded_tool_names 同源 helper），
+    // 供回程 {name, namespace} 还原白名单随执行链下发
     let (chat_body, ns_encoded): (Value, std::collections::HashSet<String>) =
         match super::wb_responses::responses_to_chat_with_ns(&peek) {
             Ok((v, ns)) => (v, ns),
@@ -3062,6 +3063,7 @@ mod tests {
         let state = Arc::new(ApiSharedState {
             pool: super::super::pool::ApiPool::new(),
             wb_pool: super::super::pool::ApiPool::new(),
+            fallback_log_last_ms: std::sync::Mutex::new(std::collections::HashMap::new()),
             wb_enabled: std::sync::atomic::AtomicBool::new(true),
             wb_sanitize: std::sync::atomic::AtomicBool::new(true),
             wb_default_thinking: std::sync::atomic::AtomicBool::new(false),

@@ -90,31 +90,17 @@ pub fn responses_to_chat_with_ns(body: &Value) -> Result<(Value, HashSet<String>
     if let Some(tools) = body.get("tools").and_then(|v| v.as_array()) {
         let mut converted: Vec<Value> = Vec::new();
         for t in tools {
-            match t.get("type").and_then(|v| v.as_str()) {
-                Some("function") => {
-                    if let Some(name) = t.get("name").and_then(|v| v.as_str()) {
-                        converted.push(chat_function(name, t));
-                    }
+            if t.get("type").and_then(|v| v.as_str()) == Some("function") {
+                if let Some(name) = t.get("name").and_then(|v| v.as_str()) {
+                    converted.push(chat_function(name, t));
                 }
-                Some("namespace") => {
-                    let Some(ns) = t.get("name").and_then(|v| v.as_str()) else {
-                        continue;
-                    };
-                    if ns.is_empty() {
-                        continue;
-                    }
-                    if let Some(inner) = t.get("tools").and_then(|v| v.as_array()) {
-                        for it in inner {
-                            if let Some(name) = it.get("name").and_then(|v| v.as_str()) {
-                                let encoded = format!("{}__{}", ns, name);
-                                ns_encoded.insert(encoded.clone());
-                                converted.push(chat_function(&encoded, it));
-                            }
-                        }
-                    }
-                }
-                _ => {}
             }
+        }
+        // namespace 分组工具展平为编码名（与 encoded_tool_names 回程闸门同一遍历，
+        // 防两处口径漂移）；编码名同步入 ns_encoded（回程拆分白名单，审查 #4）
+        for (encoded_name, src) in namespace_encoded(tools) {
+            ns_encoded.insert(encoded_name.clone());
+            converted.push(chat_function(&encoded_name, &src));
         }
         if !converted.is_empty() {
             out.insert("tools".to_string(), json!(converted));
@@ -154,9 +140,54 @@ fn chat_function(name: &str, src: &Value) -> Value {
     })
 }
 
+/// namespace 分组工具 → (编码名 `<ns>__<inner>`, 内层工具对象) 列表
+/// （responses_to_chat 请求侧展平与 encoded_tool_names 回程闸门共用）
+fn namespace_encoded(tools: &[Value]) -> Vec<(String, Value)> {
+    let mut pairs = Vec::new();
+    for t in tools {
+        if t.get("type").and_then(|v| v.as_str()) != Some("namespace") {
+            continue;
+        }
+        let Some(ns) = t.get("name").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        if ns.is_empty() {
+            continue;
+        }
+        if let Some(inner) = t.get("tools").and_then(|v| v.as_array()) {
+            for it in inner {
+                if let Some(name) = it.get("name").and_then(|v| v.as_str()) {
+                    pairs.push((format!("{ns}__{name}"), it.clone()));
+                }
+            }
+        }
+    }
+    pairs
+}
+
+/// 请求侧编码名集合（回程拆分闸门，审查 F4）：namespace 分组展平时生成的全部
+/// `<ns>__<inner>` 编码名。/v1/responses 入口在投影前收集并随执行链下发，
+/// 回程投影（completion_to_responses / wb_sse 流式）仅对集合内命中者做
+/// split_namespaced 还原——客户端原生扁平工具名可能天然含 `__`（如 MCP 惯例
+/// `mcp__server__tool`），无差别 rfind 拆分会把未编码扁平名误拆成
+/// {name, namespace} 双字段，客户端工具分发匹配失败
+pub fn encoded_tool_names(body: &Value) -> HashSet<String> {
+    body.get("tools")
+        .and_then(|v| v.as_array())
+        .map(|tools| {
+            namespace_encoded(tools)
+                .into_iter()
+                .map(|(name, _)| name)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// 拆分编码名 `<ns>__<inner>`：按最后一个 `__` 切分（namespace 自身可含 `__`，
 /// 内层工具名不含，如 `mcp__node_repl__js` → ns=`mcp__node_repl`，inner=`js`）。
-/// 无 `__` 或切分出空段返回 None——扁平 function 工具原样透传，不带 namespace
+/// 无 `__` 或切分出空段返回 None——扁平 function 工具原样透传，不带 namespace。
+/// 注意：调用方必须先用 encoded_tool_names 确认名字确属请求侧展平编码名，
+/// 本函数只做机械切分，不对「原生扁平名恰含 __」的歧义做判定
 pub fn split_namespaced(name: &str) -> Option<(String, String)> {
     let idx = name.rfind("__")?;
     let (ns, inner) = (&name[..idx], &name[idx + 2..]);
@@ -417,9 +448,10 @@ fn content_text(content: Option<&Value>) -> String {
 
 /// 内部 OpenAI completion → Responses 对象（非流式 /v1/responses）
 ///
-/// `ns_encoded`：请求侧 `responses_to_chat_with_ns` 收集的展平编码名集合。
-/// 仅对命中者还原 {name, namespace} 双字段；未命中（含原生 `__` 的扁平名，
-/// 如客户端直配的 MCP mcp__server__tool）保持单 name 字段（审查 #4）。
+/// `ns_encoded`：请求侧 `responses_to_chat_with_ns` / `encoded_tool_names` 收集的
+/// 展平编码名集合——仅集合内命中的工具名做 {name, namespace} 还原；未登记的
+/// 扁平名（可能天然含 `__`，如客户端直配的 MCP mcp__server__tool）保持单
+/// name 字段（issue #93 / 审查 #4/F4）。非 /v1/responses 入口的防御性分支传空集合。
 pub fn completion_to_responses(v: &Value, resp_id: &str, model: &str) -> Value {
     completion_to_responses_ns(v, resp_id, model, &HashSet::new())
 }
@@ -471,15 +503,18 @@ pub fn completion_to_responses_ns(
                 "call_id": tc.get("id").cloned().unwrap_or(json!(format!("call_{}", i))),
                 "arguments": tc.pointer("/function/arguments").cloned().unwrap_or(json!("{}")),
             });
-            // 编码名还原为 Codex 只接受的 {name, namespace} 双字段形态；
-            // 仅请求侧真实经展平产生的编码名才拆分（集合命中）——原生含 `__`
-            // 的扁平 function 名保持单 name 字段（issue #93 / 审查 #4）
+            // 编码名还原为 Codex 只接受的 {name, namespace} 双字段形态（issue #93）；
+            // 仅对请求侧登记的编码名拆分（审查 #4/F4）——客户端原生扁平工具名可能
+            // 天然含 `__`（MCP 惯例），未登记者保持单 name 字段
             if ns_encoded.contains(name) {
-                if let Some((ns, inner)) = split_namespaced(name) {
-                    fc["name"] = json!(inner);
-                    fc["namespace"] = json!(ns);
-                } else {
-                    fc["name"] = json!(name);
+                match split_namespaced(name) {
+                    Some((ns, inner)) => {
+                        fc["name"] = json!(inner);
+                        fc["namespace"] = json!(ns);
+                    }
+                    None => {
+                        fc["name"] = json!(name);
+                    }
                 }
             } else {
                 fc["name"] = json!(name);
@@ -992,5 +1027,51 @@ mod tests {
         let fc1 = &resp["output"][1];
         assert_eq!(fc1["name"], json!("mcp__fs__read"));
         assert!(fc1.get("namespace").is_none());
+    }
+
+    /// 审查 F4 回归：回程拆分以请求侧编码名集合为闸门——客户端原生扁平工具名
+    /// 含 `__`（MCP 惯例 mcp__server__tool）未登记时不误拆，登记时正常还原
+    #[test]
+    fn completion_split_gated_by_encoded_names() {
+        let v = json!({
+            "choices": [{"index": 0, "finish_reason": "tool_calls",
+                         "message": {"role": "assistant", "content": null,
+                                     "tool_calls": [
+                                        {"id": "call_1", "type": "function",
+                                         "function": {"name": "mcp__server__tool", "arguments": "{}"}}]}}],
+        });
+        // 未登记（扁平原生名）：保持单 name，不产出 namespace
+        let resp = completion_to_responses(&v, "resp_g1", "m");
+        let fc = &resp["output"][0];
+        assert_eq!(fc["name"], json!("mcp__server__tool"));
+        assert!(fc.get("namespace").is_none());
+        // 登记（确属 namespace 分组展平名）：正常还原双字段
+        let encoded = HashSet::from(["mcp__server__tool".to_string()]);
+        let resp = completion_to_responses_ns(&v, "resp_g2", "m", &encoded);
+        let fc = &resp["output"][0];
+        assert_eq!(fc["name"], json!("tool"));
+        assert_eq!(fc["namespace"], json!("mcp__server"));
+    }
+
+    /// encoded_tool_names：仅收集 namespace 分组展平名，扁平 function 不入集合
+    #[test]
+    fn encoded_tool_names_collects_only_namespace_groups() {
+        let body = json!({
+            "tools": [
+                {"type": "function", "name": "mcp__server__tool", "parameters": {}},
+                {"type": "namespace", "name": "multi_agent_v1", "tools": [
+                    {"type": "function", "name": "spawn_agent", "parameters": {}}
+                ]},
+                {"type": "namespace", "name": "", "tools": [
+                    {"type": "function", "name": "skipped_empty_ns", "parameters": {}}
+                ]},
+            ],
+        });
+        let encoded = encoded_tool_names(&body);
+        assert!(encoded.contains("multi_agent_v1__spawn_agent"));
+        assert_eq!(encoded.len(), 1);
+        assert!(!encoded.contains("mcp__server__tool"));
+        // 无 tools / 非对象 tools：空集合
+        assert!(encoded_tool_names(&json!({"model": "m"})).is_empty());
     }
 }

@@ -881,6 +881,10 @@ fn run_wb_stream(
                         }
                         RetryAction::Fatal => {
                             let msg = format!("upstream {} error: {}", status, safe_slice(&resp_body, 300));
+                            // 终态记账对齐 SwitchKey/耗尽收尾（审查 F3）：Fatal 是请求
+                            // 终局，此前仅 log_request 导致用量统计页缺口
+                            state.record_usage(true, model, &picked.uid, key_id, false, true,
+                                start_ts.elapsed().as_millis() as u64, 0, 0);
                             state.logger.log_request(
                                 "buddy", "POST", "/v2/chat/completions", model, true, status, &picked.uid,
                                 start_ts.elapsed().as_millis() as u64,
@@ -1206,7 +1210,7 @@ pub async fn wb_aggregate_chat(
                             }
                             RetryAction::Fatal => {
                                 // 三池统一：每请求一行终态记账——Fatal 为终态，补一行
-                                // 失败用量（对齐耗尽分支口径，防用量页缺行）
+                                // 失败用量（对齐耗尽分支口径，防用量页缺行；审查 F3）
                                 state.record_usage(true, &model, &picked.uid, &key_id, false, stream,
                                     start_ts.elapsed().as_millis() as u64, 0, 0);
                                 state.logger.log_request(

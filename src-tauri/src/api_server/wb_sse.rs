@@ -9,7 +9,7 @@
 //!
 //! 输入统一为行迭代器（便于首字超时等上层封装），不直接持有 Reader。
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::time::Duration;
 
 use serde_json::{json, Value};
@@ -245,7 +245,7 @@ pub fn stream_forward_ex(
     stream_forward_ex_ns(lines, tx, proto, chat_id, model, &std::collections::HashSet::new())
 }
 
-/// 同 stream_forward_ex，带 Responses 请求侧展平编码名集合（审查 #4）：
+/// 同 stream_forward_ex，带 Responses 请求侧展平编码名集合（审查 #4/F4）：
 /// `proto == Protocol::Responses` 时仅对集合命中者还原 {name, namespace} 双字段，
 /// 原生含 `__` 的扁平 function 名（如 MCP mcp__server__tool）保持单 name 字段
 pub fn stream_forward_ex_ns(
@@ -425,8 +425,8 @@ pub fn stream_forward_ex_ns(
                             "arguments": args,
                         });
                         // 编码名还原为 Codex 只接受的 {name, namespace} 双字段；
-                        // 仅请求侧展平编码名集合命中者拆分——原生含 `__` 的扁平
-                        // function 名保持单 name 字段（issue #93 / 审查 #4）
+                        // 仅对请求侧登记的编码名拆分（审查 #4/F4，issue #93）——
+                        // 客户端原生扁平工具名可能天然含 `__`，未登记者保持单 name
                         if ns_encoded.contains(name.as_str()) {
                             match crate::api_server::wb_responses::split_namespaced(name) {
                                 Some((ns, inner)) => {
@@ -808,9 +808,10 @@ pub fn stream_forward(
     proto: crate::api_server::routes::Protocol,
     chat_id: &str,
     model: &str,
+    encoded: &HashSet<String>,
 ) -> (Option<(i64, String)>, bool, Option<Value>) {
     let (error_info, sent_any, _failed_inline, usage, _eof_truncated) =
-        stream_forward_ex(lines, tx, proto, chat_id, model);
+        stream_forward_ex_ns(lines, tx, proto, chat_id, model, encoded);
     (error_info, sent_any, usage)
 }
 
@@ -1267,8 +1268,14 @@ mod tests {
             "data: [DONE]",
             "",
         ]);
-        let (err, sent_any, usage) =
-            stream_forward(lines, &tx, crate::api_server::routes::Protocol::Responses, "resp_1", "glm-5.3");
+        let (err, sent_any, usage) = stream_forward(
+            lines,
+            &tx,
+            crate::api_server::routes::Protocol::Responses,
+            "resp_1",
+            "glm-5.3",
+            &HashSet::new(),
+        );
         assert!(err.is_none());
         assert!(sent_any);
         assert!(usage.is_some());
@@ -1484,7 +1491,9 @@ mod tests {
             "data: [DONE]",
             "",
         ]);
-        let _ = stream_forward_ex(lines, &tx, crate::api_server::routes::Protocol::Anthropic, "msg_5", "m");
+        let _ = stream_forward_ex(
+            lines, &tx, crate::api_server::routes::Protocol::Anthropic, "msg_5", "m",
+        );
         drop(tx);
         let mut body = String::new();
         while let Ok(frame) = rx.try_recv() {

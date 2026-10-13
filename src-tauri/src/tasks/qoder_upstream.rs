@@ -2512,7 +2512,9 @@ mod tests {
             let ilines = InterruptibleLines::from_iterator(Box::new(t));
             let (tx, _rx) =
                 tokio::sync::mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(64);
-            wb_sse::stream_forward_ex(ilines, &tx, crate::api_server::routes::Protocol::OpenAi, "chat-1", "M")
+            wb_sse::stream_forward_ex(
+                ilines, &tx, crate::api_server::routes::Protocol::OpenAi, "chat-1", "M",
+            )
         };
         assert!(err.is_none(), "内容已流出，错误不得上抛换号");
         assert!(sent_any);
