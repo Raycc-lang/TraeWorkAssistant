@@ -249,6 +249,9 @@ pub fn stream_forward_ex(
 /// 同 stream_forward_ex，带 Responses 请求侧展平编码名集合（审查 #4/F4）：
 /// `proto == Protocol::Responses` 时仅对集合命中者还原 {name, namespace} 双字段，
 /// 原生含 `__` 的扁平 function 名（如 MCP mcp__server__tool）保持单 name 字段
+// 宏内末次赋值（text/thinking_block_open）在收尾路径后不再读取，属预期行为
+// （对齐 sse.rs 与 stream_forward_ex——本函数自后者重构而来，allow 须随迁）
+#[allow(unused_assignments)]
 pub fn stream_forward_ex_ns(
     lines: InterruptibleLines,
     tx: &Sender,

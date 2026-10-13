@@ -20,6 +20,9 @@ use super::wb_sse::cached_tokens_of;
 /// function_call/function_call_output → tool_calls/tool 消息；
 /// tools 平铺（Responses 顶层 name/parameters → chat function 包裹）；
 /// max_output_tokens → max_tokens；reasoning.effort → reasoning_effort。
+/// （生产路径统一走 responses_to_chat_with_ns（需 ns 集合）；本薄包装供测试与
+/// 文档消费，故 allow dead_code）
+#[allow(dead_code)]
 pub fn responses_to_chat(body: &Value) -> Result<Value, String> {
     responses_to_chat_with_ns(body).map(|(v, _)| v)
 }
@@ -173,6 +176,9 @@ fn namespace_encoded(tools: &[Value]) -> Vec<(String, Value)> {
 /// split_namespaced 还原——客户端原生扁平工具名可能天然含 `__`（如 MCP 惯例
 /// `mcp__server__tool`），无差别 rfind 拆分会把未编码扁平名误拆成
 /// {name, namespace} 双字段，客户端工具分发匹配失败
+/// （生产路径由 responses_to_chat_with_ns 的返回集合同口径收集；本独立入口供
+/// 测试与口径锁定消费，故 allow dead_code）
+#[allow(dead_code)]
 pub fn encoded_tool_names(body: &Value) -> HashSet<String> {
     body.get("tools")
         .and_then(|v| v.as_array())

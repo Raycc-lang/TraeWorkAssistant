@@ -260,6 +260,8 @@ fn parse_enabled(text: &str) -> Option<bool> {
 /// HTTP 与 secure（HTTPS）两路读输出中选中启用的一路：HTTP 启用优先（与写路径
 /// 两键同 server 对称），其次 secure；两路都未启用/不可读返回 None。
 /// 跨平台纯函数（不依赖真机 networksetup），锁定「任一启用即纳入快照」口径
+/// （mac 主代码消费 + 测试；Windows 主代码不使用故 allow dead_code，同 parse_enabled）
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn pick_proxy_text(web: Option<String>, secure: Option<String>) -> Option<String> {
     let enabled = |t: &Option<String>| t.as_deref().and_then(parse_enabled) == Some(true);
     if enabled(&web) {
