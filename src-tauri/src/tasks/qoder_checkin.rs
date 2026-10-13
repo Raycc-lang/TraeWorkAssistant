@@ -243,13 +243,23 @@ fn filter_claimable(campaigns: &[Value]) -> Vec<Value> {
 
 /// 「每日 100 Credits」已领判定（纯函数，**从严**口径——宁 fail 不假 already）：
 /// 列表中存在同时满足以下**全部**条件的条目才算已领：
+/// - campaignId ∈ allowed_ids（审查 F8 收窄：同日窗口可能存在多个 CREDITS 活动，
+///   他活动已领、每日活动未领时宽匹配会误判 already 跳过领取；候选 id 由调用方
+///   从 learned 重学 + KNOWN 常量表合成。未命中不假 already——落入盲发兜底
+///   幂等直领，replayed 回放如实归类，行为安全）
 /// - claimStatus == CLAIMED（大小写宽容）
 /// - actionType == CLAIM_BENEFIT（排除 bogo 类 VIEW_DETAILS「只看不领」活动）
 /// - benefit.kind == CREDITS（每日 100 Credits 活动的奖励类型）
 /// - startAt <= now <= endAt（当日窗口内；字段缺失视为不命中——昨日的
 ///   CLAIMED grant 无条件展示在列表里，没有窗口校验会把昨日已领误判今日已领）
-fn daily_credits_claimed_in_list(campaigns: &[Value], now_secs: i64) -> bool {
+fn daily_credits_claimed_in_list(
+    campaigns: &[Value],
+    now_secs: i64,
+    allowed_ids: &[String],
+) -> bool {
     campaigns.iter().any(|c| {
+        let cid = s_of(fs_utils::dig(c, &["campaignId", "campaign_id"]));
+        let id_ok = !cid.is_empty() && allowed_ids.iter().any(|a| a == &cid);
         let claimed =
             s_of(fs_utils::dig(c, &["claimStatus", "claim_status"])).to_ascii_uppercase()
                 == "CLAIMED";
@@ -265,7 +275,7 @@ fn daily_credits_claimed_in_list(campaigns: &[Value], now_secs: i64) -> bool {
             (Some(s), Some(e)) => now_secs >= s && now_secs <= e,
             _ => false,
         };
-        claimed && action && credits && in_window
+        id_ok && claimed && action && credits && in_window
     })
 }
 
@@ -811,7 +821,13 @@ fn process_account(
                 //    兜底），结果如实归类（Failed 不再归 already——2026-10-07
                 //    误报「已领（此前已领）」的修复点）
                 let now = chrono::Utc::now().timestamp();
-                if daily_credits_claimed_in_list(&campaigns, now) {
+                // 审查 F8：候选 id = learned 重学 + KNOWN 常量表（与盲发兜底同源）
+                let allowed_ids: Vec<String> = learned
+                    .iter()
+                    .map(|(id, _)| id.clone())
+                    .chain(KNOWN_DAILY_CAMPAIGNS.iter().map(|(id, _)| id.to_string()))
+                    .collect();
+                if daily_credits_claimed_in_list(&campaigns, now, &allowed_ids) {
                     ("already".into(), "每日奖励已领取".into(), None)
                 } else {
                     match known_daily_fallback(agent, &headers, learned) {
@@ -918,7 +934,13 @@ fn process_account(
                             // 与首次路径同口径：先查列表内当日已领 grant，再盲发
                             // 兜底直领（learned 优先），失败如实归 fail（不掩盖）
                             let now = chrono::Utc::now().timestamp();
-                            if daily_credits_claimed_in_list(&campaigns, now) {
+                            // 审查 F8：候选 id = learned 重学 + KNOWN 常量表（同首次路径）
+                            let allowed_ids: Vec<String> = learned
+                                .iter()
+                                .map(|(id, _)| id.clone())
+                                .chain(KNOWN_DAILY_CAMPAIGNS.iter().map(|(id, _)| id.to_string()))
+                                .collect();
+                            if daily_credits_claimed_in_list(&campaigns, now, &allowed_ids) {
                                 ("already".into(), "每日奖励已领取".into(), None)
                             } else {
                                 match known_daily_fallback(agent, &headers, learned) {
@@ -1324,12 +1346,14 @@ mod tests {
         }
     }
 
-    /// 「每日 100 Credits」已领判定（从严口径）：CLAIMED+CLAIM_BENEFIT+CREDITS+
-    /// 当日窗口全部命中才算已领——缺任一条件不得误判 already（宁 fail 不假 already）
+    /// 「每日 100 Credits」已领判定（从严口径）：campaignId ∈ 候选表 +
+    /// CLAIMED+CLAIM_BENEFIT+CREDITS+当日窗口全部命中才算已领——缺任一条件
+    /// 不得误判 already（宁 fail 不假 already；审查 F8 收窄后新增 id 白名单用例）
     #[test]
     fn daily_credits_claimed_detection() {
         // act-20260930-664 当日窗口（startAt/endAt 取抓包实测值）
         let now = 1_791_380_000i64;
+        let allowed = vec!["01a0f1cd-945c-7217-b373-f62e70da792d".to_string()];
         // 完整命中 → 已领
         let hit = json!({
             "campaignId": "01a0f1cd-945c-7217-b373-f62e70da792d",
@@ -1337,30 +1361,44 @@ mod tests {
             "benefit": {"kind": "CREDITS", "amount": 100},
             "startAt": 1_791_338_400, "endAt": 1_791_424_740,
         });
-        assert!(daily_credits_claimed_in_list(&[hit], now));
+        assert!(daily_credits_claimed_in_list(&[hit], now, &allowed));
+        // 审查 F8：他活动已领（id 不在候选表）、每日活动未领 → 不命中（宽匹配误报场景）
+        let other_id = json!({
+            "campaignId": "other-campaign-uuid",
+            "claimStatus": "CLAIMED", "actionType": "CLAIM_BENEFIT",
+            "benefit": {"kind": "CREDITS", "amount": 50},
+            "startAt": 1_791_338_400, "endAt": 1_791_424_740,
+        });
+        assert!(!daily_credits_claimed_in_list(&[other_id], now, &allowed));
+        // id 缺失 → 不命中（从严）
+        let bare_id = json!({"claimStatus": "CLAIMED", "actionType": "CLAIM_BENEFIT",
+                             "benefit": {"kind": "CREDITS"},
+                             "startAt": 1_791_338_400, "endAt": 1_791_424_740});
+        assert!(!daily_credits_claimed_in_list(&[bare_id], now, &allowed));
         // VIEW_DETAILS（bogo 只看不领）→ 不命中
         let view = json!({"claimStatus": "CLAIMED", "actionType": "VIEW_DETAILS",
                           "benefit": {"kind": "CREDITS"},
                           "startAt": 1_791_338_400, "endAt": 1_791_424_740});
-        assert!(!daily_credits_claimed_in_list(&[view], now));
+        assert!(!daily_credits_claimed_in_list(&[view], now, &allowed));
         // 窗口外（昨日已领 grant 无条件展示在列表）→ 不命中
         let expired = json!({"claimStatus": "CLAIMED", "actionType": "CLAIM_BENEFIT",
                              "benefit": {"kind": "CREDITS"},
                              "startAt": 1_791_252_000, "endAt": 1_791_260_640});
-        assert!(!daily_credits_claimed_in_list(&[expired], now));
+        assert!(!daily_credits_claimed_in_list(&[expired], now, &allowed));
         // 仍 CLAIMABLE → 不命中
         let claimable = json!({"claimStatus": "CLAIMABLE", "actionType": "CLAIM_BENEFIT",
                                "benefit": {"kind": "CREDITS"},
                                "startAt": 1_791_338_400, "endAt": 1_791_424_740});
-        assert!(!daily_credits_claimed_in_list(&[claimable], now));
+        assert!(!daily_credits_claimed_in_list(&[claimable], now, &allowed));
         // 字段缺失从严（无 benefit.kind / 无窗口）→ 不命中
         let bare = json!({"claimStatus": "CLAIMED", "actionType": "CLAIM_BENEFIT"});
-        assert!(!daily_credits_claimed_in_list(&[bare], now));
+        assert!(!daily_credits_claimed_in_list(&[bare], now, &allowed));
         // 大小写宽容 + snake_case 候选键（claimStatus 口径与 filter_claimable 同构）
-        let lower = json!({"claim_status": "claimed", "actionType": "claim_benefit",
+        let lower = json!({"campaign_id": "01a0f1cd-945c-7217-b373-f62e70da792d",
+                           "claim_status": "claimed", "actionType": "claim_benefit",
                            "benefit": {"kind": "credits"},
                            "startAt": 1_791_338_400, "endAt": 1_791_424_740});
-        assert!(daily_credits_claimed_in_list(&[lower], now));
+        assert!(daily_credits_claimed_in_list(&[lower], now, &allowed));
     }
 
     /// 盲发单步归类：非明确成功/回放形态一律 Failed（宁 fail 不假 already）；

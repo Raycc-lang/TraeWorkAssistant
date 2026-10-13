@@ -217,7 +217,10 @@ pub async fn do_start(
                 }
             }
         }
-        #[cfg(not(target_os = "windows"))]
+        // 审查修复：门控口径与实现对齐——capture_proxy_snapshot_services 为
+        // mac-only（proxy_ctl.rs cfg(target_os="macos")），原 not(windows) 会把
+        // Linux 也编入并在 E0425 处失败；收紧为 cfg(target_os = "macos")
+        #[cfg(target_os = "macos")]
         {
             // F-75 M2-2.1：mac 补齐 Windows 同等能力——读取用户 VPN 作为
             // 上游透传，并在停止时经 PREV_SYSTEM_PROXY 还原（语义与 Windows 分支一致）。

@@ -118,21 +118,51 @@ fn chrome_aes_key(app_dir: &Path) -> Result<Vec<u8>, String> {
 /// mac 版密钥：Keychain `<App> Safe Storage`（Chromium os_crypt_mac，account 固定
 /// "Chrome"）→ PBKDF2-HMAC-SHA1(salt="saltysalt", 1003 轮, 16 字节)。
 /// 首次跨应用读取会弹钥匙串授权弹窗，用户须点「始终允许」。
+/// 审查 F9：条目名按候选应用名兜底——TRAE_APP_DIR 可指向任意目录（如符号链接
+/// 或自定义数据目录），其 file_name() 未必等于真实应用名，逐候选尝试防取钥必败。
 #[cfg(target_os = "macos")]
 fn chrome_aes_key(app_dir: &Path) -> Result<Vec<u8>, String> {
-    let app_name = app_dir
-        .file_name()
-        .map(|n| n.to_string_lossy().to_string())
-        .unwrap_or_default();
-    let entry = keyring::Entry::new(&format!("{app_name} Safe Storage"), "Chrome")
-        .map_err(|e| format!("打开 Keychain 条目失败: {e}"))?;
-    let password = entry
-        .get_password()
-        .map_err(|e| format!("读取 Safe Storage 失败: {e}（若弹了钥匙串授权框请选「始终允许」后重试）"))?;
-    let mut key = vec![0u8; 16];
-    pbkdf2::pbkdf2::<hmac::Hmac<sha1::Sha1>>(password.as_bytes(), b"saltysalt", 1003, &mut key)
-        .map_err(|e| format!("PBKDF2 密钥派生失败: {e}"))?;
-    Ok(key)
+    let mut candidates: Vec<String> = Vec::new();
+    if let Some(n) = app_dir.file_name() {
+        let n = n.to_string_lossy().to_string();
+        if !n.is_empty() {
+            candidates.push(n);
+        }
+    }
+    for known in ["TRAE SOLO CN", "Trae CN"] {
+        if !candidates.iter().any(|c| c == known) {
+            candidates.push(known.to_string());
+        }
+    }
+    let mut last_err: Option<String> = None;
+    for app_name in &candidates {
+        let entry = match keyring::Entry::new(&format!("{app_name} Safe Storage"), "Chrome") {
+            Ok(e) => e,
+            Err(e) => {
+                last_err = Some(format!("打开 Keychain 条目失败（{app_name}）: {e}"));
+                continue;
+            }
+        };
+        match entry.get_password() {
+            Ok(password) => {
+                let mut key = vec![0u8; 16];
+                pbkdf2::pbkdf2::<hmac::Hmac<sha1::Sha1>>(
+                    password.as_bytes(),
+                    b"saltysalt",
+                    1003,
+                    &mut key,
+                )
+                .map_err(|e| format!("PBKDF2 密钥派生失败: {e}"))?;
+                return Ok(key);
+            }
+            Err(e) => {
+                last_err = Some(format!(
+                    "读取 Safe Storage 失败（{app_name}）: {e}（若弹了钥匙串授权框请选「始终允许」后重试）"
+                ));
+            }
+        }
+    }
+    Err(last_err.unwrap_or_else(|| "无候选应用名可尝试".into()))
 }
 
 /// 单个 cookie 密文解密（Windows）：v10 为 AES-256-GCM（'v10'+nonce12+ct+tag16），

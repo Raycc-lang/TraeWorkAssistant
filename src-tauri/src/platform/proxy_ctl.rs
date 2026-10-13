@@ -23,6 +23,11 @@ pub fn get_system_proxy() -> Option<(bool, String, String)> {
         // 普通读取（updater/bypass）只需快照三元组
         networksetup_read().map(|(snap, _)| snap)
     }
+    // 第三平台编译兜底（对齐 cert_ctl.rs cert_query 约定）：返回 None = 无系统代理
+    #[cfg(not(any(windows, target_os = "macos")))]
+    {
+        None
+    }
 }
 
 /// 应用系统代理设置（enable=true 接管 / false 还原清空）。
@@ -37,6 +42,12 @@ pub fn apply_system_proxy(enable: bool, server: &str, bypass: &str) -> Result<()
     #[cfg(target_os = "macos")]
     {
         networksetup_apply(enable, server, bypass)
+    }
+    // 第三平台编译兜底：无实现，保持签名编译通过
+    #[cfg(not(any(windows, target_os = "macos")))]
+    {
+        let _ = (enable, server, bypass);
+        Err("unsupported platform".to_string())
     }
 }
 
@@ -92,10 +103,20 @@ pub fn restore_system_proxy_services(enable: bool, server: &str, bypass: &str) -
     let Some(list) = captured.filter(|l| !l.is_empty()) else {
         return networksetup_apply(enable, server, bypass);
     };
-    let others: Vec<String> = network_services()?
-        .into_iter()
-        .filter(|s| !list.contains(s))
-        .collect();
+    // 审查修复（代理还原短路）：network_services() 枚举失败不应阻断整个还原链——
+    // 否则已捕获的 CAPTURED_PROXY_SERVICES 服务不会被写回用户 VPN，其余服务的
+    // 127.0.0.1:port 残留也不会被清除，系统代理可能指向死端口。枚举失败时降级为
+    // 仅还原捕获清单（用户 VPN 写回优先级最高），其余服务清理放弃并记入错误。
+    let others = match network_services() {
+        Ok(all) => all.into_iter().filter(|s| !list.contains(s)).collect::<Vec<_>>(),
+        Err(e) => {
+            let r_captured = networksetup_apply_services(enable, server, bypass, &list);
+            return match r_captured {
+                Ok(()) => Err(format!("其余服务代理清理跳过（枚举网络服务失败: {e}），如仍有断网请手动在系统设置中关闭代理")),
+                Err(ce) => Err(format!("{ce}；枚举网络服务失败: {e}")),
+            };
+        }
+    };
     // 先关其余服务（清接管残留），再还原捕获服务；两步错误独立收集合并
     let r_others = if others.is_empty() {
         Ok(())

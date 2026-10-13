@@ -1693,19 +1693,22 @@ fn stream_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: String, str
                             let us = ttfb_us.load(std::sync::atomic::Ordering::Relaxed);
                             if us == 0 { None } else { Some(us / 1000) }
                         };
-                        // 用量记账（流式结束即落盘；F-76① TTFT 入账；对冲接管记生效账号）
-                        {
-                            let (pt, ct) = up_usage.as_ref().map(extract_tokens).unwrap_or((0, 0));
-                            state.record_usage_ttfb(
-                                false, &model, &win_uid, &key_id, error_info.is_none(), true,
-                                duration_ms, pt, ct, ttfb_ms,
-                            );
-                        }
+                        // 用量记账口径（审查修复，对齐 qoder_route）：不再逐尝试落行——
+                        // 换号中间态（空完成/流内错误/首字节前轮换）不记，usage 由请求
+                        // 终局（成功/就地收尾/池耗尽）统一落一行，防 requests/errors 虚高。
+                        // 本次尝试的 usage/终态归因暂存，终局分支消费。
+                        let attempt_usage = (up_usage.as_ref().map(extract_tokens).unwrap_or((0, 0)), duration_ms, ttfb_ms);
                         if let Some((code, msg)) = error_info {
                             if super::is_empty_completion(code, &msg) {
                                 // sent_any 护栏（对齐 qoder_route）：内容已流出时换号重发
                                 // 会向同一 SSE 流拼接第二份完整响应 → 就地收尾不再重试
                                 if sent_any {
+                                    // 终局记账（就地收尾，对齐 qoder_route 终态单行）
+                                    let ((pt, ct), d_ms, t_ms) = attempt_usage;
+                                    state.record_usage_ttfb(
+                                        false, &model, &win_uid, &key_id, false, true,
+                                        d_ms, pt, ct, t_ms,
+                                    );
                                     state.logger.log_request_ttfb(
                                         "trae", "POST", proto.log_path(), &model, stream,
                                         200, &win_uid, duration_ms, ttfb_ms, &key_name,
@@ -1771,6 +1774,12 @@ fn stream_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: String, str
                                 );
                                 break; // 退出重试循环 → 换号
                             }
+                            // 终局记账（就地收尾，部分成功按实际 usage 落账）
+                            let ((pt, ct), d_ms, t_ms) = attempt_usage;
+                            state.record_usage_ttfb(
+                                false, &model, &win_uid, &key_id, false, true,
+                                d_ms, pt, ct, t_ms,
+                            );
                             state.logger.log_request_ttfb(
                                 "trae", "POST", proto.log_path(), &model, stream,
                                 200, &win_uid, duration_ms, ttfb_ms, &key_name,
@@ -1781,6 +1790,12 @@ fn stream_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: String, str
                             }
                         } else {
                             state.pool.note_success(&win_uid);
+                            // 终局记账（成功，F-76① TTFT 入账；对冲接管记生效账号）
+                            let ((pt, ct), d_ms, t_ms) = attempt_usage;
+                            state.record_usage_ttfb(
+                                false, &model, &win_uid, &key_id, true, true,
+                                d_ms, pt, ct, t_ms,
+                            );
                             // 绑定会话→账号粘性（仅 clean success；save 1s 节流；
                             // 对冲接管时绑定生效账号，会话后续粘住实际服务者）
                             if sticky_usable {
@@ -1905,6 +1920,13 @@ fn stream_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: String, str
                             RetryAction::Fatal => {
                                 // 不冷却：请求本身问题（换号无意义），终止并透传上游错误体
                                 let msg = format!("upstream {} error: {}", status, safe_slice(&resp_body, 300));
+                                // 终局记账（Fatal 透传，对齐 qoder_route 终态单行）——
+                                // HTTP 状态错误分支位于流转换前，无 usage/ttfb 可记，
+                                // 零 tokens 落行（对齐 wb_route Fatal 分支口径）
+                                state.record_usage(
+                                    false, &model, &picked.uid, &key_id, false, stream,
+                                    start_ts.elapsed().as_millis() as u64, 0, 0,
+                                );
                                 state.logger.log_request(
                                     "trae", "POST", proto.log_path(), &model, stream,
                                     status, &picked.uid, start_ts.elapsed().as_millis() as u64,
@@ -1925,9 +1947,9 @@ fn stream_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: String, str
 
         // 所有账号不可用（空完成主导 → 明示渠道指纹拦截语义，否则维持原文案）
         let duration_ms = start_ts.elapsed().as_millis() as u64;
-        // 记账口径（三池一致）：Err 分支的换号中间态不记（防虚高，审查 P2-4）；
-        // Ok 分支的空完成/流内错误换号会各记一行尝试行 + 池耗尽终态一行——
-        // 即「每请求 N 行尝试/终态记账」，非严格单行；wb/qoder 同构口径
+        // 记账口径（三池一致，审查修复 P2-4 对齐 qoder_route）：换号中间态不记，
+        // 每请求仅在终局落一行——成功/就地收尾由终局分支记账（含真实 usage 与
+        // duration/ttfb），此处池耗尽终态落一行（uid="none"、零 tokens）
         state.record_usage(false, &model, "none", &key_id, false, true, duration_ms, 0, 0);
         let (healthy_total, _) = state.pool.selectable_stats_in(None);
         let (exhaust_msg, exhaust_tag) = exhaust_message("trae", empty_hits, attempts, healthy_total);

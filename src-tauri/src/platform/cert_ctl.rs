@@ -92,13 +92,12 @@ pub fn cert_query(subject: &str) -> bool {
 pub fn cert_install_trusted(pem: &std::path::Path) -> Result<(), String> {
     #[cfg(target_os = "macos")]
     {
-        let login_keychain = format!(
-            "{}/Library/Keychains/login.keychain-db",
-            std::env::var("HOME").map_err(|_| "无法读取 HOME 环境变量".to_string())?
-        );
+        // 审查修复：去掉硬编码 login.keychain-db 路径——登录钥匙串可被重命名/
+        // 迁移（企业管控、钥匙串修复后），该路径不存在时安装恒败。省略 -k 时
+        // security 默认使用用户登录钥匙串，能正确处理非默认路径。
         crate::platform::cmd::sys_output(
             crate::platform::cmd::sys_command("security")
-                .args(["add-trusted-cert", "-r", "trustRoot", "-k", &login_keychain])
+                .args(["add-trusted-cert", "-r", "trustRoot"])
                 .arg(pem),
         )
         .map(|_| ())

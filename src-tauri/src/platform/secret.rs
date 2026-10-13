@@ -132,6 +132,13 @@ fn decode_hex(s: &str) -> Result<Vec<u8>, String> {
     // 审查修复（P2）：按字节切片——`&s[i..i+2]` 字节索引落在多字节 UTF-8 字符
     // 中间会直接 panic（Keychain 内容理论上由本应用写入，防御性处理）
     let bytes = s.as_bytes();
+    // 审查修复：空串判为损坏源——store 是 create+truncate 与 write_all 两步，
+    // 中途崩溃/断电会留下 0 字节 key file；空输入若返回 Ok(vec![])，空密码会
+    // 直达 Stronghold 解锁必败，且跳过 Keychain fail-open 兜底（Keychain 可能
+    // 仍持有写入中断前的旧值）。空串与损坏 hex 同等对待。
+    if bytes.is_empty() {
+        return Err("vault 密钥为空（key file 可能写入中断）".into());
+    }
     if bytes.len() % 2 != 0 {
         return Err("Keychain 中 vault 主密码格式非法（奇数长度 hex）".into());
     }
@@ -179,6 +186,7 @@ mod tests {
     #[test]
     fn hex编解码往返() {
         assert_eq!(decode_hex("00ff10").unwrap(), vec![0x00, 0xff, 0x10]);
+        assert!(decode_hex("").is_err());
         assert!(decode_hex("0").is_err());
         assert!(decode_hex("zz").is_err());
     }

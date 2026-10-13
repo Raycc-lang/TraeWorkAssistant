@@ -326,6 +326,10 @@ fn stream_convert_src(
     }
 
     if !saw_done && error_info.is_none() {
+        // 审查 F7：空完成哨兵与客户端在线解耦——断连 + 零内容时若跳过哨兵，
+        // 调用方会以 error_info=None+sent_any=false 误判成功并绑定粘性
+        //（空完成账号被钉住）。断连时仍上抛哨兵，调用方按失败处理；仅
+        // [DONE] 收尾帧发送前检查在线，避免向已关闭通道写帧。
         if !has_content && !sender.is_closed() {
             // EOF 且零内容：同样视为空完成（换号重试，不发 [DONE]）
             error_info = Some((
@@ -458,6 +462,7 @@ fn stream_convert_text_src(
     }
 
     if !saw_done && error_info.is_none() {
+        // 审查 F7：空完成哨兵与客户端在线解耦（同 L328，防断连+空流误判成功绑粘性）
         if !has_content && !sender.is_closed() {
             // EOF 且零内容：同样视为空完成（换号重试，不发 [DONE]）
             error_info = Some((
@@ -965,7 +970,17 @@ fn stream_convert_anthropic_src(
         }
     }
 
-    if !saw_done && !disconnected {
+    if !saw_done && !disconnected && error_info.is_none() && sender.is_closed() {
+        // 审查 F7：客户端断连（disconnected/sender.is_closed）且零内容零错误：
+        // 仍上抛空完成哨兵，防调用方以 error_info=None+sent_any=false 误判
+        // 成功并绑定粘性（与 L328/L460 哨兵在线解耦同口径）
+        if !(message_started || !tools.is_empty()) {
+            error_info = Some((
+                crate::api_server::EMPTY_COMPLETION_CODE,
+                super::EMPTY_COMPLETION_MSG.to_string(),
+            ));
+        }
+    } else if !saw_done && !disconnected {
         if message_started || !tools.is_empty() {
             // 上游未发 done 即断流：把已收到的内容按正常收尾发出，避免客户端挂起
             finish_stream!();

@@ -703,28 +703,30 @@ fn run_wb_stream(
                     let (error_info, sent_any, failed_inline, usage, eof_truncated) =
                         wb_sse::stream_forward_ex_ns(win_lines, tx, proto, chat_id, model, ns_encoded);
                     let duration_ms = start_ts.elapsed().as_millis() as u64;
-                    {
-                        let (pt, ct) = usage
-                            .as_ref()
-                            .map(|u| {
-                                (
-                                    u.get("prompt_tokens").and_then(|v| v.as_u64()).unwrap_or(0),
-                                    u.get("completion_tokens").and_then(|v| v.as_u64()).unwrap_or(0),
-                                )
-                            })
-                            .unwrap_or((0, 0));
-                        // F-76① TTFT 入账：用量页 P50/P95/TTFT 分位统计
-                        state.record_usage_ttfb(
-                            true, model, win_uid, key_id, error_info.is_none() && !failed_inline,
-                            true, duration_ms, pt, ct, Some(ttfb_ms),
-                        );
-                    }
+                    // 用量记账口径（审查修复，对齐 qoder_route）：不再逐尝试落行——
+                    // 换号中间态（空完成/流内错误轮换）不记，usage 由请求终局
+                    // （成功/就地收尾/池耗尽）统一落一行，防 requests/errors 虚高。
+                    // 本次尝试的 usage 暂存，终局分支消费。
+                    let attempt_usage = usage
+                        .as_ref()
+                        .map(|u| {
+                            (
+                                u.get("prompt_tokens").and_then(|v| v.as_u64()).unwrap_or(0),
+                                u.get("completion_tokens").and_then(|v| v.as_u64()).unwrap_or(0),
+                            )
+                        })
+                        .unwrap_or((0, 0));
                     match error_info {
                         Some((code, msg)) => {
                             if super::is_empty_completion(code, &msg) {
                                 // sent_any 护栏（对齐 qoder_route）：内容已流出时换号重发
                                 // 会向同一 SSE 流拼接第二份完整响应 → 就地收尾不再重试
                                 if sent_any {
+                                    // 终局记账（就地收尾，对齐 qoder_route 终态单行）
+                                    state.record_usage_ttfb(
+                                        true, model, win_uid, key_id, false,
+                                        true, duration_ms, attempt_usage.0, attempt_usage.1, Some(ttfb_ms),
+                                    );
                                     state.logger.log_request_ttfb(
                                         "buddy", "POST", "/v2/chat/completions", model, true, 200, win_uid,
                                         duration_ms, Some(ttfb_ms), &key_name,
@@ -764,6 +766,11 @@ fn run_wb_stream(
                                 // 流未开始：错误不下发，允许换号重试
                                 break;
                             }
+                            // 终局记账（就地收尾，部分成功按实际 usage 落账）
+                            state.record_usage_ttfb(
+                                true, model, win_uid, key_id, false,
+                                true, duration_ms, attempt_usage.0, attempt_usage.1, Some(ttfb_ms),
+                            );
                             state.logger.log_request_ttfb(
                                 "buddy", "POST", "/v2/chat/completions", model, true, 200, win_uid,
                                 duration_ms, Some(ttfb_ms), &key_name,
@@ -777,6 +784,11 @@ fn run_wb_stream(
                                 // 已下发）：不重试、不 note_success、不清模型冷却、不绑定
                                 // 粘性会话；亦不 note_error——错误已原样给到客户端，内容类
                                 // 失败计入冷却会造成账号过度冷却
+                                // 终局记账（就地收尾，对齐 qoder_route 终态单行）
+                                state.record_usage_ttfb(
+                                    true, model, win_uid, key_id, false,
+                                    true, duration_ms, attempt_usage.0, attempt_usage.1, Some(ttfb_ms),
+                                );
                                 state.logger.log_request_ttfb(
                                     "buddy", "POST", "/v2/chat/completions", model, true, 200, win_uid,
                                     duration_ms, Some(ttfb_ms), &key_name,
@@ -785,6 +797,11 @@ fn run_wb_stream(
                                 return;
                             }
                             state.wb_pool.note_success(win_uid);
+                            // 终局记账（成功，F-76① TTFT 入账：用量页 P50/P95/TTFT 分位统计）
+                            state.record_usage_ttfb(
+                                true, model, win_uid, key_id, true,
+                                true, duration_ms, attempt_usage.0, attempt_usage.1, Some(ttfb_ms),
+                            );
                             clear_model_failure(state, model);
                             // 绑定粘性会话（Mutex 内 re-check 防 TOCTOU）
                             state.wb_sticky.bind(&sticky_key, win_uid, &conv_id, now_ts());

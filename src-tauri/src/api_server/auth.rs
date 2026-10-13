@@ -11,9 +11,11 @@ use super::usage::KeyId;
 use super::ApiSharedState;
 
 /// API Key 鉴权中间件：
-/// - /healthz 跳过鉴权（macOS 分支 P2-8 特有：响应仅 status/solo_available/
+/// - /healthz 跳过鉴权仅限**环回监听**（响应仅 status/solo_available/
 ///   wb_available 布尔 + 503 时通用 reason 字符串，无账号数/模型/密钥等敏感
-///   信息，供定位探活/看门狗直接探测）
+///   信息，供定位探活/看门狗直接探测；非环回监听时不豁免，与 /health 及
+///   ensure_bind_auth_policy「非环回必须有启用 Key」的 fail-closed 口径一致，
+///   防止局域网探测账号池健康状态）
 /// - /health 跳过鉴权仅限**环回监听**（响应已收敏为 status/running 存活布尔，
 ///   完整诊断在需鉴权的 /status；非环回监听时不豁免，与其他端点一致走 Key
 ///   鉴权 fail-closed，与 ensure_bind_auth_policy「非环回必须有启用 Key」的
@@ -31,11 +33,10 @@ pub async fn bearer_auth(
     mut request: Request,
     next: Next,
 ) -> Response {
-    // 健康探针路径免鉴权：/healthz 仅布尔（T2.3/F-32 定位探活/看门狗直接探测）；
-    // /health 已收敏为存活布尔，环回监听下豁免，非环回须带 Key（fail-closed）
+    // 健康探针路径免鉴权：/healthz 与 /health 均收敏为布尔，环回监听下豁免，
+    // 非环回须带 Key（fail-closed）——探活/看门狗均为本机进程，环回限定不影响功能
     match request.uri().path() {
-        "/healthz" => return next.run(request).await,
-        "/health" => {
+        "/healthz" | "/health" => {
             // 环回豁免与 bind 物理同源（2026-10-12 审查 M3）：按实际绑定 host 判定，
             // 不重读配置——改配置未重启时不会误用新配置值放行（fail-open）
             let host = state

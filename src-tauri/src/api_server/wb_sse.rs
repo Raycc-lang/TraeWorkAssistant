@@ -846,14 +846,18 @@ pub fn stream_forward_ex_ns(
         sent_any = true;
     }
 
-    // 空完成兜底（issue #57）：EOF 且零内容零错误、客户端仍在线 → 哨兵上抛
-    // （原样收尾会让客户端收到 "empty provider response"）。
+    // 空完成兜底（issue #57）：EOF 且零内容零错误 → 哨兵上抛（原样收尾会让
+    // 客户端收到 "empty provider response"）。
+    // 审查 F7：哨兵判定与客户端在线解耦——客户端已断连（tx.is_closed）且上游
+    // 零内容时若跳过哨兵，调用方会以 error_info=None+sent_any=false 误判成功
+    // 并绑定粘性（空完成账号被钉住）。断连时仍上抛哨兵，调用方按失败处理；
+    // 仅 response.failed 帧发送前检查在线，避免向已关闭通道写帧。
     // 终审补齐（P2-9 同构）：resp_created 已置位（空 delta/usage chunk 触发）时
     // 与 Done 分支对称地补发 response.failed——EOF 断流同属「created 后悬空」
     // 场景（qoder_route 证实 EOF 零完成真实存在，非理论不可达），补发后仍上抛
     // 哨兵交调用方换号重试，sent_any/failed_inline 语义不变
-    if error_info.is_none() && !has_content && !failed_inline && !tx.is_closed() {
-        if resp_created {
+    if error_info.is_none() && !has_content && !failed_inline {
+        if resp_created && !tx.is_closed() {
             let mut resp = responses_object(chat_id, model, "failed", vec![], None);
             resp["error"] = json!({
                 "code": "empty_completion",
