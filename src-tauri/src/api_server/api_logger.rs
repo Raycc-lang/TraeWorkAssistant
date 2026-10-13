@@ -3,9 +3,9 @@ use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::sync::{Arc, Condvar, Mutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
-use chrono::{Datelike, Local};
+use chrono::{Datelike, Local, Timelike};
 
 /// API 请求日志记录器：按日期分文件，直接存储在 logs/ 目录下（文件名 api_YYYY-MM-DD.log）
 ///
@@ -13,6 +13,14 @@ use chrono::{Datelike, Local};
 /// 仅将格式化后的行推入内存队列（µs 级、零磁盘 IO），由专用写入线程
 /// 每 100ms（或被唤醒时）批量落盘。读路径（read_log/search_log/list_dates）
 /// 先同步排空队列再读文件，保证「写后读」一致（测试与 UI 依赖此语义）。
+/// 行内 [HH:MM:SS] 时间戳（审查 L：与 today_filename 同源 chrono Local——
+/// 此前固定 UTC+8 手算，非东八区机器上行内时间与文件日期可相差 7-8 小时
+/// 甚至跨日，排障时间线对不上）
+fn local_hms() -> (u32, u32, u32) {
+    let lt = Local::now().time();
+    (lt.hour(), lt.minute(), lt.second())
+}
+
 pub struct ApiLogger {
     dir: PathBuf,
     /// 队列 + 文件句柄同锁互斥（写入线程与读路径排空共用一把锁，保证一致）
@@ -153,14 +161,7 @@ impl ApiLogger {
         acct_name: &str,
         error: Option<&str>,
     ) {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-        let local_ts = now + 8 * 3600;
-        let h = (local_ts % 86400) / 3600;
-        let m = (local_ts % 3600) / 60;
-        let s = local_ts % 60;
+        let (h, m, s) = local_hms();
 
         // 审查 P2-6：按 Unicode 字符截断（原字节切片落点多字节字符内会 panic）
         let uid_short: String = uid.chars().take(12).collect();
@@ -188,14 +189,7 @@ impl ApiLogger {
     /// 记录调度事件日志（F-77）：sticky_yield 让位 / busy 降级取号 / 对冲接管等，
     /// 单行 `[SCHED]` 前缀写入当日日志，供用量页日志检索与调度行为观测
     pub fn log_sched_event(&self, event: &str) {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-        let local_ts = now + 8 * 3600;
-        let h = (local_ts % 86400) / 3600;
-        let m = (local_ts % 3600) / 60;
-        let s = local_ts % 60;
+        let (h, m, s) = local_hms();
         let line = format!("[{:02}:{:02}:{:02}] [SCHED] {}\n", h, m, s, event);
         self.enqueue(line);
     }
@@ -209,14 +203,7 @@ impl ApiLogger {
         status: u16,
         error: Option<&str>,
     ) {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-        let local_ts = now + 8 * 3600;
-        let h = (local_ts % 86400) / 3600;
-        let m = (local_ts % 3600) / 60;
-        let s = local_ts % 60;
+        let (h, m, s) = local_hms();
 
         // 审查 P2-6：按 Unicode 字符截断（原字节切片落点多字节字符内会 panic）
         let uid_short: String = uid.chars().take(12).collect();

@@ -520,6 +520,37 @@ pub fn oauth_get_login_url(state: State<AppState>) -> Result<OAuthLoginUrl, Stri
             "Unknown-Device".into()
         }
     }
+    // 设备类型/OS 版本按平台分派（审查 H2）：此前 mac 也硬编码 windows/Windows，
+    // 与 mac 设备凭证指纹（machine_id/hostname 均已按 mac 取值）自相矛盾，
+    // 设备指纹严格校验时有触发风控（20403）的实际风险。
+    // 注意：mac 侧取值（x_device_type=mac / "macOS <ver>"）暂为最贴近的合理值，
+    // 真实客户端上报形态待抓包核实——若不一致仅需调整本函数。
+    fn device_platform_fields() -> (String, String) {
+        #[cfg(windows)]
+        {
+            ("windows".into(), "Windows".into())
+        }
+        #[cfg(target_os = "macos")]
+        {
+            let ver = crate::platform::cmd::sys_command("sw_vers")
+                .arg("-productVersion")
+                .output()
+                .ok()
+                .filter(|o| o.status.success())
+                .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+                .filter(|s| !s.is_empty());
+            let os_version = match ver {
+                Some(v) => format!("macOS {v}"),
+                None => "macOS".into(),
+            };
+            ("mac".into(), os_version)
+        }
+        #[cfg(not(any(windows, target_os = "macos")))]
+        {
+            ("unknown".into(), "Unknown".into())
+        }
+    }
+    let (device_type, os_version) = device_platform_fields();
     let url = format!(
         "https://www.trae.cn/authorization?\
         login_version=1\
@@ -536,7 +567,7 @@ pub fn oauth_get_login_url(state: State<AppState>) -> Result<OAuthLoginUrl, Stri
         &x_device_id={device_id}\
         &x_machine_id={machine_id}\
         &x_device_brand={hostname}\
-        &x_device_type=windows\
+        &x_device_type={device_type}\
         &x_os_version={os_version}\
         &x_env=\
         &x_app_version={app_version}\
@@ -551,7 +582,8 @@ pub fn oauth_get_login_url(state: State<AppState>) -> Result<OAuthLoginUrl, Stri
         machine_id = machine_id,
         device_id = device_id,
         hostname = urlencoding::encode(&hostname),
-        os_version = urlencoding::encode("Windows"),
+        device_type = device_type,
+        os_version = urlencoding::encode(&os_version),
         app_version = OAUTH_PAGE_APP_VERSION,
         code_challenge = code_challenge,
     );
@@ -1062,6 +1094,14 @@ fn mask_sensitive(v: &mut serde_json::Value) {
                 if is_sensitive_key(k) {
                     if let Some(s) = val.as_str() {
                         if !s.is_empty() {
+                            // 审查 L：短纯数字串不打码——Error.Code/StandardCode 实测为
+                            // 字符串形态数字（"20101"），打码后 [OAuth交换-响应] 日志
+                            // 失去最关键的错误码；真实凭证（授权码/令牌）恒为长随机串，
+                            // 长度上限 12 + 纯数字双条件确保不会误放行
+                            if s.len() <= 12 && s.chars().all(|c| c.is_ascii_digit()) {
+                                mask_sensitive(val);
+                                continue;
+                            }
                             *val = serde_json::Value::String(mask_str(s));
                             continue;
                         }

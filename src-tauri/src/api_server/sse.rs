@@ -4,7 +4,7 @@ use std::time::Duration;
 use serde_json::{json, Map, Value};
 
 use super::wb_upstream::InterruptibleLines;
-use super::wb_sse::{cache_write_tokens_of, cached_tokens_of};
+use super::wb_sse::{cache_write_tokens_of, cached_tokens_of, token_number};
 use crate::api_server::routes::stream_msg_or_fallback;
 
 /// 上游停滞期间的断连轮询间隔：每 500ms 醒来检查一次客户端是否断连
@@ -621,9 +621,16 @@ fn usage_i64(u: &Value, keys: &[&str]) -> Option<i64> {
 /// 归一化 OpenAI usage：WB token_usage 原始字段（cache_read_token 等）→
 /// OpenAI 标准（prompt_tokens/completion_tokens + prompt_tokens_details.cached_tokens）。
 /// 下游（CPA 等）只认标准字段，直接透传原始事件会导致缓存读恒为 0。
+/// prompt/completion 用 token_number 宽口径解析（f64/字符串形态不再静默得 0），
+/// 与 wb_sse::u64_pair / tool-exec 累加同口径——否则会出现「缓存读 > 总输入」的矛盾账。
 pub(crate) fn normalize_openai_usage(u: &Value) -> Value {
-    let prompt = usage_i64(u, &["prompt_tokens", "input_tokens"]).unwrap_or(0);
-    let completion = usage_i64(u, &["completion_tokens", "output_tokens"]).unwrap_or(0);
+    let num = |keys: &[&str]| -> u64 {
+        keys.iter()
+            .find_map(|k| u.get(*k).and_then(token_number))
+            .unwrap_or(0)
+    };
+    let prompt = num(&["prompt_tokens", "input_tokens"]);
+    let completion = num(&["completion_tokens", "output_tokens"]);
     json!({
         "prompt_tokens": prompt,
         "completion_tokens": completion,
@@ -1344,6 +1351,21 @@ mod tests {
         let n = normalize_openai_usage(&u);
         assert_eq!(n["prompt_tokens"], serde_json::json!(10));
         assert_eq!(n["prompt_tokens_details"]["cached_tokens"], serde_json::json!(0));
+    }
+
+    #[test]
+    fn normalize_openai_usage_accepts_f64_and_string_forms() {
+        // 宽口径对齐 token_number：浮点/字符串形态不再静默得 0
+        let u = serde_json::json!({
+            "prompt_tokens": 100.0,
+            "completion_tokens": "20",
+            "cache_read_token": 80,
+        });
+        let n = normalize_openai_usage(&u);
+        assert_eq!(n["prompt_tokens"], serde_json::json!(100));
+        assert_eq!(n["completion_tokens"], serde_json::json!(20));
+        assert_eq!(n["total_tokens"], serde_json::json!(120));
+        assert_eq!(n["prompt_tokens_details"]["cached_tokens"], serde_json::json!(80));
     }
 
     #[test]

@@ -775,10 +775,15 @@ pub fn update_restart_app(app: AppHandle) -> Result<(), String> {
                 status.code()
             ));
         }
-        // 结果型事件：emit 失败落 stderr（issue #44 约定；即将 exit，无 data_dir 需求）
+        // 结果型事件：emit 失败落 stderr（issue #44 约定）
         crate::events::emit_logged(&app, "update-restarting", serde_json::Value::Null, None);
         std::thread::sleep(Duration::from_millis(800));
-        std::process::exit(0);
+        // app.exit(0) 走 RunEvent::Exit 清理链（停进程内代理、停 API 服务、还原系统代理）
+        // ——与 update_quit_app 同口径。std::process::exit(0) 会跳过清理：MITM 代理
+        // 运行中重启更新会使系统代理停留在 127.0.0.1:<port>，重启后全局断网且
+        // 启动路径无 cleanup_stale_local_proxy 自愈（仅直开应用命令触发）
+        app.exit(0);
+        Ok(())
     }
     #[cfg(not(target_os = "macos"))]
     {

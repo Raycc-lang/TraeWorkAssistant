@@ -37,6 +37,11 @@ pub fn app_support_root() -> Result<std::path::PathBuf, String> {
         let home = std::env::var("HOME").map_err(|_| "无法读取 HOME 环境变量".to_string())?;
         Ok(std::path::PathBuf::from(home).join("Library/Application Support"))
     }
+    // 编译卫生兜底（对齐 cert.rs / oauth.rs 惯例）：非目标平台给出可编译分支
+    #[cfg(not(any(windows, target_os = "macos")))]
+    {
+        Err("仅支持 Windows / macOS".to_string())
+    }
 }
 
 /// 目标应用数据基根（profile.rs / env.rs 的档案路径展开用）：
@@ -54,6 +59,10 @@ pub fn local_data_root() -> Result<std::path::PathBuf, String> {
     {
         app_support_root()
     }
+    #[cfg(not(any(windows, target_os = "macos")))]
+    {
+        Err("仅支持 Windows / macOS".to_string())
+    }
 }
 
 /// Program Files / /Applications（exe 候选路径基根）
@@ -68,6 +77,10 @@ pub fn programs_root() -> Result<std::path::PathBuf, String> {
     #[cfg(target_os = "macos")]
     {
         Ok(std::path::PathBuf::from("/Applications"))
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
+    {
+        Err("仅支持 Windows / macOS".to_string())
     }
 }
 
@@ -88,6 +101,12 @@ pub fn home_dir() -> std::path::PathBuf {
             .unwrap_or_default()
     }
     #[cfg(target_os = "macos")]
+    {
+        std::env::var("HOME")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_default()
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
     {
         std::env::var("HOME")
             .map(std::path::PathBuf::from)

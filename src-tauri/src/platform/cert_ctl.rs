@@ -60,6 +60,15 @@ pub fn cert_query(subject: &str) -> bool {
         };
         let written = file.write_all(pem.as_bytes()).is_ok();
         drop(file);
+        // 审查 L1：清理挂 Drop guard——verify-cert panic/线程中断等异常路径也保证
+        // 删除临时 PEM，代理启动与 cert_status 并发调用不再累积残留
+        struct RemoveOnDrop(std::path::PathBuf);
+        impl Drop for RemoveOnDrop {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_file(&self.0);
+            }
+        }
+        let _cleanup = RemoveOnDrop(tmp.clone());
         let trusted = written
             && crate::platform::cmd::sys_output(
                 crate::platform::cmd::sys_command("security")
@@ -68,7 +77,6 @@ pub fn cert_query(subject: &str) -> bool {
                     .args(["-p", "ssl"]),
             )
             .is_ok(); // sys_output 非零退出码即 Err（含 CSSMERR_TP_NOT_TRUSTED 未信任）
-        let _ = std::fs::remove_file(&tmp);
         trusted
     }
     #[cfg(not(any(windows, target_os = "macos")))]

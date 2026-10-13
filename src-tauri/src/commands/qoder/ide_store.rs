@@ -471,7 +471,27 @@ pub async fn qoder_ide_scan(
     };
     // 凭证按生效 id 落库（uid 兜底命中时为池内既有 id），与池条目对齐——
     // 若按派生 id 落库则凭证与池条目错位，后续扫描/导入按 id 查不到新凭证
-    qoder_common::save_token_store(&st, &effective_id, &creds)?;
+    // 审查 M3：落库失败不再直接上抛——with_pool_mut 已把账号写进池（含
+    // needs_relogin 清零），上抛会跳过 async 侧热重载，网关池与本地池短暂
+    // 不一致。改为返回 found=true + reason 警告 + should_reload=true：
+    // 热重载照常执行，前端以 info toast 如实展示落库失败
+    if let Err(e) = qoder_common::save_token_store(&st, &effective_id, &creds) {
+        crate::fs_utils::app_log(
+            &st.data_dir,
+            &format!("Qoder IDE 存储账号 {effective_id} 凭证落库失败（池条目已入账，热重载照常执行）: {e}"),
+        );
+        return Ok((
+            QoderIdeScanResult {
+                found: true,
+                imported: false,
+                updated: false,
+                account_id: effective_id,
+                nickname,
+                reason: format!("已入池但凭证落库失败（vault/密钥库异常），请排查后重试扫描: {e}"),
+            },
+            true,
+        ));
+    }
     crate::fs_utils::app_log(&st.data_dir, &format!("Qoder IDE 存储账号已发现并导入: {effective_id}"));
             Ok((
                 QoderIdeScanResult {

@@ -702,6 +702,15 @@ pub fn resolve_native_risk_identity() -> Option<&'static NativeRiskIdentity> {
             FINAL.get().and_then(|o| o.as_ref())
         }
         RuntimeInfoOutcome::DeterministicNone => {
+            // 审查 L：降级事实落日志（进程生命周期一次）——派生 fallback 会被服务端
+            // 分入独立风控桶（模块头注释），直接后果是 campaigns 恒空 / claim 盲发
+            // 503；此前零观测，排障只能从「空活动列表」侧面推断
+            static DEGRADE_LOGGED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+            if DEGRADE_LOGGED.set(()).is_ok() {
+                crate::fs_utils::app_log_default(
+                    "[Qoder风控] 原生风控身份不可用（客户端未装在固定根/bundle 缺 runtime-info），已降级 machine_id 派生指纹",
+                );
+            }
             let _ = FINAL.set(None);
             None
         }

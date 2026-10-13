@@ -253,13 +253,25 @@ fn scan_cookies_db(ctx: &ProxyCtx, db: &Path, key: Option<&[u8]>) -> Result<usiz
         .map(|d| d.as_nanos())
         .unwrap_or(0);
     let td = std::env::temp_dir().join(format!("aw_trae_ck_{}_{nanos}", std::process::id()));
-    std::fs::create_dir_all(&td).map_err(|e| format!("临时目录创建失败: {e}"))?;
-    let tmp_db = td.join("Cookies");
-    let copy_res = std::fs::copy(db, &tmp_db).map_err(|e| format!("Cookies 复制失败: {e}"));
-    if copy_res.is_err() {
-        let _ = std::fs::remove_dir_all(&td);
-        return Err(copy_res.unwrap_err());
+    // 审查 L1：目录权限收紧 0700（内容为用户 Cookies 库副本，敏感）+ 清理挂 Drop
+    // guard——中途 panic/线程中断也保证删除，不再依赖正常路径的 remove_dir_all
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::create_dir_all(&td).map_err(|e| format!("临时目录创建失败: {e}"))?;
+        let _ = std::fs::set_permissions(&td, std::fs::Permissions::from_mode(0o700));
     }
+    #[cfg(not(unix))]
+    std::fs::create_dir_all(&td).map_err(|e| format!("临时目录创建失败: {e}"))?;
+    struct RemoveDirOnDrop(std::path::PathBuf);
+    impl Drop for RemoveDirOnDrop {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    let _cleanup = RemoveDirOnDrop(td.clone());
+    let tmp_db = td.join("Cookies");
+    std::fs::copy(db, &tmp_db).map_err(|e| format!("Cookies 复制失败: {e}"))?;
     for suffix in ["-wal", "-shm"] {
         let side = db.with_file_name(format!("Cookies{suffix}"));
         if side.exists() {
@@ -306,7 +318,6 @@ fn scan_cookies_db(ctx: &ProxyCtx, db: &Path, key: Option<&[u8]>) -> Result<usiz
         }
         Ok(found)
     })();
-    let _ = std::fs::remove_dir_all(&td);
     result
 }
 

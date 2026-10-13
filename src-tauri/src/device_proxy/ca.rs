@@ -55,24 +55,27 @@ pub struct CaAuthority {
 
 impl CaAuthority {
     /// 按域名生成（或取缓存）TLS 服务端配置。叶子证书 CN/SAN=域名，有效期 10 年。
-    pub fn gen_server_config(&self, host: &str) -> Arc<ServerConfig> {
+    /// Err = 签发失败（host 来自 CONNECT 目标、属任意外部输入，非法 SAN/IP 无法
+    /// 构造证书参数等）——失败不缓存，由调用方关闭该连接并记日志（审查 M2：
+    /// 原 expect 会 per-connection panic 刷日志，可被畸形 host 干扰 MITM 面）
+    pub fn gen_server_config(&self, host: &str) -> Result<Arc<ServerConfig>, String> {
         if let Some(cfg) = self.cache.lock().unwrap_or_else(|e| e.into_inner()).get(host) {
-            return Arc::clone(cfg);
+            return Ok(Arc::clone(cfg));
         }
-        let cfg = Arc::new(self.build_server_config(host));
+        let cfg = Arc::new(self.build_server_config(host)?);
         let mut cache = self.cache.lock().unwrap_or_else(|e| e.into_inner());
         if cache.len() >= LEAF_CACHE_MAX {
             cache.clear();
         }
         cache.insert(host.to_string(), Arc::clone(&cfg));
-        cfg
+        Ok(cfg)
     }
 
-    fn build_server_config(&self, host: &str) -> ServerConfig {
+    fn build_server_config(&self, host: &str) -> Result<ServerConfig, String> {
         let not_before = OffsetDateTime::now_utc() - Duration::days(1);
         // rcgen 0.14：new() 接受字符串 SAN，内部自动识别 IP 地址
         let mut params = CertificateParams::new(vec![host.to_string()])
-            .expect("leaf certificate params");
+            .map_err(|e| format!("leaf certificate params invalid for {host}: {e}"))?;
         params.distinguished_name.push(DnType::CommonName, host);
         params.not_before = not_before;
         params.not_after = not_before + Duration::days(3650);
@@ -83,23 +86,23 @@ impl CaAuthority {
 
         let cert = params
             .signed_by(&self.leaf_key, &self.issuer)
-            .expect("failed to sign leaf certificate");
+            .map_err(|e| format!("failed to sign leaf certificate for {host}: {e}"))?;
 
         let cfg = ServerConfig::builder_with_provider(Arc::clone(&self.provider))
             .with_safe_default_protocol_versions()
-            .expect("protocol versions")
+            .map_err(|e| format!("protocol versions: {e}"))?
             .with_no_client_auth()
             .with_single_cert(
                 vec![CertificateDer::from(cert)],
                 PrivatePkcs8KeyDer::from(self.leaf_key.serialize_der()).into(),
             )
-            .expect("failed to build server config");
+            .map_err(|e| format!("failed to build server config for {host}: {e}"))?;
         // 不广播 ALPN（对齐 Python 版 ssl.SSLContext 默认行为——ServerHello 不带
         // ALPN 扩展，客户端一律回落 HTTP/1.1）。差异修复 2026-09-15：此前显式广播
         // ALPN=[http/1.1]，对只提供 h2 的客户端（豆包 cronet/ttnet 原生栈对其 API
         // 域常见）服务端选不出共同协议直接握手告警中止（实测 proxy.log 大量
         // 「TLS 握手失败 os error 10053」，Python 版同域无此现象）。
-        cfg
+        Ok(cfg)
     }
 }
 
@@ -414,7 +417,7 @@ mod tests {
         let ca2 = ensure_ca(&tmp).expect("reload");
         let _ = ca2.gen_server_config("api.trae.cn");
 
-        let cfg = ca.gen_server_config("api.trae.cn");
+        let cfg = ca.gen_server_config("api.trae.cn").expect("leaf config");
         // 不广播 ALPN：对齐 Python 版行为（客户端回落 HTTP/1.1）
         assert!(cfg.alpn_protocols.is_empty());
         let _ = std::fs::remove_dir_all(&tmp);
@@ -435,7 +438,7 @@ mod tests {
 
         let ca = ensure_ca(&tmp).expect("legacy PKCS#1 CA must load");
         // 签发器可用：复用 RSA CA 密钥签发叶子证书
-        let cfg = ca.gen_server_config("api.trae.cn");
+        let cfg = ca.gen_server_config("api.trae.cn").expect("legacy leaf config");
         // 不广播 ALPN：对齐 Python 版行为（客户端回落 HTTP/1.1）
         assert!(cfg.alpn_protocols.is_empty());
         // 加载路径不得重写 CA 文件（换 CA = 强制所有用户重装证书）

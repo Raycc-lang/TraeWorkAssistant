@@ -379,7 +379,8 @@ pub fn profile_for(app: TargetApp, app_data_dir: &std::path::Path) -> AppProfile
             // （switcher/electron_root.rs）纯文件拷贝，跨平台零改动。数据目录收口
             // roaming_dir()：Windows=%APPDATA%\com.qodercn.app.stable（2026-10-02
             // 实测）/ mac=~/Library/Application Support/com.qodercn.app.stable
-            // （Electron userData 惯例——**待真机实测**）；mac_supported 灰度 false。
+            // （Electron userData 惯例，2026-10-05 真机实测定稿，见下方
+            // mac_supported 段——此前的「待真机实测/灰度 false」旧稿注释已随放开更新）。
             app_name: "Qoder Work",
             layout: Layout::ElectronRoot,
             data_dir: roaming_dir("com.qodercn.app.stable"),

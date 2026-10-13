@@ -81,9 +81,11 @@ fn mac_services() -> Result<Vec<String>, String> {
     crate::platform::proxy_ctl::network_services()
 }
 
-/// 读某服务的 bypass 域列表（未设置时 networksetup 输出说明行，过滤之）
+/// 读某服务的 bypass 域列表（未设置时 networksetup 输出说明行，过滤之）。
+/// Err = 读取失败（networksetup 不可用/服务名无效等）——调用方不得把「读不到」
+/// 当作「本来为空」执行覆盖写，否则会把用户 bypass 整体清掉（审查 M1）
 #[cfg(target_os = "macos")]
-fn mac_bypass_list(svc: &str) -> Vec<String> {
+fn mac_bypass_list(svc: &str) -> Result<Vec<String>, String> {
     crate::platform::cmd::sys_output(
         crate::platform::cmd::sys_command("networksetup").args(["-getproxybypassdomains", svc]),
     )
@@ -99,7 +101,6 @@ fn mac_bypass_list(svc: &str) -> Vec<String> {
             .map(String::from)
             .collect()
     })
-    .unwrap_or_default()
 }
 
 /// 写某服务的 bypass 域列表（空列表 → man 页 Empty 关键字清空）
@@ -137,7 +138,10 @@ pub fn cleanup_residual_bypass(data_dir: &Path) {
         return;
     };
     for svc in &services {
-        let current = mac_bypass_list(svc);
+        // 审查 M1：读取失败的服务跳过（不当作空覆盖写），保留 marker 下次启动重试
+        let Ok(current) = mac_bypass_list(svc) else {
+            return;
+        };
         let remaining: Vec<String> = current
             .into_iter()
             .filter(|s| !added.iter().any(|a| a.eq_ignore_ascii_case(s)))
@@ -253,7 +257,12 @@ pub fn enable_oauth_bypass(data_dir: &Path) -> Result<bool, String> {
     let mut collected: Vec<String> = Vec::new();
     let mut errs: Vec<String> = Vec::new();
     for svc in &mac_services()? {
-        let current = mac_bypass_list(svc);
+        // 审查 M1：读取失败的服务跳过合并写入（不当作空表覆盖），并计入错误——
+        // 该服务缺豁免条目可能影响捕获，如实上报
+        let Ok(current) = mac_bypass_list(svc) else {
+            errs.push(format!("{svc}: 读取 bypass 列表失败，已跳过"));
+            continue;
+        };
         let mut merged = current.clone();
         for e in OAUTH_BYPASS_ENTRIES {
             if !current.iter().any(|x| x.eq_ignore_ascii_case(e)) {
@@ -294,7 +303,9 @@ pub fn disable_oauth_bypass(data_dir: &Path) -> Result<(), String> {
     // 即整体报错且不清账（保留 ADDED + marker 供重试）——半还原状态下「失忆」
     // 会让用户 bypass 永久残留（对齐 Windows 注册表路径的 ? 传播语义）
     for svc in mac_services()? {
-        let current = mac_bypass_list(&svc);
+        // 审查 M1：读取失败按 Err 上抛（保留 ADDED + marker 供重试），不得当作
+        // 空表覆盖写清空用户 bypass
+        let current = mac_bypass_list(&svc)?;
         let remaining: Vec<String> = current
             .into_iter()
             .filter(|s| !added.iter().any(|a| a.eq_ignore_ascii_case(s)))
