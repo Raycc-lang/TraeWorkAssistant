@@ -512,14 +512,8 @@ mod tests {
     /// 配置读取（SQLite 化 P2）：kv 缺失 → 空配置；写入后可读回
     #[test]
     fn load_config_kv_roundtrip() {
-        let dir = std::env::temp_dir().join(format!(
-            "twa_route_{}_{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos()
-        ));
+        // 目录名唯一性交给 fs_utils::test_temp_dir（进程内计数器），防 CI 偶发撞名
+        let dir = crate::fs_utils::test_temp_dir("twa_route");
         std::fs::create_dir_all(dir.join("data")).unwrap();
         // kv 缺失 → 空配置
         let empty = load_config(&dir);

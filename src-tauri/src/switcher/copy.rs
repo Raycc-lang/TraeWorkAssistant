@@ -115,14 +115,7 @@ mod tests {
     }
 
     fn tmpdir(tag: &str) -> std::path::PathBuf {
-        let d = std::env::temp_dir().join(format!(
-            "sw-copy-{tag}-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .subsec_nanos()
-        ));
+        let d = crate::fs_utils::test_temp_dir(&format!("sw-copy-{tag}"));
         std::fs::create_dir_all(&d).unwrap();
         d
     }

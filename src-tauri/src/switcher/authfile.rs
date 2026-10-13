@@ -980,16 +980,9 @@ mod tests {
     }
 
     /// Session 构造：auth 路径注入临时目录（不触碰真实 auth 文件），
-    /// 目录含纳秒级后缀（Windows pid 可复用，防上次运行残留互踩），先清再建
+    /// 目录名由 test_temp_dir 计数器保证唯一，先清再建
     fn session(app: TargetApp, tag: &str) -> Session {
-        let data = std::env::temp_dir().join(format!(
-            "sw-auth-{tag}-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .subsec_nanos()
-        ));
+        let data = crate::fs_utils::test_temp_dir(&format!("sw-auth-{tag}"));
         let _ = std::fs::remove_dir_all(&data);
         let mut args = RunArgs {
             action: Action::Switch,
@@ -1015,14 +1008,7 @@ mod tests {
     #[test]
     fn auth_file_uid_四键兼容() {
         let _guard = test_io_lock();
-        let base = std::env::temp_dir().join(format!(
-            "sw-authuid-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .subsec_nanos()
-        ));
+        let base = crate::fs_utils::test_temp_dir("sw-authuid");
         std::fs::create_dir_all(&base).unwrap();
         let p = base.join("auth.info");
         for (content, want) in [

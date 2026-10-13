@@ -1154,14 +1154,7 @@ mod tests {
     /// sidecar detectedUid ≠ 槽位 → 污染自愈指引（切换是死循环）；其余 → 通用文案
     #[test]
     fn save_reject_message_三类场景分流() {
-        let base = std::env::temp_dir().join(format!(
-            "sw-reject-msg-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .subsec_nanos()
-        ));
+        let base = crate::fs_utils::test_temp_dir("sw-reject-msg");
         let _ = std::fs::remove_dir_all(&base);
         let profiles = base.join("data").join("profiles");
         std::fs::create_dir_all(&profiles).unwrap();
@@ -1326,14 +1319,7 @@ mod tests {
     /// bootstrap 测试用 Session：全部 IO 路径注入纳秒级临时目录（store db、
     /// profiles_dir、auth 文件均不触碰真实机器路径）
     fn bootstrap_session(tag: &str, app: TargetApp) -> Session {
-        let base = std::env::temp_dir().join(format!(
-            "sw-boot-{tag}-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .subsec_nanos()
-        ));
+        let base = crate::fs_utils::test_temp_dir(&format!("sw-boot-{tag}"));
         let _ = std::fs::remove_dir_all(&base);
         let args = RunArgs {
             action: Action::Switch,

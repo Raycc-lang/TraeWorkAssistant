@@ -288,14 +288,8 @@ mod tests {
     use super::*;
 
     fn tmp_db(tag: &str) -> std::path::PathBuf {
-        let p = std::env::temp_dir().join(format!(
-            "f68-{tag}-{}-{}.vscdb",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .subsec_nanos()
-        ));
+        // 计数器防 CI 同微秒撞名（原 subsec_nanos 在 macOS 粒度仅 ~1µs）
+        let p = crate::fs_utils::test_temp_dir(&format!("f68-{tag}")).with_extension("vscdb");
         let _ = std::fs::remove_file(&p);
         p
     }

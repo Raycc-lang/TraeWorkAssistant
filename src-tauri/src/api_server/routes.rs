@@ -3118,15 +3118,8 @@ mod tests {
     }
 
     fn wl_fixture(tag: &str) -> WlFixture {
-        let dir = std::env::temp_dir().join(format!(
-            "twa_routes_wl_test_{}_{}_{}",
-            std::process::id(),
-            tag,
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos()
-        ));
+        // 目录名唯一性交给 fs_utils::test_temp_dir（进程内计数器），防 CI 偶发撞名
+        let dir = crate::fs_utils::test_temp_dir(&format!("twa_routes_wl_test_{tag}"));
         std::fs::create_dir_all(&dir).unwrap();
         let state = Arc::new(ApiSharedState {
             pool: super::super::pool::ApiPool::new(),

@@ -296,14 +296,8 @@ mod tests {
     }
 
     fn session(tag: &str) -> Session {
-        let data = std::env::temp_dir().join(format!(
-            "sw-icube-{tag}-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .subsec_nanos()
-        ));
+        // 计数器防 CI 同微秒撞名（原 subsec_nanos 在 macOS 粒度仅 ~1µs）
+        let data = crate::fs_utils::test_temp_dir(&format!("sw-icube-{tag}"));
         let _ = std::fs::remove_dir_all(&data);
         let mut args = RunArgs {
             action: Action::Switch,
@@ -382,14 +376,8 @@ mod tests {
 
     #[test]
     fn detect_live_uid_最新会话与guid_ouid边界检查() {
-        let appdata = std::env::temp_dir().join(format!(
-            "sw-icube-detect-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .subsec_nanos()
-        ));
+        // 计数器防 CI 同微秒撞名（原 subsec_nanos 在 macOS 粒度仅 ~1µs）
+        let appdata = crate::fs_utils::test_temp_dir("sw-icube-detect");
         let _ = std::fs::remove_dir_all(&appdata);
         let logs = appdata.join("logs");
         // 次新会话：另一账号的 uid（不应被采纳）

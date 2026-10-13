@@ -955,14 +955,8 @@ mod tests {
     /// 注意 wb_catalog 语义"空文件=缺失"，显式空目录不可表达——
     /// 需要"无 WB 干扰"时传一个不相关模型，如 Some(&["hy4"])）
     fn fixture(trae_models: &[&str], wb_models: Option<&[&str]>, policy: Option<&DispatchPolicy>) -> Fixture {
-        let dir = std::env::temp_dir().join(format!(
-            "twa_dispatch_test_{}_{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos()
-        ));
+        // 目录名唯一性交给 fs_utils::test_temp_dir（进程内计数器），防 CI 偶发撞名
+        let dir = crate::fs_utils::test_temp_dir("twa_dispatch_test");
         std::fs::create_dir_all(dir.join("data")).unwrap();
         // SQLite 化（P2）：测试种子改走 kv（api_models / wb_model_catalog / dispatch_policy）
         let st = crate::store::db(&dir);

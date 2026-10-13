@@ -836,14 +836,9 @@ mod tests {
         wb: &[&str],
         meta: Option<serde_json::Value>,
     ) -> Fixture {
-        let dir = std::env::temp_dir().join(format!(
-            "twa_ucat_test_{}_{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos()
-        ));
+        // 目录名唯一性交给 fs_utils::test_temp_dir（进程内计数器），修复 CI
+        // 偶发同微秒撞名导致的跨测试种子覆盖
+        let dir = crate::fs_utils::test_temp_dir("twa_ucat_test");
         std::fs::create_dir_all(dir.join("data")).unwrap();
         // SQLite 化（P2）：测试种子改走 kv（api_models / wb_model_catalog / trae_model_meta）
         let st = crate::store::db(&dir);

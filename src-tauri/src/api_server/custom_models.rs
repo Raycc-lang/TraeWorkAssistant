@@ -213,14 +213,8 @@ mod tests {
     struct Fixture(std::path::PathBuf);
     impl Fixture {
         fn new() -> Fixture {
-            let dir = std::env::temp_dir().join(format!(
-                "twa_custom_{}_{}",
-                std::process::id(),
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_nanos()
-            ));
+            // 目录名唯一性交给 fs_utils::test_temp_dir（进程内计数器），防 CI 偶发撞名
+            let dir = crate::fs_utils::test_temp_dir("twa_custom");
             std::fs::create_dir_all(dir.join("data")).unwrap();
             Fixture(dir)
         }

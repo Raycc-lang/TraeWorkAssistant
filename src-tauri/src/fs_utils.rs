@@ -299,6 +299,23 @@ fn dig_key<'a>(v: &'a serde_json::Value, key: &str, depth: usize) -> Option<&'a 
     }
 }
 
+/// 生成并行测试专用的唯一临时目录（仅测试可用）：`<temp>/<tag>_<pid>_<自增序号>`。
+///
+/// 唯一性必须用进程内原子计数器保证，不依赖系统时钟——macOS 实时时钟粒度约
+/// 1µs，cargo 并行测试在同一微秒窗口内各自建 fixture 时会得到同名目录（同
+/// pid），共享同一 SQLite 后 kv 种子互相覆盖，偶发断言失败（CI 实录：
+/// unified_catalog t02 读到 t03 的种子 → len 3≠1）。
+#[cfg(test)]
+pub fn test_temp_dir(tag: &str) -> std::path::PathBuf {
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    std::env::temp_dir().join(format!(
+        "{tag}_{}_{}",
+        std::process::id(),
+        n
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

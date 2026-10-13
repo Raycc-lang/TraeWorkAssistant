@@ -480,14 +480,8 @@ mod tests {
     }
 
     fn session(tag: &str) -> Session {
-        let data = std::env::temp_dir().join(format!(
-            "sw-chromium-{tag}-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .subsec_nanos()
-        ));
+        // 计数器防 CI 同微秒撞名（原 subsec_nanos 在 macOS 粒度仅 ~1µs）
+        let data = crate::fs_utils::test_temp_dir(&format!("sw-chromium-{tag}"));
         let _ = std::fs::remove_dir_all(&data);
         let mut args = RunArgs {
             action: Action::Switch,
@@ -508,14 +502,8 @@ mod tests {
 
     #[test]
     fn profile_dirs_枚举_default与profile_n排序() {
-        let base = std::env::temp_dir().join(format!(
-            "sw-cdirs-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .subsec_nanos()
-        ));
+        // 计数器防 CI 同微秒撞名（原 subsec_nanos 在 macOS 粒度仅 ~1µs）
+        let base = crate::fs_utils::test_temp_dir("sw-cdirs");
         std::fs::create_dir_all(base.join("Profile 10")).unwrap();
         std::fs::create_dir_all(base.join("Default")).unwrap();
         std::fs::create_dir_all(base.join("Profile 2")).unwrap();
@@ -532,14 +520,8 @@ mod tests {
 
     #[test]
     fn cookies_新旧布局归一() {
-        let base = std::env::temp_dir().join(format!(
-            "sw-ck-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .subsec_nanos()
-        ));
+        // 计数器防 CI 同微秒撞名（原 subsec_nanos 在 macOS 粒度仅 ~1µs）
+        let base = crate::fs_utils::test_temp_dir("sw-ck");
         let prof = base.join("Default");
         // 新布局：Network\Cookies + Network\Cookies-journal
         std::fs::create_dir_all(prof.join("Network")).unwrap();

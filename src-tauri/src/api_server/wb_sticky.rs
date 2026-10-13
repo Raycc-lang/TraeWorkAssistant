@@ -448,14 +448,8 @@ mod tests {
     /// 不得删除无前缀键——修复前整表替换互删对方运行期新增的绑定
     #[test]
     fn scoped_save_preserves_other_namespace_rows() {
-        let dir = std::env::temp_dir().join(format!(
-            "twa_sticky_scoped_{}_{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos()
-        ));
+        // 目录名唯一性交给 fs_utils::test_temp_dir（进程内计数器），防 CI 偶发撞名
+        let dir = crate::fs_utils::test_temp_dir("twa_sticky_scoped");
         std::fs::create_dir_all(dir.join("data")).unwrap();
         let wb = StickyStore::load_ns(&dir, "");
         let qoder = StickyStore::load_ns(&dir, "q:");
@@ -479,14 +473,8 @@ mod tests {
     /// 落盘写入 data/ 子目录；1s 节流窗口内的重复 save 跳过写盘（内存态照常更新）
     #[test]
     fn save_writes_data_subdir_and_throttles_within_one_second() {
-        let dir = std::env::temp_dir().join(format!(
-            "twa_sticky_{}_{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos()
-        ));
+        // 目录名唯一性交给 fs_utils::test_temp_dir（进程内计数器），防 CI 偶发撞名
+        let dir = crate::fs_utils::test_temp_dir("twa_sticky");
         std::fs::create_dir_all(dir.join("data")).unwrap();
         let store = StickyStore::new();
         let key = SessionKey::from_body(&body_with(Some("c"), json!([{"role":"user","content":"x"}])));
@@ -510,14 +498,8 @@ mod tests {
     /// 读取兼容：data/ 新路径不存在时回退旧根路径（存量用户数据），save 迁移写新路径
     #[test]
     fn load_falls_back_to_legacy_root_path() {
-        let dir = std::env::temp_dir().join(format!(
-            "twa_sticky_legacy_{}_{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos()
-        ));
+        // 目录名唯一性交给 fs_utils::test_temp_dir（进程内计数器），防 CI 偶发撞名
+        let dir = crate::fs_utils::test_temp_dir("twa_sticky_legacy");
         std::fs::create_dir_all(dir.join("data")).unwrap();
         // SQLite 化（P6）：种子 = sticky_bindings 表
         crate::store::docs::sticky_bindings_save(

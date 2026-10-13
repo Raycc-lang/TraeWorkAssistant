@@ -129,14 +129,8 @@ mod tests {
     }
 
     fn fixture(app_settings: Option<serde_json::Value>) -> Fixture {
-        let dir = std::env::temp_dir().join(format!(
-            "twa_gwset_test_{}_{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos()
-        ));
+        // 目录名唯一性交给 fs_utils::test_temp_dir（进程内计数器），防 CI 偶发撞名
+        let dir = crate::fs_utils::test_temp_dir("twa_gwset_test");
         std::fs::create_dir_all(dir.join("conf")).unwrap();
         std::fs::create_dir_all(dir.join("data")).unwrap();
         if let Some(v) = app_settings {

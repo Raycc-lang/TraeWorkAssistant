@@ -811,14 +811,7 @@ mod tests {
     /// 保证 hybrid 分支确定选标记（不受测试机真实 %APPDATA% 证据干扰）。
     #[test]
     fn live_cloud_uid_with_日志优先与hybrid回退() {
-        let base = std::env::temp_dir().join(format!(
-            "trae-apps-live-uid-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .subsec_nanos()
-        ));
+        let base = crate::fs_utils::test_temp_dir("trae-apps-live-uid");
         let _ = std::fs::remove_dir_all(&base);
         // 应用数据目录：最新会话日志记录 uid=3401…（客户端真实登录）
         let app_dir = base.join("appdata");
@@ -903,14 +896,7 @@ mod tests {
     /// BOM 剥离与 profiles 目录路由按档案表）
     #[test]
     fn marker_with_ts_读取标记与切换时刻() {
-        let data = std::env::temp_dir().join(format!(
-            "trae-apps-marker-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .subsec_nanos()
-        ));
+        let data = crate::fs_utils::test_temp_dir("trae-apps-marker");
         let _ = std::fs::remove_dir_all(&data);
         // TraeWork → data/data/profiles（档案表路由）
         let dir = crate::switcher::profile::profile_for(

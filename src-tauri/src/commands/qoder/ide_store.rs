@@ -552,14 +552,7 @@ mod tests {
 
     #[test]
     fn vscdb读键_text与blob与缺文件() {
-        let p = std::env::temp_dir().join(format!(
-            "f80-ide-{}-{}.vscdb",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .subsec_nanos()
-        ));
+        let p = crate::fs_utils::test_temp_dir("f80-ide").with_extension("vscdb");
         let _ = std::fs::remove_file(&p);
         let conn = rusqlite::Connection::open(&p).unwrap();
         conn.execute_batch("CREATE TABLE ItemTable (key TEXT PRIMARY KEY, value BLOB)")
@@ -616,14 +609,7 @@ mod tests {
     #[test]
     fn work_auth_dat_解密全链路_roundtrip() {
         use base64::Engine as _;
-        let base = std::env::temp_dir().join(format!(
-            "f80-workauth-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .subsec_nanos()
-        ));
+        let base = crate::fs_utils::test_temp_dir("f80-workauth");
         let data_dir = base.join("com.qodercn.app.stable");
         std::fs::create_dir_all(&data_dir).unwrap();
 
@@ -720,14 +706,7 @@ mod mac_tests {
 
     #[test]
     fn mac_scan_work_login_uid_全链路_roundtrip() {
-        let base = std::env::temp_dir().join(format!(
-            "f80-mac-workauth-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .subsec_nanos()
-        ));
+        let base = crate::fs_utils::test_temp_dir("f80-mac-workauth");
         let data_dir = base.join("com.qodercn.app.stable");
         std::fs::create_dir_all(&data_dir).unwrap();
         let uid = "01a106b2d387786796f68391bdf6b179";
