@@ -1239,16 +1239,33 @@ mod tests {
     /// 审查 2026-10-07：活跃流中途断连且有内容——eof_truncated 应置位（流被
     /// 截断收尾），sent_any 语义不变；该场景 tx 已关、wb_sse 跳过补帧，
     /// 调用方日志文案据 tx.is_closed() 区分「客户端已断开」与「已补齐终止帧」
+    ///
+    /// 确定性：from_iterator 转发线程向无界 std channel 预取行，本闭包 drop rx
+    /// 的时机由生产者线程决定——CI 高负载下可能先于消费者首个 delta 下发执行，
+    /// 消费者首轮 tx.is_closed() 即 break，sent_any=false 误报（2026-10-13
+    /// macOS aarch64 job 偶发）。故 drop rx 前先 try_recv 观测到消费者已实际
+    /// 下发首帧（rx 未 drop，观测不影响消费），「断连前已下发」前提确定性成立；
+    /// 10s 兜底 deadline 防异常情况下测试无限挂起。
     #[test]
     fn stream_forward_eof_truncated_when_client_disconnects_midstream() {
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(64);
         let mut rx = Some(rx);
         let mut i = 0usize;
         // 行序列：delta + 空行交替；产出行 5 前模拟客户端断开（drop rx），
-        // 此前已完整下发 2 个 delta 事件（has_content/sent_any 已置位）
+        // 此前至少 1 个 delta 事件已完整下发（has_content/sent_any 已置位）
         let iter = std::iter::from_fn(move || {
             i += 1;
             if i == 5 {
+                if let Some(r) = rx.as_mut() {
+                    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+                    while matches!(r.try_recv(), Err(tokio::sync::mpsc::error::TryRecvError::Empty))
+                    {
+                        if std::time::Instant::now() >= deadline {
+                            break;
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(1));
+                    }
+                }
                 drop(rx.take());
             }
             if i > 9 {
