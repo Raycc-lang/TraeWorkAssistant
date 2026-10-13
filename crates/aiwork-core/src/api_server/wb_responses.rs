@@ -8,6 +8,7 @@
 //!
 //! 宽容解析红线：字段缺失不报错，只按规范降级（input 缺失 → 空消息列表）。
 
+use super::wb_sse::cached_tokens_of;
 use serde_json::{json, Map, Value};
 use std::collections::{HashMap, HashSet};
 
@@ -130,14 +131,16 @@ pub fn responses_to_chat(body: &Value) -> Result<Value, String> {
                     continue;
                 };
                 let encoded = format!("{}__{}", ns, iname);
-                // 裸名 → 编码名映射（审查修复 #3）：tool_choice 裸名命中组内
-                // 工具时拼回编码名，与 tools 声明一致
-                choice_inner_lookup
-                    .entry(iname.to_string())
-                    .or_insert_with(|| encoded.clone());
                 if !seen.insert(encoded.clone()) {
                     continue;
                 }
+                // 裸名 → 编码名映射（审查修复 #3）：tool_choice 裸名命中组内
+                // 工具时拼回编码名，与 tools 声明一致；置于 seen 去重之后，
+                // 与 encoded_tool_names 同口径——仅映射实际下发的工具，
+                // 防止映射指向被去重跳过、未向上游声明的名字（审查 #2）
+                choice_inner_lookup
+                    .entry(iname.to_string())
+                    .or_insert_with(|| encoded.clone());
                 let inner_desc = it.get("description").cloned().unwrap_or(json!(""));
                 let desc = if !ns_desc.is_empty() {
                     match inner_desc.as_str() {
@@ -589,18 +592,6 @@ pub fn completion_to_responses(v: &Value, resp_id: &str, model: &str, encoded: &
         },
         "stop_reason": if finish == "tool_calls" { json!("tool_use") } else { json!(null) },
     })
-}
-
-fn cached_tokens_of(u: &Value) -> u64 {
-    [
-        "cache_read_input_tokens",
-        "cache_read_token",
-        "cached_tokens",
-        "cache_read_tokens",
-    ]
-        .iter()
-        .find_map(|k| u.get(*k).and_then(|v| v.as_u64()))
-        .unwrap_or(0)
 }
 
 fn u64_pair(u: &Value) -> (u64, u64) {
@@ -1079,6 +1070,30 @@ mod tests {
         assert_eq!(tools.len(), 1);
         assert_eq!(tools[0]["function"]["name"], json!("mcp__node_repl__js"));
         assert_eq!(tools[0]["function"]["description"], json!("top"));
+    }
+
+    /// 审查 #2 回归：裸名映射仅登记实际下发的组内工具——首个同名编码名
+    /// 与顶层 function 碰撞被去重跳过时，tool_choice 裸名应映射到后续
+    /// 实际下发的组内工具，而非指向被跳过、未向上游声明者
+    #[test]
+    fn choice_lookup_skips_deduped_tools() {
+        let body = json!({
+            "model": "m",
+            "input": "hi",
+            "tools": [
+                {"type": "function", "name": "ns1__js", "description": "top"},
+                {"type": "namespace", "name": "ns1",
+                 "tools": [{"type": "function", "name": "js", "description": "a"}]},
+                {"type": "namespace", "name": "ns2",
+                 "tools": [{"type": "function", "name": "js", "description": "b"}]},
+            ],
+            "tool_choice": {"type": "function", "name": "js"},
+        });
+        let chat = responses_to_chat(&body).unwrap();
+        assert_eq!(
+            chat["tool_choice"]["function"]["name"],
+            json!("ns2__js")
+        );
     }
 
     /// 审查修复 #5：组级 description 保留——内层为空/缺失回退组级，

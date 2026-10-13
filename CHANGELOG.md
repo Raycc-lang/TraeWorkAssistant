@@ -6,6 +6,25 @@
 
 ---
 
+## [1.4.12] · 2026-10-13 · 移植 main 缓存 tokens 口径对齐批：宽口径提取 + usage 归一化 + OpenAI 流式噪声帧治理
+
+> 合并点 `main@aa4b475` → `main@f5e3f48`（3 个补充提交 + 本分支 PR #97 收敛，手工语义移植，未 merge）。全部为网关协议出口层系统无关改动，无桌面/OS 依赖。
+
+### 修复与加固
+
+- **缓存 tokens 宽口径提取收敛（main@1bbe54f）**：缓存读/写提取统一收敛为 `wb_sse` 单一宽口径实现（`cached_tokens_of` / `cache_write_tokens_of`）——键集对齐用量统计既有口径（补 `cacheReadInputTokens` / `prompt_cache_hit_tokens` / `cache_write_input_tokens` / `prompt_cache_write_tokens` 等），正值过滤（0 值陈旧别名不再遮蔽有效别名），嵌套兜底 `prompt_tokens_details.cached_tokens` 与 `inputTokensDetails[].cached_tokens`；`sse.rs` 与 `wb_responses.rs` 删除各自窄口径实现改为复用。
+- **usage 归一化投影补齐（main@1bbe54f）**：WB 管线 OpenAi / OpenAiText 流式出口 usage 改走 `normalize_openai_usage`（WB 原始字段 → OpenAI 标准 `prompt_tokens_details.cached_tokens`，下游缓存读不再恒 0）。
+- **多轮工具循环写回口径（main@37cdae7 / f5e3f48）**：`wb_route` 多轮累计写回 `write_back_acc_usage`——先清除全部读写侧遮蔽键（顶层别名 + 嵌套容器）再写 `cache_read_token` / `cache_write_token` 累计值，防上游末轮单轮残留值遮蔽跨轮累计（读侧少计、写侧首轮最大少报最明显）；各轮累计改用宽口径 `token_number`（f64/字符串形态 token 数不再静默得 0）。
+- **Anthropic 出口缓存读/写透传（main@37cdae7 + PR #97）**：WB 流式 `message_delta` 与非流式 `completion_to_anthropic` 透传 `cache_read_input_tokens` / `cache_creation_input_tokens`（>0 才带）；SOLO 管线 `aggregate_anthropic` / 流式 `message_delta` 同口径补缓存写透传。
+- **OpenAI 流式噪声帧治理（issue #96）**：Buddy 上游逐帧携带空 `tool_calls` 数组、重复 `role`、空串 `content/reasoning_content/refusal`、恒 null `extra_fields/function_call`，AI SDK v5 系客户端把空数组当思考封口信号导致思考被撕成上百碎片——透传前按 OpenAI 流式惯例归一化（空数组剥离、role 仅首帧、空串/null 剥离、纯噪声帧整帧跳过、`[DONE]` 不重复下发）。
+- **移植审查防御加固**：多轮 usage 累计与 usage 总数求和改饱和加法（异常上游超大 token 值不 panic / 不回绕错账）；`write_back_acc_usage` 对非对象 usage（异常上游标量/数组）先归一为对象再写回，消除 `IndexMut[str]` panic 路径。
+
+### 验证
+
+- `cargo test -p aiwork-core --lib` 663 通过（7 忽略）· `cargo check`（core + server）0 错误。
+
+---
+
 ## [1.4.11] · 2026-10-13 · 移植 main@7883d1c：OAuth 防伪加固 + namespace 拆分精确化 + Qoder 冷却快速失败
 
 > 合并点 `main@af5c59e` → `main@7883d1c`（1 个提交，手工语义移植，未 merge）。桌面/OS 专属与依赖本分支不存在的 settings 字段的改动跳过。

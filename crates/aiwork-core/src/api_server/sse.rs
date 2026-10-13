@@ -2,6 +2,7 @@ use std::io::{BufRead, BufReader, Read};
 
 use serde_json::{json, Map, Value};
 
+use super::wb_sse::{cache_write_tokens_of, cached_tokens_of};
 use super::wb_upstream::{InterruptibleLines, LINE_POLL};
 use crate::api_server::routes::stream_msg_or_fallback;
 
@@ -623,35 +624,18 @@ fn usage_i64(u: &Value, keys: &[&str]) -> Option<i64> {
     keys.iter().find_map(|k| u.get(*k).and_then(|v| v.as_i64()))
 }
 
-/// 上游缓存读 tokens：WB token_usage 事件字段为 cache_read_token（与用量历史
-/// extra_info 同源口径），兼容 OpenAI 风格 cached_tokens / cache_read_tokens
-fn cached_tokens_i64(u: &Value) -> i64 {
-    // 实证（2026-10-13 glm-5.3-flash 上游抓包）：WB token_usage 事件字段为
-    // cache_read_input_tokens（另有 cache_creation_input_tokens 写入侧）；
-    // 保留 cache_read_token（用量历史 extra_info 口径）与 OpenAI 风格键兜底
-    usage_i64(
-        u,
-        &[
-            "cache_read_input_tokens",
-            "cache_read_token",
-            "cached_tokens",
-            "cache_read_tokens",
-        ],
-    )
-    .unwrap_or(0)
-}
-
 /// 归一化 OpenAI usage：WB token_usage 原始字段（cache_read_token 等）→
 /// OpenAI 标准（prompt_tokens/completion_tokens + prompt_tokens_details.cached_tokens）。
 /// 下游（CPA 等）只认标准字段，直接透传原始事件会导致缓存读恒为 0。
-fn normalize_openai_usage(u: &Value) -> Value {
+pub(crate) fn normalize_openai_usage(u: &Value) -> Value {
     let prompt = usage_i64(u, &["prompt_tokens", "input_tokens"]).unwrap_or(0);
     let completion = usage_i64(u, &["completion_tokens", "output_tokens"]).unwrap_or(0);
     json!({
         "prompt_tokens": prompt,
         "completion_tokens": completion,
-        "total_tokens": prompt + completion,
-        "prompt_tokens_details": { "cached_tokens": cached_tokens_i64(u) },
+        // 饱和求和：异常上游的超大值不 panic / 不回绕
+        "total_tokens": prompt.saturating_add(completion),
+        "prompt_tokens_details": { "cached_tokens": cached_tokens_of(u) },
     })
 }
 
@@ -725,6 +709,7 @@ fn stream_convert_anthropic_src(
                                 "input_tokens": 0,
                                 "output_tokens": 0,
                                 "cache_read_input_tokens": 0,
+                                "cache_creation_input_tokens": 0,
                             },
                         },
                     })
@@ -799,10 +784,12 @@ fn stream_convert_anthropic_src(
                 );
             }
             let mut out_tokens = None;
-            let mut cached_tokens = 0i64;
+            let mut cached_tokens = 0u64;
+            let mut cache_write_tokens = 0u64;
             if let Some(u) = &usage {
                 out_tokens = usage_i64(u, &["output_tokens", "completion_tokens"]);
-                cached_tokens = cached_tokens_i64(u);
+                cached_tokens = cached_tokens_of(u);
+                cache_write_tokens = cache_write_tokens_of(u);
             }
             let mut message_delta = json!({
                 "type": "message_delta",
@@ -817,6 +804,9 @@ fn stream_convert_anthropic_src(
             }
             if cached_tokens > 0 {
                 message_delta["usage"]["cache_read_input_tokens"] = json!(cached_tokens);
+            }
+            if cache_write_tokens > 0 {
+                message_delta["usage"]["cache_creation_input_tokens"] = json!(cache_write_tokens);
             }
             send_event!("message_delta", message_delta);
             send_event!("message_stop", json!({ "type": "message_stop" }));
@@ -1117,9 +1107,15 @@ pub fn aggregate_anthropic<R: Read + Send>(
         if let Some(v) = usage_i64(u, &["output_tokens", "completion_tokens"]) {
             usage_obj["output_tokens"] = json!(v);
         }
-        let cached = cached_tokens_i64(u);
+        // 缓存读：宽口径提取（对齐 wb_sse::cached_tokens_of，正值过滤）
+        let cached = cached_tokens_of(u);
         if cached > 0 {
             usage_obj["cache_read_input_tokens"] = json!(cached);
+        }
+        // 缓存写 tokens（cache_creation_input_tokens）：写侧口径补齐
+        let written = cache_write_tokens_of(u);
+        if written > 0 {
+            usage_obj["cache_creation_input_tokens"] = json!(written);
         }
     }
 
@@ -1361,15 +1357,76 @@ mod tests {
     }
 
     #[test]
-    fn cached_tokens_i64_accepts_openai_style_keys() {
+    fn normalize_openai_usage_total_saturates() {
+        // 异常上游超大值：总数十饱和，不 panic / 不回绕
+        let u = serde_json::json!({"prompt_tokens": i64::MAX, "completion_tokens": 1});
+        let n = normalize_openai_usage(&u);
+        assert_eq!(n["total_tokens"], serde_json::json!(i64::MAX));
+    }
+
+    #[test]
+    fn cached_tokens_of_accepts_openai_style_keys() {
         assert_eq!(
-            cached_tokens_i64(&serde_json::json!({"cached_tokens": 7})),
+            cached_tokens_of(&serde_json::json!({"cached_tokens": 7})),
             7
         );
         assert_eq!(
-            cached_tokens_i64(&serde_json::json!({"cache_read_tokens": 9})),
+            cached_tokens_of(&serde_json::json!({"cache_read_tokens": 9})),
             9
         );
-        assert_eq!(cached_tokens_i64(&serde_json::json!({})), 0);
+        assert_eq!(cached_tokens_of(&serde_json::json!({})), 0);
+    }
+
+    #[test]
+    fn aggregate_anthropic_emits_cache_read_and_creation() {
+        // SOLO token_usage 事件 → Anthropic usage：缓存读（宽口径正值）+ 缓存写透传
+        // （issue #94：Trae 池 Anthropic 出口需与 WB 管线同口径输出读/写两侧）
+        let sse = concat!(
+            "event: output\n",
+            "data: {\"response\": \"hi\"}\n",
+            "\n",
+            "event: token_usage\n",
+            "data: {\"prompt_tokens\": 100, \"output_tokens\": 20, ",
+            "\"cache_read_input_tokens\": 0, \"cache_read_token\": 80, ",
+            "\"cache_creation_input_tokens\": 5}\n",
+            "\n",
+            "event: done\n",
+            "data: {\"finish_reason\": \"stop\"}\n",
+            "\n",
+        );
+        let (resp, err) = aggregate_anthropic(sse.as_bytes(), "msg_test", "glm-5.3");
+        assert!(err.is_none());
+        let resp = resp.expect("message");
+        let usage = &resp["usage"];
+        assert_eq!(usage["input_tokens"], serde_json::json!(100));
+        assert_eq!(usage["output_tokens"], serde_json::json!(20));
+        // 0 值别名（cache_read_input_tokens=0）不遮蔽有效别名（cache_read_token=80）
+        assert_eq!(usage["cache_read_input_tokens"], serde_json::json!(80));
+        assert_eq!(usage["cache_creation_input_tokens"], serde_json::json!(5));
+    }
+
+    /// Anthropic 流式出口透出缓存读/写 tokens（token_usage 的 usage 即 data 本体）
+    #[test]
+    fn anthropic_delta_emits_cache_read_and_creation_tokens() {
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(64);
+        let input = "event: output\ndata: {\"response\":\"hi\"}\n\n\
+                     event: token_usage\ndata: {\"input_tokens\":10,\"output_tokens\":3,\"cache_read_input_tokens\":7,\"cache_creation_input_tokens\":2}\n\n\
+                     event: done\ndata: {\"finish_reason\":\"stop\"}\n\n";
+        let (error_info, _sent_any, _) = stream_convert_anthropic_lines(
+            InterruptibleLines::from_iterator(Box::new(input.lines().map(str::to_string))),
+            tx,
+            "msg_cache",
+            "m",
+        );
+        assert!(error_info.is_none());
+        let joined = collect_events(rx).join("\n");
+        assert!(
+            joined.contains("\"cache_read_input_tokens\":7"),
+            "message_delta 需透出缓存读: {joined}"
+        );
+        assert!(
+            joined.contains("\"cache_creation_input_tokens\":2"),
+            "message_delta 需透出缓存写: {joined}"
+        );
     }
 }
