@@ -296,6 +296,21 @@ fn daily_credits_claimed_in_list(
     })
 }
 
+/// 「每日活动」候选 id 全集（统一口径，审查修复）：learned 重学 ∪ table（conf
+/// 覆盖表 ∪ KNOWN 内置表）——与盲发候选源（known_daily_fallback 装配的
+/// candidates）同源。此前已领快路径（daily_credits_claimed_in_list）只取
+/// learned+KNOWN，conf 表独有 id 时漏配、多一次徒劳盲发；抽公共函数防再分叉。
+fn daily_allowed_ids(
+    learned: &[(String, String)],
+    table: &[(String, String)],
+) -> Vec<String> {
+    learned
+        .iter()
+        .chain(table.iter())
+        .map(|(id, _)| id.clone())
+        .collect()
+}
+
 /// 复查判定（纯函数，可单测）：campaigns 列表中是否存在 campaignId 匹配且
 /// claimStatus 已变 CLAIMED 的条目（字段语义与 filter_claimable 过滤同构）。
 fn campaign_is_claimed(campaigns: &[Value], campaign_id: &str) -> bool {
@@ -1135,7 +1150,10 @@ fn known_daily_fallback(
 /// 一次（learn_from_min_headers），拿到新 id 立即重试盲发——同轮自愈，不等
 /// 调度器下一轮（旧实现 409 后只能等 30 分钟起步的退避重试，且主列表视野对
 /// 容器形态不可见 CLAIMABLE 时永远收敛不了）。
-/// 注意：过期候选已在首轮盲发中从 learned/table 剔除，重试候选天然只含新 id。
+/// 注意：过期候选虽已在首轮盲发中从 learned/table 剔除，但宽松档重学不校验
+/// 时间窗、可能把同一批过期 id 学回——故补学结果须过滤「本轮已判 409 过期」
+/// 的 id（pre-post 差集）再入共享池，否则重试轮会再次盲发同一过期 id 白吃
+/// 一次 409（审查修复；重试判据同步收紧为「过滤后确有新 id」）。
 fn fallback_with_relearn(
     state: &AppState,
     agent: &ureq::Agent,
@@ -1145,10 +1163,23 @@ fn fallback_with_relearn(
     learned: &mut Vec<(String, String)>,
     table: &mut Vec<(String, String)>,
 ) -> FallbackOutcome {
+    // 首轮候选 id 全集快照：409 过期 id 会被 blind_round 从 learned/table 原地
+    // 剔除，pre-post 差集即「本轮已判过期」名单
+    let pre_ids: std::collections::HashSet<String> = learned
+        .iter()
+        .chain(table.iter())
+        .map(|(id, _)| id.clone())
+        .collect();
     let outcome = known_daily_fallback(agent, headers, urls, learned, table);
     if let FallbackOutcome::Failed(m, ..) = &outcome {
         if m.contains(CAMPAIGN_NOT_ACTIVE_TAG) {
-            let before = learned.len();
+            let stale: std::collections::HashSet<String> = pre_ids
+                .into_iter()
+                .filter(|id| {
+                    !learned.iter().any(|(e, _)| e == id)
+                        && !table.iter().any(|(e, _)| e == id)
+                })
+                .collect();
             let found = learn_from_min_headers(
                 state,
                 agent,
@@ -1156,8 +1187,16 @@ fn fallback_with_relearn(
                 urls,
                 chrono::Utc::now().timestamp(),
             );
-            merge_learned(learned, found);
-            if learned.len() > before {
+            // 只留「新学得且非本轮已判过期」的 id（merge_learned 仅去重不滤过期，
+            // 直接入池会让重试轮再次盲发同一 409 id）
+            let fresh: Vec<(String, String)> = found
+                .into_iter()
+                .filter(|(id, _)| {
+                    !stale.contains(id) && !learned.iter().any(|(e, _)| e == id)
+                })
+                .collect();
+            if !fresh.is_empty() {
+                merge_learned(learned, fresh);
                 return known_daily_fallback(agent, headers, urls, learned, table);
             }
         }
@@ -1177,6 +1216,7 @@ fn process_account(
     opts: &QoderCheckinOpts,
     learned: &mut Vec<(String, String)>,
     table: &mut Vec<(String, String)>,
+    runtime: Option<&std::sync::Mutex<Option<crate::commands::api_server::ApiServerRuntime>>>,
 ) -> Value {
     let aid = s_of(acct.get("id"));
     let name = acct
@@ -1270,12 +1310,10 @@ fn process_account(
                 //    兜底），结果如实归类（Failed 不再归 already——2026-10-07
                 //    误报「已领（此前已领）」的修复点）
                 let now = chrono::Utc::now().timestamp();
-                // 审查 F8：候选 id = learned 重学 + KNOWN 常量表（与盲发兜底同源）
-                let allowed_ids: Vec<String> = learned
-                    .iter()
-                    .map(|(id, _)| id.clone())
-                    .chain(KNOWN_DAILY_CAMPAIGNS.iter().map(|(id, _)| id.to_string()))
-                    .collect();
+                // 候选 id 全集 = learned 重学 ∪ conf 覆盖表 ∪ KNOWN 内置表（与盲发
+                // 候选源同口径，审查修复：原仅 learned+KNOWN 会让 conf 独有 id 的
+                // 已领快路径漏配，落入盲发多一次徒劳 claim POST）
+                let allowed_ids = daily_allowed_ids(learned, table);
                 if daily_credits_claimed_in_list(&campaigns, now, &allowed_ids) {
                     ("already".into(), "每日奖励已领取".into(), None)
                 } else {
@@ -1408,12 +1446,8 @@ fn process_account(
                             // 与首次路径同口径：先查列表内当日已领 grant，再盲发
                             // 兜底直领（learned 优先），失败如实归 fail（不掩盖）
                             let now = chrono::Utc::now().timestamp();
-                            // 审查 F8：候选 id = learned 重学 + KNOWN 常量表（同首次路径）
-                            let allowed_ids: Vec<String> = learned
-                                .iter()
-                                .map(|(id, _)| id.clone())
-                                .chain(KNOWN_DAILY_CAMPAIGNS.iter().map(|(id, _)| id.to_string()))
-                                .collect();
+                            // 与首次路径同口径：候选 id 全集 = learned ∪ table ∪ KNOWN
+                            let allowed_ids = daily_allowed_ids(learned, table);
                             if daily_credits_claimed_in_list(&campaigns, now, &allowed_ids) {
                                 ("already".into(), "每日奖励已领取".into(), None)
                             } else {
@@ -1591,6 +1625,22 @@ fn process_account(
             reward = None;
         }
     }
+    // 签到充值即时拨新运行池（issue #102 补缺）：到账校验通过（或未启用校验的
+    // 成功路径）后，把 reward 按「旧值+reward」回写进 qoder_pool 内存池——否则
+    // 充值/领取到账的账号仍按旧快照被零积分过滤排除，直到下次积分快照
+    //（every_hours 档最长 2h，daily 档近一天；期间若它是池内唯一账号，网关
+    // has_selectable=false 整体不可用）。到期键不动（签到奖励不改变订阅/包到期）。
+    // 网关未运行/CLI 传 None 跳过（对齐快照任务 runtime 口径）
+    if kind == "success" {
+        if let Some(r) = reward.filter(|r| *r > 0.0) {
+            if let Some(shared) = runtime.and_then(|rt| {
+                let g = rt.lock().unwrap_or_else(|e| e.into_inner());
+                g.as_ref().map(|rt| rt.shared.clone())
+            }) {
+                shared.qoder_pool.add_credits(&aid, r);
+            }
+        }
+    }
     let status_txt = match kind.as_str() {
         "success" => "success",
         "already" => "already",
@@ -1653,7 +1703,14 @@ fn process_account(
 
 /// 签到整轮：逐账号串行处理，事件经 emit 回调逐条输出（NDJSON 管线复用）。
 /// 返回 done 事件（ok/already/failed 计数），供启动补签/调度静默路径直接消费。
-pub fn run_checkin_round(state: &AppState, opts: &QoderCheckinOpts, emit: &mut dyn FnMut(&Value)) -> Value {
+/// `runtime`：GUI 进程内的网关运行态句柄（调度器/UI/启动补签传入）——签到充值
+/// 到账后即时拨新 qoder_pool 余额（issue #102 补缺）；CLI 独立进程传 None 跳过
+pub fn run_checkin_round(
+    state: &AppState,
+    opts: &QoderCheckinOpts,
+    runtime: Option<&std::sync::Mutex<Option<crate::commands::api_server::ApiServerRuntime>>>,
+    emit: &mut dyn FnMut(&Value),
+) -> Value {
     // 跨进程互斥（审查 P1）：schtasks CLI（--task-run qoder-checkin）与应用内调度器
     // 默认同为 10:15 触发，双进程对同账号并发 ensure_fresh 会以同一 refresh_token
     // 刷新（服务端一次性轮换下后到者误标 needs_relogin）。抢锁失败方幂等跳过
@@ -1727,7 +1784,7 @@ pub fn run_checkin_round(state: &AppState, opts: &QoderCheckinOpts, emit: &mut d
             std::thread::sleep(std::time::Duration::from_secs(gap_secs));
         }
         // 单账号失败不中断整轮（对齐 wb try/except 语义）
-        let mut ev = process_account(state, &agent, acct, opts, &mut learned_ids, &mut campaign_table);
+        let mut ev = process_account(state, &agent, acct, opts, &mut learned_ids, &mut campaign_table, runtime);
         ev["index"] = json!(i + 1);
         emit(&ev);
         events.push(ev);

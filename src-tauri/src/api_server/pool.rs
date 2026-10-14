@@ -453,6 +453,24 @@ impl ApiPool {
         }
     }
 
+    /// Qoder 签到充值即时拨新（issue #102 补缺）：到账奖励按「旧值+delta」回写
+    /// 余额并刷新 fetched_at——不拨新则充值/领取到账的账号仍按旧快照被零积分
+    /// 过滤排除，直到下次积分快照（every_hours 档最长 2h，daily 档近一天）。
+    /// 与 update_credits_snapshot 不同：**不动 credits_expire_at**（签到奖励不改变
+    /// 订阅/包到期，覆写会丢真值）。credits 为 None（从未拉取）的账号本就不被
+    /// 零积分过滤，无需回写；不触碰冷却/inflight/禁用等运行态（对齐 update_credits
+    /// 纪律）。网关未运行时由调用方跳过（None 句柄）。
+    pub fn add_credits(&self, uid: &str, delta: f64) {
+        let mut entries = safe_lock(&self.entries);
+        let now = now_ts();
+        if let Some(e) = entries.get_mut(uid) {
+            if let Some(c) = e.credits {
+                e.credits = Some(c + delta);
+                e.credits_fetched_at = Some(now);
+            }
+        }
+    }
+
     /// 从 WorkBuddy 账号同步池（T2.1/F-28）：WB 上游账号进同一调度引擎，
     /// 携带区域/企业域信息供上游 headers 使用
     pub fn sync_from_wb(&self, accounts: &[WbSyncAccount], enabled: &[String]) {

@@ -108,7 +108,9 @@ pub fn run_cli_task(name: &str, state: &AppState) -> i32 {
         // Qoder 每日签到（F-80；schtasks 直调 + 应用内调度器共用；10:15 单次覆盖双活动）
         "qoder-checkin" => {
             let opts = qoder_checkin::QoderCheckinOpts::daily();
-            let done = qoder_checkin::run_checkin_round(state, &opts, &mut print_progress);
+            // CLI 独立进程无网关运行态（runtime=None）——签到拨新运行池跳过，
+            // 该进程本就无内存池；GUI 侧由调度器/UI/启动补签传入（issue #102 补缺）
+            let done = qoder_checkin::run_checkin_round(state, &opts, None, &mut print_progress);
             // 审查 M-1：存在失败账号时返 Err（schtasks 退出码可见 + 通知渠道）。
             // 口径对齐调度器（scheduler.rs 同款）：empty_campaigns（活动未上线/不可用）
             // 属非用户可操作失败，不计失败——CLI 进程本身无 30min 冷却重试链，

@@ -947,6 +947,12 @@ pub struct TraeWorkMigrationReport {
     pub finished_at_ms: i64,
     /// 迁移明细条目（settings 步 note + 快照池步摘要，用户可读文案）
     pub notes: Vec<String>,
+    /// settings 步（旧安装路径设置处置）的结构化结果（审查修复：前端此前用
+    /// notes 子串匹配 'trae_path' 识别该步，跨层文案契约脆弱，后端改文案即
+    /// 静默误显「已跳过」）。None = settings 步无事发生（未发现旧安装路径设置）。
+    /// #[serde(default)]：修复前落的旧报告无此字段，反序列化按 None 兼容
+    #[serde(default)]
+    pub settings_note: Option<String>,
     /// 整组迁入 profiles_trae 的组数
     pub moved_groups: usize,
     /// 同名冲突整组保留至 profiles_trae_work_legacy 的组数
@@ -996,8 +1002,13 @@ pub fn migrate_traework_merge(data_dir: &Path) -> Option<String> {
 /// 迁移主体（无进程检测，供单测直调）：settings 步 + 快照池步，全部成功才置标记。
 fn migrate_traework_merge_inner(store: &Store, data_dir: &Path) -> Option<String> {
     let mut notes: Vec<String> = Vec::new();
+    // settings 步结果单列（升级引导报告结构化字段，前端不再子串匹配 notes）
+    let mut settings_note: Option<String> = None;
     match migrate_traework_settings(store) {
-        Ok(Some(note)) => notes.push(note),
+        Ok(Some(note)) => {
+            settings_note = Some(note.clone());
+            notes.push(note);
+        }
         Ok(None) => {}
         Err(e) => {
             return Some(format!(
@@ -1028,6 +1039,7 @@ fn migrate_traework_merge_inner(store: &Store, data_dir: &Path) -> Option<String
             &TraeWorkMigrationReport {
                 finished_at_ms: chrono::Utc::now().timestamp_millis(),
                 notes: notes.clone(),
+                settings_note,
                 moved_groups,
                 legacy_groups,
             },
@@ -1102,15 +1114,17 @@ fn migrate_traework_settings(store: &Store) -> Result<Option<String>, String> {
             let cn = obj.get("trae_cn_path").and_then(|v| v.as_str()).unwrap_or("");
             if cn.trim().is_empty() && Path::new(p).is_file() {
                 // 承接守卫：trae_path 是退役 Trae Work 的专属键，其值可能指向未卸载的
-                // 旧客户端（TRAE SOLO CN.exe）——承接会让「打开 Trae」静默拉起旧 exe，
-                // 且 app_locate 一级命中压制自动探测。按文件名判 solo 拒绝承接，
-                // 留空走 env.rs 自动探测（默认路径/注册表/进程）
+                // 旧客户端（TRAE SOLO CN.exe / TRAE SOLO.exe / 旧形态 Trae.exe——旧
+                // TraeWork 档案 exe_names 三者皆收录，与本迁移运行检测名单同源）——
+                // 承接会让「打开 Trae」静默拉起旧 exe，且 app_locate 一级命中压制
+                // 自动探测。按文件名判旧形态拒绝承接（原仅拒 solo，Trae.exe 旧形态
+                // 会被误承接——审查修复），留空走 env.rs 自动探测
                 let fname = Path::new(p)
                     .file_name()
                     .map(|n| n.to_string_lossy().to_lowercase())
                     .unwrap_or_default();
-                if fname.contains("solo") {
-                    note = "trae_path 指向已退役的 Trae Solo 客户端，已丢弃（不承接，走自动探测）".to_string();
+                if fname.contains("solo") || fname == "trae.exe" {
+                    note = "trae_path 指向已退役的旧版客户端（非合并版 Trae CN），已丢弃（不承接，走自动探测）".to_string();
                 } else {
                     obj.insert("trae_cn_path".into(), json!(p));
                     note = "trae_path 已承接为 trae_cn_path（原键删除）".to_string();
@@ -1809,6 +1823,33 @@ mod tests {
         assert_eq!(v["theme"], json!("dark"), "其余设置保留");
         // 幂等：二次调用跳过
         assert!(migrate_traework_merge_inner(&store, &dir).is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn traework_merge_settings_rejects_legacy_trae_exe_path() {
+        // 承接守卫补齐（审查修复）：旧形态 Trae.exe（旧 TraeWork 档案 exe_names
+        // 收录、运行检测名单同源）同样不得承接为 trae_cn_path——否则「打开 Trae」
+        // 静默拉起退役旧客户端且压制自动探测
+        let dir = tmp_dir("traework_trae_exe_guard");
+        let store = db(&dir);
+        let old_exe = dir.join("fake").join("Trae.exe");
+        std::fs::create_dir_all(old_exe.parent().unwrap()).unwrap();
+        std::fs::write(&old_exe, "exe").unwrap();
+        store
+            .kv_set_raw(
+                "app_settings",
+                &json!({ "trae_path": old_exe.to_string_lossy() }).to_string(),
+            )
+            .unwrap();
+
+        let summary = migrate_traework_merge_inner(&store, &dir).unwrap();
+        assert!(summary.contains("丢弃"), "旧形态 Trae.exe 应拒绝承接: {summary}");
+
+        let v: Value =
+            serde_json::from_str(&store.kv_get_raw("app_settings").unwrap()).unwrap();
+        assert!(v.get("trae_cn_path").is_none(), "不得承接旧形态 Trae.exe 为 trae_cn_path");
+        assert!(v.get("trae_path").is_none(), "trae_path 键仍应删除");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

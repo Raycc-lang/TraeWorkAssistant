@@ -1646,7 +1646,8 @@ fn stream_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: String, str
                                 // 三池统一：每请求一行终态记账（中间态不记，防虚高）——
                                 // 首字超时为换号中间步，usage 由终态路径（成功/池耗尽）
                                 // 统一落一行（审查 P2-4，对齐 qoder_route 聚合口径；main 侧
-                                // 审查问题6 同目标，实现取本侧暂存模式与终局消费配套）
+                                // 审查问题6 同目标，实现取流结束即时落账——rotating 判定，
+                                // 见下方 record_usage_ttfb 处）
                                 state.logger.log_request(
                                     "trae", "POST", proto.log_path(), &model, stream,
                                     504, &picked.uid, start_ts.elapsed().as_millis() as u64,

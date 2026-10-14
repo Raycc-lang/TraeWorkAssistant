@@ -138,9 +138,11 @@ fn ms_to_date(ms: i64) -> String {
 }
 
 /// fetch_account 产出 row → 最早积分包到期 Unix 秒（issue #102 网关智能调度口径）：
-/// 逐包 expire_ms（原始毫秒，仅剩余>0 且激活的包，parse 层已过滤）取 min；
-/// 包明细缺失或包未携带原始 ms（随订阅周期）时回退 row 级 plan_expires_ms
-/// （sash expiresAt / big_model nextResetAt）。None = 响应未携带任何到期信息。
+/// 逐包 expire_ms（原始毫秒，仅剩余>0 且激活的包，parse 层已过滤）与订阅周期
+/// plan_expires_ms（sash expiresAt / big_model nextResetAt）取 **min**——混合账户
+///（订阅 + 更晚到期的资源包）的最早重置时点可能在订阅周期，仅无包时回退会把
+/// 最早到期高估、smart「先到期先消耗」排序失真（审查修复）。
+/// None = 响应未携带任何到期信息。
 fn earliest_expire_secs(row: &Value) -> Option<i64> {
     let mut earliest_ms: Option<i64> = None;
     if let Some(arr) = row.get("packages").and_then(Value::as_array) {
@@ -152,10 +154,13 @@ fn earliest_expire_secs(row: &Value) -> Option<i64> {
             }
         }
     }
-    let to_secs = |ms: i64| Some(ms / 1000);
-    earliest_ms
-        .and_then(to_secs)
-        .or_else(|| row.get("plan_expires_ms").and_then(Value::as_i64).filter(|m| *m > 0).and_then(to_secs))
+    // 订阅周期与逐包同源取 min（0/负值视为缺失，不参与）
+    if let Some(ms) = row.get("plan_expires_ms").and_then(Value::as_i64).filter(|m| *m > 0) {
+        if earliest_ms.map_or(true, |cur| ms < cur) {
+            earliest_ms = Some(ms);
+        }
+    }
+    earliest_ms.map(|ms| ms / 1000)
 }
 
 /// usage 解析产出（R-7 主结构 + 宽容兜底）。
@@ -1008,10 +1013,11 @@ mod tests {
     }
 
     #[test]
-    fn earliest_expire_secs_prefers_pack_then_plan_cycle() {
-        // issue #102 调度口径：逐包 expire_ms 取 min（毫秒→秒）；
-        // 包未携带原始 ms（随订阅周期）或无包明细时回退 plan_expires_ms；
-        // 0/负值视为缺失，全缺失 → None
+    fn earliest_expire_secs_min_of_pack_and_plan_cycle() {
+        // issue #102 调度口径：逐包 expire_ms 与订阅周期 plan_expires_ms 取 min
+        //（毫秒→秒）；0/负值视为缺失，全缺失 → None
+        // 混合账户：订阅周期早于最晚包 → 取更早的订阅周期（审查修复：原「仅无包
+        // 才回退 plan」会把最早到期高估，smart「先到期先消耗」排序失真）
         let row = json!({
             "packages": [
                 {"expire_at": "2099-01-01", "expire_ms": 4_000_000_000_000i64},
@@ -1019,6 +1025,12 @@ mod tests {
                 {"expire_at": "2027-01-01", "expire_ms": 0},
             ],
             "plan_expires_ms": 1_791_673_619_906i64,
+        });
+        assert_eq!(earliest_expire_secs(&row), Some(1_791_673_619));
+        // 包早于订阅周期 → 取包
+        let row = json!({
+            "packages": [{"expire_at": "2026-11-01", "expire_ms": 1_793_500_000_000i64}],
+            "plan_expires_ms": 4_000_000_000_000i64,
         });
         assert_eq!(earliest_expire_secs(&row), Some(1_793_500_000));
         // 无逐包 ms → 订阅周期兜底
