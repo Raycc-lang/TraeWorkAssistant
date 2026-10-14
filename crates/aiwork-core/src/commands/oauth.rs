@@ -9,14 +9,18 @@ use crate::state::AppState;
 /// 最近签发的 OAuth 登录会话（CSRF 防护 + PKCE）：oauth_get_login_url 签发时记录，
 /// oauth_parse_callback 用 loginTraceID 双向绑定校验（抓包实证：login_trace_id 参数
 /// 会被授权页原样回传为回调的 loginTraceID），PKCE verifier 供 AuthCode 交换。
-/// device_id：本会话选定的凭证设备（issue #76 轮转）——登录 URL 参数、
-/// ExchangeToken DeviceInfo、device_map 回写三者共用同一台，保证同源。
+/// device_id：本会话选定的凭证设备（issue #76 轮转 / Web-only 每登录会话合成身份）——
+/// 登录 URL 参数、ExchangeToken DeviceInfo、device_map 回写三者共用同一台，保证同源。
 struct PendingLogin {
     state: String,
     pkce_verifier: String,
     device_id: String,
 }
 static LAST_OAUTH_STATE: Mutex<Option<PendingLogin>> = Mutex::new(None);
+
+/// 按账号持久化的合成设备身份（Web-only 容器无本机 Trae 客户端凭证时使用）。
+/// uid 是键，设备私钥只存服务端自有数据库，不进日志/事件。
+const SYNTHETIC_DEVICE_KEY_PREFIX: &str = "oauth_synthetic_device:";
 
 /// OAuth 常量（2026-09-16 抓包固化）：client_id 取真实 Trae IDE 登录 URL 实证值
 /// （授权页 native_ide 流程 GetPCAuthCode 接受；旧值 en1oxy7wnw8j9n 会让页面
@@ -291,17 +295,39 @@ fn load_or_create_oauth_device(state: &AppState) -> OAuthDevice {
 // 恒用 icube_device_creds().first()，所有 OAuth 账号在服务端全部绑到同一台设备。
 // 本机各 Trae 客户端（Trae CN / TRAE SOLO CN / Trae / Trae Work）各有一套独立
 // 凭证，按「已绑定账号数最少」轮转选择即可成倍分散绑定上限。
-// Web-only 容器部署无本机客户端凭证时回落合成设备（单凭证，轮转退化为恒选 0）。
+// Web-only 容器部署无本机客户端凭证时使用 per-account synthetic 身份。
 
-/// 按会话 device_id 匹配本机凭证（DeviceInfo/DeviceProof 的设备与签名私钥必须
-/// 同源，20403/20405 实测拒绝）；匹配不到返回 None 由调用方兜底
+/// 按 device_id 查找凭证：本机真实客户端凭证优先，其次按 uid 持久化的 synthetic
+/// 凭证。DeviceInfo/DeviceProof 的设备与签名私钥必须同源，20403/20405 实测拒绝；
+/// 匹配不到返回 None 由调用方按协议变体处理。
 fn find_cred_by_device(
-    data_dir: &std::path::Path,
+    state: &AppState,
     device_id: &str,
-) -> Option<&'static crate::icube_auth::DeviceCredential> {
-    icube_device_creds(data_dir)
+) -> Option<crate::icube_auth::DeviceCredential> {
+    let store = crate::store::db(&state.data_dir);
+    // OAuth 登录窗口内，pending synthetic 身份尚未绑定 uid（uid 要等 JWT 解析后才
+    // 可知），必须先按 pending 设备 ID 直接命中，供 AuthCode/DeviceInfo 交换使用。
+    let pending: serde_json::Value = store.kv_get(&format!("{}pending", SYNTHETIC_DEVICE_KEY_PREFIX));
+    if let Some(cred) = crate::icube_auth::device_credential_from_json(&pending)
+        .filter(|c| c.device_id == device_id)
+    {
+        return Some(cred);
+    }
+    let cred = icube_device_creds(&state.data_dir)
         .iter()
         .find(|c| c.device_id == device_id)
+        .cloned();
+    if cred.is_some() {
+        return cred;
+    }
+    let map = crate::store::docs::device_map_load(&store);
+    let uid = map
+        .iter()
+        .find(|(_, e)| e.device_id == device_id)
+        .map(|(uid, _)| uid.clone())?;
+    let saved: serde_json::Value = crate::store::db(&state.data_dir)
+        .kv_get(&format!("{SYNTHETIC_DEVICE_KEY_PREFIX}{uid}"));
+    crate::icube_auth::device_credential_from_json(&saved).filter(|c| c.device_id == device_id)
 }
 
 /// 统计本机各凭证设备的账号绑定数（轮转选择依据，纯函数供单测）：
@@ -346,7 +372,7 @@ fn select_credential_index(
 /// 选定本次登录使用的设备：本机有凭证时取「已绑定账号数最少」的一套
 ///（issue #76 轮转），machine_id 取凭证自带值（与 ExchangeToken DeviceInfo
 /// .MachineID 同源，对齐真实客户端 URL 参数 = telemetry.machineId）；
-/// 无凭证回退 kv 持久化设备（load_or_create_oauth_device）
+/// Web-only 无本机凭证时为本次登录生成 synthetic 身份
 fn select_login_device(state: &AppState) -> (String, String) {
     let creds = icube_device_creds(&state.data_dir);
     if !creds.is_empty() {
@@ -362,8 +388,74 @@ fn select_login_device(state: &AppState) -> (String, String) {
             return (cred.device_id.clone(), cred.machine_id.clone());
         }
     }
-    let dev = load_or_create_oauth_device(state);
-    (dev.device_id, dev.machine_id)
+    // Web-only 兜底不再是全局单设备：本机无客户端凭证时，每次 OAuth 会话生成
+    // 一套合成身份（等价每次在“新本机”上重新安装 IDE 登录）。身份在 oauth_login
+    // 成功拿到 uid 后持久化，避免登录前未知 uid 导致所有账号共享同一台设备。
+    match generate_and_persist_login_device(state) {
+        Ok(cred) => (cred.device_id, cred.machine_id),
+        Err(e) => {
+            fs_utils::app_log(&state.data_dir, &format!("OAuth: 合成设备身份生成失败: {e}"));
+            let dev = load_or_create_oauth_device(state);
+            (dev.device_id, dev.machine_id)
+        }
+    }
+}
+
+/// 为当前 OAuth 登录会话生成一套合成设备身份。只生成/暂存，不绑定账号；
+/// 绑定发生在 oauth_login 成功解析 uid 后。
+fn generate_and_persist_login_device(
+    state: &AppState,
+) -> Result<crate::icube_auth::DeviceCredential, String> {
+    let cred = crate::icube_auth::generate_synthetic_device_credential(OAUTH_PAGE_APP_VERSION)?;
+    let json = serde_json::to_value(&cred)
+        .map_err(|e| format!("合成设备身份序列化失败: {e}"))?;
+    let key = format!("{}pending", SYNTHETIC_DEVICE_KEY_PREFIX);
+    crate::store::db(&state.data_dir)
+        .kv_set(&key, &json)
+        .map_err(|e| format!("合成设备身份写入失败: {e}"))?;
+    fs_utils::app_log(
+        &state.data_dir,
+        &format!(
+            "OAuth: 本机无 Trae 客户端凭证，已为登录会话生成合成设备身份（device_id={}，来源 synthetic）",
+            cred.device_id
+        ),
+    );
+    Ok(cred)
+}
+
+fn take_pending_login_device(
+    state: &AppState,
+    device_id: &str,
+) -> Option<crate::icube_auth::DeviceCredential> {
+    let key = format!("{}pending", SYNTHETIC_DEVICE_KEY_PREFIX);
+    let store = crate::store::db(&state.data_dir);
+    let saved: serde_json::Value = store.kv_get(&key);
+    let cred = crate::icube_auth::device_credential_from_json(&saved)?;
+    if cred.device_id != device_id || store.kv_delete(&key).is_err() {
+        return None;
+    }
+    Some(cred)
+}
+
+pub(crate) fn persist_account_synthetic_device(
+    state: &AppState,
+    uid: &str,
+    cred: &crate::icube_auth::DeviceCredential,
+) -> Result<(), String> {
+    fs_utils::ensure_uid_safe(uid)?;
+    let json = serde_json::to_value(cred)
+        .map_err(|e| format!("合成设备身份序列化失败: {e}"))?;
+    crate::store::db(&state.data_dir)
+        .kv_set(&format!("{SYNTHETIC_DEVICE_KEY_PREFIX}{uid}"), &json)
+        .map_err(|e| format!("合成设备身份写入失败: {e}"))
+}
+
+pub(crate) fn remove_account_synthetic_device(state: &AppState, uid: &str) {
+    if fs_utils::ensure_uid_safe(uid).is_err() {
+        return;
+    }
+    let _ = crate::store::db(&state.data_dir)
+        .kv_delete(&format!("{SYNTHETIC_DEVICE_KEY_PREFIX}{uid}"));
 }
 
 /// OAuth 登录成功后回写 device_map（issue #76 次因修复）：登录/交换签发的新 JWT
@@ -421,7 +513,7 @@ fn pkce_pair() -> (String, String) {
 /// 粘贴回调 URL（不再打开浏览器/启动回环监听）。
 pub fn oauth_get_login_url(state: &AppState) -> OAuthLoginUrl {
     // issue #76：登录设备 = 本机凭证中已绑定账号数最少的一套（分散服务端每设备
-    // 绑定上限）；无凭证回退 kv 持久化设备
+    // 绑定上限）；Web-only 无本机凭证时为本次登录生成 synthetic 身份
     let (device_id, machine_id) = select_login_device(state);
     // login_trace_id 兼作 CSRF 绑定值（抓包实证：授权页原样回传为回调 loginTraceID）
     let trace_id = random_hex(32);
@@ -582,12 +674,11 @@ pub fn oauth_parse_callback(
         }
     }
 
-    // 无在途会话 fallback 设备入口一次性选定（移植 main 8628629 去漂移）：会话快照的
-    // device_id 优先，缺失时按轮转规则 select_login_device。AuthCode 交换与尾部
-    // device_id 透传必须共用同一选择——两处若横跨 exchange_code（分钟级网络调用）
-    // 独立选定，期间重叠登录会话整体覆盖写入 LAST_OAUTH_STATE，绑定数分布变化会让
-    // 两处选中不同设备 → 实际交换设备与 device_map 回写/刷新交换设备错配。
-    // 选择是确定性的，同状态下结果一致，去重仅消除窗口期漂移，行为不变
+    // 无在途会话 fallback 设备入口一次性选定：会话快照的 device_id 优先，缺失时
+    // 重新选择。AuthCode 交换与尾部 device_id 透传必须共用同一选择——两处若横跨
+    // exchange_code（分钟级网络调用）独立选定，期间重叠登录会话整体覆盖写入
+    // LAST_OAUTH_STATE，会让两处选中不同设备 → 实际交换设备与 device_map 回写/
+    // 刷新交换设备错配。去重仅消除窗口期漂移。
     let fallback_device = LAST_OAUTH_STATE
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -623,7 +714,7 @@ pub fn oauth_parse_callback(
                 .get("host")
                 .cloned()
                 .unwrap_or_else(|| "https://api.trae.com.cn".into());
-            match exchange_code(&code, verifier.as_deref(), &fallback_device, &host, &state.data_dir) {
+            match exchange_code(&code, verifier.as_deref(), &fallback_device, &host, state) {
                 Ok((at, rt)) => {
                     access_token = Some(at);
                     rt
@@ -685,7 +776,7 @@ fn validate_exchange_host(host: &str) -> Result<(), String> {
     }
 }
 
-fn exchange_code(code: &str, verifier: Option<&str>, device_id: &str, host: &str, data_dir: &std::path::Path) -> Result<(String, String), String> {
+fn exchange_code(code: &str, verifier: Option<&str>, device_id: &str, host: &str, state: &AppState) -> Result<(String, String), String> {
     validate_exchange_host(host)?;
     let client_id = oauth_client().client_id.clone();
     let code_v = code.to_string();
@@ -696,11 +787,11 @@ fn exchange_code(code: &str, verifier: Option<&str>, device_id: &str, host: &str
 
     // issue #76：凭证按会话选定 device_id 匹配（DeviceInfo.DeviceID 与签名私钥必须
     // 同源）；匹配不到（无在途会话且回调粘贴等）回退首个凭证——历史行为
-    let cred = find_cred_by_device(data_dir, device_id).or_else(|| icube_device_creds(data_dir).first());
+    let cred = find_cred_by_device(state, device_id);
 
     // 主变体（真实客户端形态）：DeviceInfo 对象 + IDEVersion，无 DeviceProof
-    if let Some(cred) = cred {
-        let pub_pem = crate::icube_auth::device_public_key_pem(cred)
+    if let Some(ref cred) = cred {
+        let pub_pem = crate::icube_auth::device_public_key_pem(&cred)
             .unwrap_or_default();
         let url = format!("{}/trae/api/v3/oauth/ExchangeToken", host.trim_end_matches('/'));
         variants.push((
@@ -733,7 +824,7 @@ fn exchange_code(code: &str, verifier: Option<&str>, device_id: &str, host: &str
 
     // 兜底：旧形态探测变体（DeviceProof 是 refreshToken 刷新场景的结构，AuthCode
     // 场景按逆向结论不应携带；保留以验证逆向结论，全部失败时错误码进 app.log）
-    if let Some(cred) = cred {
+    if let Some(ref cred) = cred {
         let proof_path_com = "/cloudide/api/v3/trae/oauth/ExchangeToken";
         for (fmt, tag_base, url) in [
             (
@@ -747,7 +838,7 @@ fn exchange_code(code: &str, verifier: Option<&str>, device_id: &str, host: &str
                 oauth_client().exchange_url.clone(),
             ),
         ] {
-            if let Ok(proof) = crate::icube_auth::device_proof(cred, proof_path_com, &client_id, code, fmt) {
+            if let Ok(proof) = crate::icube_auth::device_proof(&cred, proof_path_com, &client_id, code, fmt) {
                 variants.push((
                     format!("{}{}", tag_base, fmt.suffix()),
                     url.clone(),
@@ -785,9 +876,9 @@ fn exchange_code(code: &str, verifier: Option<&str>, device_id: &str, host: &str
 
     let mut errs: Vec<String> = Vec::new();
     for (tag, url, payload, with_proof_header) in &variants {
-        match try_exchange_variant(tag, url, payload.clone(), device_id, *with_proof_header, data_dir) {
+        match try_exchange_variant(tag, url, payload.clone(), device_id, *with_proof_header, &state.data_dir) {
             Ok(t) => {
-                fs_utils::app_log(data_dir, &format!("[OAuth交换] 变体 {tag} 成功（协议固化前保留探测链）"));
+                fs_utils::app_log(&state.data_dir, &format!("[OAuth交换] 变体 {tag} 成功（协议固化前保留探测链）"));
                 return Ok(t);
             }
             Err(e) => errs.push(format!("{tag}: {e}")),
@@ -797,42 +888,20 @@ fn exchange_code(code: &str, verifier: Option<&str>, device_id: &str, host: &str
 }
 
 /// 本机 Trae 客户端 icube 设备凭证（进程内缓存；首次调用解析）。
-/// 解析链：扫描本机 storage.json（桌面机真实凭证）→ 空则加载/生成合成设备
-///（kv `oauth_synthetic_device` 持久化，跨重启稳定）——Web-only 容器部署无 Trae
-/// 客户端，此前仅剩裸 DeviceID 兜底变体，上游 20405 Device proof required 直接拒绝。
-/// data_dir 仅首次调用生效（OnceLock 进程级缓存；进程内 data_dir 恒定）。
-fn icube_device_creds(data_dir: &std::path::Path) -> &'static [crate::icube_auth::DeviceCredential] {
+/// 解析链：扫描本机 storage.json（桌面机真实凭证）。Web-only 容器无本机凭证时，
+/// synthetic 身份由每次 OAuth 会话生成并按 uid 持久化；本函数只返回真实客户端
+/// 凭证，防刷新/签到兜底到共享设备。data_dir 仅用于兼容既有进程级缓存注释。
+fn icube_device_creds(_data_dir: &std::path::Path) -> &'static [crate::icube_auth::DeviceCredential] {
     static CREDS: std::sync::OnceLock<Vec<crate::icube_auth::DeviceCredential>> = std::sync::OnceLock::new();
     CREDS.get_or_init(|| {
         let extracted = crate::icube_auth::extract_device_credentials();
         if !extracted.is_empty() {
             return extracted;
         }
-        // 合成设备兜底（等同全新安装 IDE 的自生成密钥对 + DeviceInfo 自声明）：
-        // 服务端自有身份落 store（与 token 同信任域），私钥不进日志
-        let store = crate::store::db(data_dir);
-        let saved: serde_json::Value = store.kv_get("oauth_synthetic_device");
-        if let Some(cred) = crate::icube_auth::device_credential_from_json(&saved) {
-            return vec![cred];
-        }
-        match crate::icube_auth::generate_synthetic_device_credential(OAUTH_PAGE_APP_VERSION) {
-            Ok(cred) => {
-                let json = serde_json::to_value(&cred).unwrap_or_default();
-                let _ = store.kv_set("oauth_synthetic_device", &json);
-                fs_utils::app_log(
-                    data_dir,
-                    &format!(
-                        "OAuth: 本机无 Trae 客户端凭证，已生成合成设备身份并持久化（device_id={}，来源 synthetic）",
-                        cred.device_id
-                    ),
-                );
-                vec![cred]
-            }
-            Err(e) => {
-                fs_utils::app_log(data_dir, &format!("OAuth: 合成设备凭证生成失败: {e}"));
-                Vec::new()
-            }
-        }
+        // Web-only synthetic 身份按账号持久化，不再提供“全局首个凭证”作为刷新
+        // 兜底。账号必须通过 device_map 命中自己的合成身份；未命中时返回空表，
+        // 促使错误如实暴露，防止刷新/签到悄悄落回共享设备。
+        Vec::new()
     })
 }
 
@@ -1145,10 +1214,11 @@ pub(crate) fn exchange_token_refresh(
     // issue #76：按账号绑定设备匹配凭证。matched 只在「override 确实命中本机
     // 凭证」时为 Some——区分「命中走同源凭证」与「未命中维持历史兜底」两种口径，
     // 不能让未命中也落到 cred.is_some() 分支（那会绕过 bound_device_id 修复）
-    let matched_cred = device_id_override.and_then(|d| find_cred_by_device(&state.data_dir, d));
-    let cred = matched_cred.or_else(|| icube_device_creds(&state.data_dir).first());
+    let matched_cred = device_id_override.and_then(|d| find_cred_by_device(state, d));
+    let cred = matched_cred.clone();
     let dev = load_or_create_oauth_device(state);
     let local_device_id = matched_cred
+        .as_ref()
         .map(|c| c.device_id.clone())
         .unwrap_or_else(|| dev.device_id.clone());
     // 刷新 DeviceID 选择：账号绑定设备命中本机凭证时直接用该凭证 device_id
@@ -1166,7 +1236,7 @@ pub(crate) fn exchange_token_refresh(
     // 变体链（主→兜底）：固化协议 P1363/DER → 旧端点 P1363 → 旧协议（无凭证时唯一路径）
     let new_url = "https://api.trae.com.cn/trae/api/v3/oauth/ExchangeToken";
     let mut variants: Vec<(String, String, serde_json::Value, String, bool)> = Vec::new();
-    if let Some(cred) = cred {
+    if let Some(ref cred) = cred {
         for (fmt, url, sign_path) in [
             (
                 crate::icube_auth::ProofSigFormat::P1363,
@@ -1185,7 +1255,7 @@ pub(crate) fn exchange_token_refresh(
             ),
         ] {
             let Ok(proof) =
-                crate::icube_auth::device_proof(cred, sign_path, &client_id, refresh_token, fmt)
+                crate::icube_auth::device_proof(&cred, sign_path, &client_id, refresh_token, fmt)
             else {
                 continue;
             };
@@ -1462,9 +1532,8 @@ pub fn oauth_login(
     // 1. 解析回调 URL
     let callback_info = oauth_parse_callback(state, callback_url)?;
 
-    // issue #76：本次登录会话设备（回调签发时轮转选定，回调解析已透传；
-    // 极端场景下缺失则重选——选择是确定性的，同状态下两次调用结果一致）。
-    // 登录 URL 参数 / ExchangeToken DeviceInfo / 刷新交换 / device_map 回写全链路同源
+    // 本次登录会话设备（回调签发时选定，回调解析已透传；极端场景下缺失则重选）。
+    // 登录 URL 参数 / ExchangeToken DeviceInfo / 刷新交换 / device_map 回写全链路同源。
     let login_device_id = callback_info
         .device_id
         .clone()
@@ -1573,6 +1642,13 @@ pub fn oauth_login(
     // 签到/积分查询经 get_device_for/resolve_device 取该设备，x-device-id 与 JWT
     // 同源（此前不回写，签到路径派生另一台伪设备，新 JWT 严格校验指纹时被拒）
     writeback_oauth_device(state, &user_id, &login_device_id);
+    // Web-only 每登录会话合成身份：成功拿到 uid 后落为该账号身份，供后续刷新
+    // DeviceProof 使用。删除账号时同步移除，重新 OAuth 即生成新设备。
+    if let Some(cred) = take_pending_login_device(state, &login_device_id) {
+        if let Err(e) = persist_account_synthetic_device(state, &user_id, &cred) {
+            fs_utils::app_log(&state.data_dir, &format!("OAuth: 账号合成设备身份持久化失败: {e}"));
+        }
+    }
 
     // 5. 尝试获取用户名
     let name = account_name

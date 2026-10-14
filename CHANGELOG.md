@@ -6,6 +6,30 @@
 
 ---
 
+
+## [Unreleased] · 2026-10-13 · Trae OAuth 每账号合成设备身份
+
+### 修复与加固
+
+- **Trae Web-only OAuth 设备指纹按账号隔离**：容器内无本机 Trae 客户端凭证时，每次 OAuth 登录会话生成一套独立 synthetic 设备身份；AuthCode `DeviceInfo` 交换、成功后的 refresh `DeviceProof`、签到与积分请求的 `device_map` 绑定共用同一身份，避免多个账号共享一台合成设备触发上游「当前设备今日已经签到」。
+- **同 uid 重新 OAuth 覆盖设备身份**：同一账号再次 OAuth 仍按既有逻辑合并更新凭证（不新增账号），但会把该账号 `device_map` 与 per-account synthetic 身份覆盖为本次新设备。
+- **删除账号清理设备指纹**：`account_delete` 在既有删除口径外同步清理该账号 `device_map` 与 synthetic 身份；重新 OAuth 即得到新设备。
+- **OAuth 登录窗口 pending 身份可匹配**：AuthCode 交换发生在最终 uid 解析前，设备凭证查找先命中本次登录的 pending synthetic 身份，避免退回无 `DeviceInfo` 变体导致 20405 `Device proof required`。
+- **移除 synthetic 全局首凭证兜底**：刷新链路不再悄悄回退到共享旧设备；找不到账号绑定身份时如实报错，防设备漂移。
+- **保留官方交换 host 白名单**：AuthCode 交换继续限定官方 API 域，防止伪造回调把令牌发往第三方主机。
+
+### 验证
+
+- `cargo check -p aiwork-core`
+- `cargo test -p aiwork-core -- --test-threads=1`：672 通过 / 7 忽略
+- `cargo test --workspace`：672 + 12 通过 / 7 忽略
+- `npm test`：61 通过
+- `npx tsc --noEmit`：0 错误
+- `cargo build --release -p aiwork-server`
+- Docker 重启后 `/health`：`{"running":true,"status":"ok"}`
+
+---
+
 ## [1.4.13] · 2026-10-13 · 移植 main：指纹诊断闭环 + 模板规则合并语义
 
 > 合并点 `main@f5e3f48` → `main@dea9ceb`（2 个提交，手工语义移植，未 merge）。桌面/OS 专属改动跳过。

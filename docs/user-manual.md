@@ -82,6 +82,8 @@ docker compose exec aiwork-server cat /app/data/conf/admin_token
 
 > OAuth 登录的账号自带 refresh_token，支持 48h 懒续期与每日自动续期（调度任务）。
 
+Docker / Web-only 环境没有本机 Trae 客户端设备凭证时，系统会在每次 OAuth 登录会话生成一套独立 synthetic 设备身份，并在登录成功后绑定到该账号；后续刷新、签到、积分查询都复用这套身份。同一账号重新 OAuth 会更新凭证并覆盖为新设备身份；删除账号会同步清理设备绑定，重新登录得到全新设备。
+
 ### 4.2 添加 WorkBuddy 账号（authUrl 轮询）
 
 Buddy 账号页发起 OAuth → 按提示在浏览器打开 authUrl 完成授权 → 服务端自动轮询收取 token（≤300s）并入池，**无需粘贴**。
