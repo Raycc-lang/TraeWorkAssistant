@@ -66,6 +66,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Docker ref 强制小写：github.repository（smart-open/TraeWorkAssistant）须转小写，
+      # push-by-digest 的 name= 不经 metadata-action（其才做小写化），必须自转
+      - name: 计算小写镜像名
+        id: img
+        run: echo "image=${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
+
       - uses: docker/setup-buildx-action@v3
 
       - name: 登录 GHCR
@@ -90,7 +96,7 @@ jobs:
           context: .
           platforms: ${{ matrix.platform }}
           labels: ${{ steps.meta.outputs.labels }}
-          outputs: type=image,name=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }},push-by-digest=true,name-canonical=true,push=true
+          outputs: type=image,name=${{ env.REGISTRY }}/${{ steps.img.outputs.image }},push-by-digest=true,name-canonical=true,push=true
           # GHA cache 按平台隔离 scope，避免双平台缓存互相覆盖
           cache-from: type=gha,scope=build-${{ matrix.suffix }}
           cache-to: type=gha,mode=max,scope=build-${{ matrix.suffix }}
@@ -116,6 +122,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
+      # Docker ref 强制小写（与 build-push job 同因）：digest 引用不经 metadata-action
+      - name: 计算小写镜像名
+        id: img
+        run: echo "image=${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
 
       - name: 下载两平台 digest
         uses: actions/download-artifact@v4
@@ -155,9 +166,9 @@ jobs:
         run: |
           docker buildx imagetools create \
             $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
-            $(printf '${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@sha256:%s ' *)
+            $(printf '${{ env.REGISTRY }}/${{ steps.img.outputs.image }}@sha256:%s ' *)
 
       - name: 校验多架构 manifest
         run: |
           docker buildx imagetools inspect \
-            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.ver.outputs.version }}
+            ${{ env.REGISTRY }}/${{ steps.img.outputs.image }}:${{ steps.ver.outputs.version }}

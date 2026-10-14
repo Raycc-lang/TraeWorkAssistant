@@ -11,6 +11,7 @@
 ### 新增
 
 - **多架构 Docker 镜像（issue #107）**：镜像同时发布 `linux/amd64` + `linux/arm64`。arm64 走 GitHub public 仓库免费原生 runner（`ubuntu-24.04-arm`），非 QEMU 模拟（Rust + rusqlite C 编译在模拟下极慢）；两平台并行按 digest 推送，末尾合并为多架构 manifest 并 inspect 校验。Dockerfile 零改动（基础镜像均官方多架构），GHA 缓存按平台隔离 scope。
+- **首跑修复（CI）**：push-by-digest 的镜像名不经 metadata-action（其才做小写化），`smart-open/TraeWorkAssistant` 大写仓库名被 buildx 拒绝（`invalid reference format: must be lowercase`）——两个 job 增加 `${GITHUB_REPOSITORY,,}` 小写化步骤，buildx 直接引用点（outputs/printf/inspect）改用小写输出。
 
 ### 验证
 
