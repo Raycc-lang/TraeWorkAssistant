@@ -90,10 +90,10 @@ impl TargetApp {
             "CodeBuddy" => Ok(TargetApp::CodeBuddy),
             "Qoder" => Ok(TargetApp::Qoder),
             "QoderWork" => Ok(TargetApp::QoderWork),
-            // 合法值清单 + 旧值指引：TraeWork 为合并前旧值（存量持久化字符串
-            // 由 store 迁移一次性改写，若此处出现多为旧版本数据未迁移）
+            // Err 文案带合法值清单 + 旧值指引（审查 P3）：调用方（CLI/持久化
+            // 读取）只报「未知应用类型」时无从排障，TraeWork 旧值需指路
             other => Err(format!(
-                "未知应用类型: {other}（合法值: Trae/Doubao/WorkBuddy/CodeBuddy/Qoder/QoderWork；TraeWork 已于 v3.7.12 并入 Trae，请更新应用到最新版本后重试）"
+                "未知应用类型: {other}（合法值: Trae | Doubao | WorkBuddy | CodeBuddy | Qoder | QoderWork；TraeWork 已于 v3.7.12 并入 Trae，存量数据由启动迁移自动改写，外部配置请改存为 Trae）"
             )),
         }
     }

@@ -1,6 +1,6 @@
 # AI Work 助手 用户手册
 
-> **版本**: v3.4.5 | **平台**: Windows 10 / 11 · macOS 12+（Apple Silicon / Intel）| **更新日期**: 2026-09-17
+> **版本**: v3.7.12 | **平台**: Windows 10 / 11 · macOS 12+（Apple Silicon / Intel）| **更新日期**: 2026-10-14
 
 ## 目录
 
