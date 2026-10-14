@@ -6,6 +6,14 @@
 
 ---
 
+## [未发布]
+
+### 新增
+
+- **多架构 Docker 镜像（issue #107）**：镜像同时发布 `linux/amd64` + `linux/arm64`。arm64 走 GitHub public 仓库免费原生 runner（`ubuntu-24.04-arm`），非 QEMU 模拟（Rust + rusqlite C 编译在模拟下极慢）；两平台并行按 digest 推送，末尾合并为多架构 manifest 并 inspect 校验。Dockerfile 零改动（基础镜像均官方多架构），GHA 缓存按平台隔离 scope。
+
+---
+
 ## [1.4.15] · 2026-10-14 · 移植 main：记账终态单行 + Qoder 调度三键 + 签到重学
 
 > 合并点 `main@dea9ceb` → `main@b0f81db`（4 个提交，手工语义移植，未 merge）+ PR #106（手工移植，未 merge）。桌面/OS 专属（TraeWork 迁移与升级引导、switcher、env 检测、device_proxy 等）跳过。

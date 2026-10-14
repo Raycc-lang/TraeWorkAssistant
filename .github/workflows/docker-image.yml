@@ -3,7 +3,9 @@
 # - push main（默认分支）→ 额外 :latest
 # - push tag v*      → :x.y.z + :latest + :sha（semver 与版本步骤产出同值，自动去重）
 # - pull_request     → 仅跑测试与构建验证，不推镜像
-# 仅 linux/amd64（arm64 需 QEMU 交叉编译 Rust，构建极慢，暂不启用）
+# 多架构发布（issue #107）：amd64 → ubuntu-latest，arm64 → ubuntu-24.04-arm（public 仓库免费原生 runner）；
+# 两平台并行按 digest 推送，末尾 merge job 合并为多架构 manifest。
+# 不走 QEMU 模拟（Rust + rusqlite(bundled) C 编译在模拟下极慢），不引入交叉编译工具链。
 name: CI & Docker Image
 
 on:
@@ -50,14 +52,19 @@ jobs:
     name: 构建并推送镜像（GHCR）
     needs: [rust, web]
     if: github.event_name != 'pull_request'
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            runner: ubuntu-latest
+            suffix: amd64
+          - platform: linux/arm64
+            runner: ubuntu-24.04-arm
+            suffix: arm64
+    runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
-
-      # 版本号取 package.json（sync_version.mjs 单一来源维护），任意 push 均产出 :x.y.z 版本 tag
-      - name: 读取项目版本
-        id: ver
-        run: echo "version=$(node -p "require('./package.json').version")" >> "$GITHUB_OUTPUT"
 
       - uses: docker/setup-buildx-action@v3
 
@@ -67,6 +74,69 @@ jobs:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
+
+      # 仅取 OCI labels（created/revision/source 等）写入各平台 image config；
+      # tags 由 merge job 统一计算（push-by-digest 不打 tag）
+      - name: 计算 OCI labels
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+
+      - name: 构建并按 digest 推送
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: ${{ matrix.platform }}
+          labels: ${{ steps.meta.outputs.labels }}
+          outputs: type=image,name=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }},push-by-digest=true,name-canonical=true,push=true
+          # GHA cache 按平台隔离 scope，避免双平台缓存互相覆盖
+          cache-from: type=gha,scope=build-${{ matrix.suffix }}
+          cache-to: type=gha,mode=max,scope=build-${{ matrix.suffix }}
+
+      - name: 导出 digest
+        run: |
+          mkdir -p "$RUNNER_TEMP/digests"
+          digest="${{ steps.build.outputs.digest }}"
+          touch "$RUNNER_TEMP/digests/${digest#sha256:}"
+
+      - name: 上传 digest
+        uses: actions/upload-artifact@v4
+        with:
+          name: digests-${{ matrix.suffix }}
+          path: ${{ runner.temp }}/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  merge:
+    name: 合并多架构 manifest（GHCR）
+    needs: build-push
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 下载两平台 digest
+        uses: actions/download-artifact@v4
+        with:
+          path: ${{ runner.temp }}/digests
+          pattern: digests-*
+          merge-multiple: true
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: 登录 GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # 版本号取 package.json（sync_version.mjs 单一来源维护），任意 push 均产出 :x.y.z 版本 tag
+      - name: 读取项目版本
+        id: ver
+        run: echo "version=$(node -p "require('./package.json').version")" >> "$GITHUB_OUTPUT"
 
       - name: 计算镜像标签
         id: meta
@@ -80,13 +150,14 @@ jobs:
             type=semver,pattern={{version}}
             type=sha,format=short
 
-      - name: 构建并推送
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          platforms: linux/amd64
-          push: true
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+      - name: 合并 manifest 并推送
+        working-directory: ${{ runner.temp }}/digests
+        run: |
+          docker buildx imagetools create \
+            $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
+            $(printf '${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@sha256:%s ' *)
+
+      - name: 校验多架构 manifest
+        run: |
+          docker buildx imagetools inspect \
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.ver.outputs.version }}
