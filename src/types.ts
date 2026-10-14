@@ -186,7 +186,6 @@ export interface Settings {
   checkin_skip_expired: boolean;
   retry: number;
   notify: string;
-  trae_path: string | null;
   trae_cn_path: string | null;
   doubao_path: string | null;
   /** 豆包会话续期保活端点（null = 用 doubao.com 首页滑动续期） */

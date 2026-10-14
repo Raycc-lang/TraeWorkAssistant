@@ -412,8 +412,11 @@ pub fn build_shared(state: &AppState) -> Arc<ApiSharedState> {
     //   WB 池：wb_credits_snapshot_task 快照后按 ok=true 账号经 update_credits 拨新
     //     （只更新余额+时间戳，不触碰运行期健康状态；此前 WB 池无运行期拨新
     //     路径，陈旧快照会一直 fail-open）；
-    //   Qoder 池：sync_from_qoder 恒 credits=None（倍率计费无余额概念），
-    //     reserve 对其结构性不生效，无保鲜需求（仅标注）。
+    //   Qoder 池（issue #102）：run_snapshot_task 快照后按 ok 行经
+    //     update_credits_snapshot 三键拨新（credits/expire_at/fetched_at）——
+    //     selectable 零积分与到期过滤均无新鲜度自愈，装配时 Some(0.0)/已过期的
+    //     账号在充值或续期后需拨新才恢复可选（此前注释「恒 credits=None 无保鲜
+    //     需求」随三键透传已过时）。
     // 静默失败不影响启动流程。docker 适配：build_shared 仅 aiwork-server 启动
     // 调用一次（热重载走 reload_pools_after_change），此处一次性保鲜与 main 的
     // do_start 语义等价；Trae 臂回写依赖 gateway_shared() 注册，线程开头轮询等待。
@@ -437,7 +440,8 @@ pub fn build_shared(state: &AppState) -> Arc<ApiSharedState> {
             }
             let trae_stale = shared2.pool.has_stale_credits();
             let wb_stale = shared2.wb_pool.has_stale_credits();
-            if !trae_stale && !wb_stale {
+            let qoder_stale = shared2.qoder_pool.has_zero_or_expired_credits();
+            if !trae_stale && !wb_stale && !qoder_stale {
                 return;
             }
             fs_utils::app_log(&st2.data_dir, "API服务启动-积分保鲜: 检测到陈旧积分快照, 后台刷新中");
@@ -486,6 +490,24 @@ pub fn build_shared(state: &AppState) -> Arc<ApiSharedState> {
                     Err(e) => fs_utils::app_log(
                         &st2.data_dir,
                         &format!("API服务启动-积分保鲜: WB池刷新失败(不影响使用) {}", e),
+                    ),
+                }
+            }
+            if qoder_stale {
+                // 拨新在 run_snapshot_task 内部经 gateway_shared() 完成（ok 行三键
+                // 拨新）；永久失效账号（needs_relogin）其内部已落日志，这里只汇总
+                match crate::tasks::qoder_credits::run_snapshot_task(&st2) {
+                    Ok(v) => {
+                        let n = v.get("accounts").and_then(serde_json::Value::as_i64).unwrap_or(0);
+                        let ok = v.get("ok").and_then(serde_json::Value::as_bool).unwrap_or(true);
+                        fs_utils::app_log(
+                            &st2.data_dir,
+                            &format!("API服务启动-积分保鲜: Qoder池拨新完成 ok={ok} accounts={n}"),
+                        );
+                    }
+                    Err(e) => fs_utils::app_log(
+                        &st2.data_dir,
+                        &format!("API服务启动-积分保鲜: Qoder池刷新失败(不影响使用) {}", e),
                     ),
                 }
             }
@@ -598,7 +620,7 @@ pub fn apply_pool_snapshot(
     wb_pool.sync_from_wb(&wb_accounts, &wb_uids);
     // Qoder 池同步（api_pool.json.qoder_enabled_uids 白名单 + qoder_group_ids 分组筛选，
     // 对齐 Buddy 池 wb_group_filter 语义：非空时仅纳入所选分组的账号，未分组不参与；
-    // token 空不入池，credits 恒 None——qoder 侧积分为订阅制口径，池内快照不承载）
+    // token 空不入池；积分三键快照入池（issue #91 reserve 过滤 + issue #102 智能调度））
     let qoder_accounts_all = qoder_upstream_accounts(state);
     let qoder_group_filter: Option<std::collections::HashSet<&str>> =
         if pool_file.qoder_group_ids.is_empty() {
@@ -788,6 +810,9 @@ pub fn qoder_upstream_accounts(state: &AppState) -> Vec<crate::api_server::pool:
             // 回写 QoderAccount.credits_balance + credits_fetched_at）入池，使 reserve
             // 保留额过滤在 Qoder 池同样生效。旧数据无字段 → None → fail-open
             credits: a.get("credits_balance").and_then(Value::as_f64),
+            // issue #102 智能调度：最早积分包到期随 qoder_credits 回写链路入池
+            //（smart 排序键①「先到期先消耗」+ selectable 到期过滤数据源；旧数据 None）
+            credits_expire_at: a.get("credits_expire_at").and_then(Value::as_i64),
             credits_fetched_at: a
                 .get("credits_fetched_at")
                 .and_then(Value::as_str)

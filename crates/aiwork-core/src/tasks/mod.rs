@@ -88,7 +88,8 @@ pub fn run_cli_task(name: &str, state: &AppState) -> i32 {
                 Ok(done)
             }
         }
-        // Qoder 积分快照（调度器/CLI 共用；空池自然空转）
+        // Qoder 积分快照（调度器/CLI 共用；空池自然空转）。CLI 独立任务模式无
+        // 网关运行态（gateway_shared() 未注册），函数内部仅落 doc 快照不拨新内存池
         "qoder-credits-snapshot" => qoder_credits::run_snapshot_task(state),
         // Qoder 凭证 6h 兜底刷新（调度器/CLI 共用；空池空转）
         "qoder-refresh" => qoder_refresh::run_task(state),

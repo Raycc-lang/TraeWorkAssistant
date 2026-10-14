@@ -729,11 +729,16 @@ fn run_wb_stream(
                                 )
                             })
                             .unwrap_or((0, 0));
-                        // F-76① TTFT 入账：用量页 P50/P95/TTFT 分位统计
-                        state.record_usage_ttfb(
-                            true, model, win_uid, key_id, error_info.is_none() && !failed_inline,
-                            true, duration_ms, pt, ct, Some(ttfb_ms),
-                        );
+                        // F-76① TTFT 入账：用量页 P50/P95/TTFT 分位统计。
+                        // 每请求终态单行（审查问题6）：换号重试（空完成未流出 /
+                        // 错误未流出，对应下方两处 break）为中间态不落账，避免
+                        // requests 虚高；终态（成功 / 就地收尾 / 流内失败透传）恰落一行
+                        if !(error_info.is_some() && !sent_any) {
+                            state.record_usage_ttfb(
+                                true, model, win_uid, key_id, error_info.is_none() && !failed_inline,
+                                true, duration_ms, pt, ct, Some(ttfb_ms),
+                            );
+                        }
                     }
                     match error_info {
                         Some((code, msg)) => {
@@ -1110,7 +1115,8 @@ pub async fn wb_aggregate_chat(
                                     empty_hits += 1;
                                     state.wb_pool.note_error(win_uid, ErrKind::Server);
                                     note_model_failure(&state, &model);
-                                    state.record_usage_ttfb(true, &model, win_uid, &key_id, false, stream, duration_ms, 0, 0, Some(ttfb_ms));
+                                    // 每请求终态单行（审查问题6）：换号是中间态不落账
+                                    // （终局由后续成功行/耗尽 none 行统一落）
                                     state.logger.log_request_ttfb(
                                         "buddy", "POST", "/v2/chat/completions", &model, stream, 502, win_uid,
                                         duration_ms, Some(ttfb_ms), &key_name,
@@ -1148,7 +1154,8 @@ pub async fn wb_aggregate_chat(
                                 }
                                 *safe_lock(&state.last_error) =
                                     Some(format!("wb uid={} code={} msg={}", win_uid, code, msg));
-                                state.record_usage_ttfb(true, &model, win_uid, &key_id, false, stream, duration_ms, 0, 0, Some(ttfb_ms));
+                                // 每请求终态单行（审查问题6）：换号是中间态不落账
+                                // （终局由后续成功行/耗尽 none 行统一落）
                                 state.logger.log_request_ttfb(
                                     "buddy", "POST", "/v2/chat/completions", &model, stream, 200, win_uid,
                                     duration_ms, Some(ttfb_ms), &key_name,
@@ -1160,7 +1167,7 @@ pub async fn wb_aggregate_chat(
                             _ => {
                                 state.wb_pool.note_error(win_uid, ErrKind::Server);
                                 note_model_failure(&state, &model);
-                                state.record_usage_ttfb(true, &model, win_uid, &key_id, false, stream, duration_ms, 0, 0, Some(ttfb_ms));
+                                // 每请求终态单行（审查问题6）：换号是中间态不落账
                                 state.logger.log_request_ttfb(
                                     "buddy", "POST", "/v2/chat/completions", &model, stream, 502, win_uid,
                                     duration_ms, Some(ttfb_ms), &key_name,
@@ -1236,8 +1243,8 @@ pub async fn wb_aggregate_chat(
                                 note_model_failure_ex(&state, &model, upstream_msg(&resp_body).as_deref());
                                 *safe_lock(&state.last_error) =
                                     Some(format!("wb uid={} status={}", picked.uid, status));
-                                state.record_usage(true, &model, &picked.uid, &key_id, false, stream,
-                                    start_ts.elapsed().as_millis() as u64, 0, 0);
+                                // 每请求终态单行（审查问题6）：SwitchKey → 换号是中间态，
+                                // 不落账（对齐流式路径），由终局分支统一落行
                                 state.logger.log_request(
                                     "buddy", "POST", "/v2/chat/completions", &model, stream, status, &picked.uid,
                                     start_ts.elapsed().as_millis() as u64,

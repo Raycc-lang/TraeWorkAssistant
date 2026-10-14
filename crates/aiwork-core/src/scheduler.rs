@@ -739,7 +739,9 @@ fn run_task(key: &str, st: &AppState) -> Result<Value, String> {
             }
             Ok(done)
         }
-        // F-80 Qoder 积分快照：与 `--task-run qoder-credits-snapshot` 同款（空池空转）
+        // F-80 Qoder 积分快照：与 `--task-run qoder-credits-snapshot` 同款（空池空转）；
+        // 成功行快照三键拨新进 qoder_pool（issue #102 运行期保鲜，函数内部经
+        // gateway_shared() 判定，对齐 trae-credits-snapshot 的 issue #67 口径）
         "qoder-credits-snapshot" => crate::tasks::qoder_credits::run_snapshot_task(st),
         // Qoder Token 定时刷新：与 `--task-run qoder-refresh` 同款（6h 周期，lazy 7h 惰性门；
         // 有账号刷新失败时返 Err，交由调度器 30 分钟冷却重试；抢不到跨进程锁返回 skipped_busy）

@@ -652,7 +652,14 @@ pub fn account_delete(
         let store = crate::store::db(&state.data_dir);
         let mut map = crate::store::docs::device_map_load(&store);
         if map.remove(&user_id).is_some() {
-            let _ = crate::store::docs::device_map_save(&store, &map);
+            // 保存失败仅落日志不阻断删除（数据卫生问题，对齐下方标签清理口径；
+            // 孤儿条目影响兜底设备基准，留痕便于人工修复 device_map.json）
+            if let Err(e) = crate::store::docs::device_map_save(&store, &map) {
+                fs_utils::app_log(
+                    &state.data_dir,
+                    &format!("账号 {user_id} 设备指纹清理失败: {e}"),
+                );
+            }
         }
     }
     crate::commands::oauth::remove_account_synthetic_device(state, &user_id);

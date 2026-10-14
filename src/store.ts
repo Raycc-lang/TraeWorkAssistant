@@ -184,7 +184,6 @@ function defaultSettings(): Settings {
     checkin_skip_expired: true,
     retry: 1,
     notify: 'toast',
-    trae_path: null,
     trae_cn_path: null,
     doubao_path: null,
     doubao_renew_url: 'https://www.doubao.com/info/v2/',
