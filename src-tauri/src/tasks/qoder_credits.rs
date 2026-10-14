@@ -137,6 +137,27 @@ fn ms_to_date(ms: i64) -> String {
         .unwrap_or_default()
 }
 
+/// fetch_account 产出 row → 最早积分包到期 Unix 秒（issue #102 网关智能调度口径）：
+/// 逐包 expire_ms（原始毫秒，仅剩余>0 且激活的包，parse 层已过滤）取 min；
+/// 包明细缺失或包未携带原始 ms（随订阅周期）时回退 row 级 plan_expires_ms
+/// （sash expiresAt / big_model nextResetAt）。None = 响应未携带任何到期信息。
+fn earliest_expire_secs(row: &Value) -> Option<i64> {
+    let mut earliest_ms: Option<i64> = None;
+    if let Some(arr) = row.get("packages").and_then(Value::as_array) {
+        for p in arr {
+            if let Some(ms) = p.get("expire_ms").and_then(Value::as_i64).filter(|m| *m > 0) {
+                if earliest_ms.map_or(true, |cur| ms < cur) {
+                    earliest_ms = Some(ms);
+                }
+            }
+        }
+    }
+    let to_secs = |ms: i64| Some(ms / 1000);
+    earliest_ms
+        .and_then(to_secs)
+        .or_else(|| row.get("plan_expires_ms").and_then(Value::as_i64).filter(|m| *m > 0).and_then(to_secs))
+}
+
 /// usage 解析产出（R-7 主结构 + 宽容兜底）。
 /// used（userQuota/addOnQuota.used，订阅周期内已消耗）与 plan_expires_at
 /// （qoderUsage.expiresAt → 订阅周期到期日）为积分看板 v2 新增捕获字段。
@@ -237,6 +258,8 @@ fn parse_usage(b: &Value) -> UsageParsed {
                 "amount": amount,
                 "total": num_or_none(d.get("total")),
                 "expire_at": expire_at,
+                // 原始到期毫秒（issue #102 调度数据源）；0 = 随订阅周期（expire_at 已兜底）
+                "expire_ms": exp_ms,
                 "source": "dedicated",
                 "name": name,
             }));
@@ -347,6 +370,8 @@ fn parse_big_model(b: &Value, plan_expires_at: &str) -> BigModelParsed {
                 "amount": amount,
                 "total": num_or_none(d.get("limit_value")),
                 "expire_at": expire_at,
+                // 原始到期毫秒（issue #102 调度数据源）；0 = 随订阅周期（expire_at 已兜底）
+                "expire_ms": exp_ms,
                 "source": big_model_source(&s_of(d.get("source"))),
             }));
         }
@@ -429,6 +454,14 @@ fn fetch_account(
     row["total"] = json!(p.total);
     row["plan_expires_at"] = json!(p.plan_expires_at);
     row["packages"] = json!(p.packages);
+    // 订阅周期到期原始毫秒（issue #102 调度兜底键）；sash expiresAt 缺失 → None，
+    // 由下方 big_model nextResetAt 分支补齐
+    let plan_expires_ms = b
+        .get("qoderUsage")
+        .and_then(|v| v.get("expiresAt"))
+        .and_then(Value::as_i64)
+        .filter(|m| *m > 0);
+    row["plan_expires_ms"] = json!(plan_expires_ms);
     // 逐包明细增强（R-11）：端点在官网域（WEB_BASE）——openapi 主机无此路由
     //（实测 alb 503），保留为兜底（未来开放即生效）。任一主机 200 即解析；
     // 字段级覆盖——新接口有值才覆盖，缺失/失败（非 200、非 JSON）静默回退
@@ -479,6 +512,9 @@ fn fetch_account(
             if let Some(nr) = bm.next_reset_ms {
                 if nr > 0 {
                     row["plan_expires_at"] = json!(ms_to_date(nr));
+                    if row.get("plan_expires_ms").and_then(Value::as_i64).is_none() {
+                        row["plan_expires_ms"] = json!(nr);
+                    }
                 }
             }
         }
@@ -494,6 +530,10 @@ fn fetch_account(
             ),
         );
     }
+    // 最早积分包到期（issue #102 智能调度数据源）：逐包 expire_ms 取 min →
+    // 订阅周期 plan_expires_ms 兜底；此处 ok 恒 true（失败分支均已提前 return），
+    // 随 credits_balance 同链路由池回写落 QoderAccount
+    row["credits_expire_at"] = json!(earliest_expire_secs(&row));
     // source 徽标：PAT 通道（access_token 已换为作业令牌，kind 恒为 pat）/ 客户端 token（dt- 等）
     row["source"] = json!(if creds.kind == "pat" || creds.access_token.starts_with("pt-") { "pat" } else { "client_token" });
     row
@@ -698,6 +738,9 @@ pub fn fetch_credits(state: &AppState, user_id: Option<&str>, fresh: bool) -> Re
             };
             a["credits_balance"] = row.get("total").cloned().unwrap_or(Value::Null);
             a["credits_fetched_at"] = json!(fs_utils::now_iso());
+            // 最早积分包到期（issue #102 网关智能调度数据源；None = 响应未携带，
+            // 键值随每次回写覆盖不留 stale）
+            a["credits_expire_at"] = row.get("credits_expire_at").cloned().unwrap_or(Value::Null);
             // 套餐档位回填（v3.7.x）：行内 plan_tier 非空且与池内不同才更新（幂等，
             // 顺带把存量账号空套餐补齐、旧值如 "Pro Trial" 归一为展示名）
             if let Some(tier) = row
@@ -786,6 +829,29 @@ pub fn fetch_credits(state: &AppState, user_id: Option<&str>, fresh: bool) -> Re
     Ok(out)
 }
 
+/// 运行池拨新快照收集（issue #102 运行期保鲜）：ok 行且 total 有值才进；
+/// expire 取行内 credits_expire_at（None = 响应未携带，拨新时覆盖旧值不留
+/// stale，对齐 fetch_credits 池回写「键值随每次回写覆盖」口径）
+fn collect_running_pool_snapshot(
+    rows: &[Value],
+) -> std::collections::HashMap<String, (f64, Option<i64>)> {
+    let mut m = std::collections::HashMap::new();
+    for r in rows {
+        if r.get("ok").and_then(Value::as_bool) != Some(true) {
+            continue;
+        }
+        let (Some(aid), Some(total)) = (
+            r.get("user_id").and_then(Value::as_str),
+            r.get("total").and_then(Value::as_f64),
+        ) else {
+            continue;
+        };
+        let expire = r.get("credits_expire_at").and_then(Value::as_i64);
+        m.insert(aid.to_string(), (total, expire));
+    }
+    m
+}
+
 /// 每日快照任务（调度器/CLI 共用；fresh 拉取全部账号 + 快照落库，空池自然空转）
 /// 审查 P2：原实现永不返回 Err（fetch_credits 全路径 Ok），当日全部账号失败时
 /// （无缓存 → 空结果；有缓存 → stale 回退行内全 ok、failed 不可见）快照缺失且
@@ -795,7 +861,12 @@ pub fn fetch_credits(state: &AppState, user_id: Option<&str>, fresh: bool) -> Re
 ///   冷却重试（同日 UPSERT 覆盖，重试成功即补落当日快照）；
 /// - 仅永久失败（无凭证/4xx，401 自愈已试过）→ Ok 停止重试（重试无解，
 ///   全天 48 次 tick 徒劳 + 误报通知），落日志提示人工处理。
-pub fn run_snapshot_task(state: &AppState) -> Result<Value, String> {
+/// `runtime`：GUI 进程内的网关运行态句柄（调度器/启动保鲜传入）——成功行
+/// 快照三键拨新进 qoder_pool（issue #102 运行期保鲜）；CLI 独立进程传 None
+pub fn run_snapshot_task(
+    state: &AppState,
+    runtime: Option<&std::sync::Mutex<Option<crate::commands::api_server::ApiServerRuntime>>>,
+) -> Result<Value, String> {
     // 账号池读取（审查 P2 同族修复）：qoder_pool_load 将 rows_all 失败吞为空池，
     // 「库损坏/IO 故障」会误走 n==0 空转 Ok 被调度器记当日已跑，快照点永久缺失。
     // 区分：Ok(空 rows)=真实空池；no such table（表未建，db() 打开时已建表，理论
@@ -832,6 +903,19 @@ pub fn run_snapshot_task(state: &AppState) -> Result<Value, String> {
         .and_then(Value::as_array)
         .cloned()
         .unwrap_or_default();
+    // 运行池三键拨新（issue #102 运行期保鲜）：网关运行中（调度器/启动保鲜传
+    // runtime）时把 ok 行快照同步进 qoder_pool——内存池三键钉死在装配时刻，
+    // 不拨新则签到充值/续期后账号仍被零积分/到期过滤持续排除，直到网关重启
+    // （对齐 Trae issue #67 运行期回写先例）。CLI 独立进程传 None 跳过
+    if let Some(shared) = runtime.and_then(|r| {
+        let g = r.lock().unwrap_or_else(|e| e.into_inner());
+        g.as_ref().map(|rt| rt.shared.clone())
+    }) {
+        let m = collect_running_pool_snapshot(&rows);
+        if !m.is_empty() {
+            shared.qoder_pool.update_credits_snapshot(&m);
+        }
+    }
     let failed: Vec<&Value> = rows
         .iter()
         .filter(|r| r.get("ok").and_then(Value::as_bool) != Some(true))
@@ -868,6 +952,26 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    #[test]
+    fn collect_running_pool_snapshot_filters_rows() {
+        // issue #102 运行期拨新收集：ok 行 + total 有值才进；expire 透传
+        //（None = 响应未携带，拨新时覆盖旧值不留 stale）
+        let rows = vec![
+            json!({"user_id": "qd-a", "ok": true, "total": 120.0, "credits_expire_at": 1999999999}),
+            json!({"user_id": "qd-b", "ok": true, "total": 5.5}),
+            json!({"user_id": "qd-c", "ok": false, "total": 9.0}),
+            json!({"user_id": "qd-d", "ok": true}),
+            json!({"user_id": "qd-e", "ok": true, "total": null}),
+        ];
+        let m = collect_running_pool_snapshot(&rows);
+        assert_eq!(m.len(), 2);
+        assert_eq!(m.get("qd-a"), Some(&(120.0, Some(1_999_999_999))));
+        assert_eq!(m.get("qd-b"), Some(&(5.5, None)));
+        assert!(!m.contains_key("qd-c"), "失败行剔除");
+        assert!(!m.contains_key("qd-d"), "total 缺失剔除");
+        assert!(!m.contains_key("qd-e"), "total null 剔除");
+    }
+
     /// R-7 抓包样本（2026-09-27 实测，claim 第二活动后 addOnQuota 出现）
     const CAPTURED_SAMPLE: &str = r#"{"displayMode":"qoder","qoderUsage":{"userId":"01a0dff8-cc47-7b64-bd6d-d9cb2aea6792","userType":"personal_professional_trial","usageType":"credits","totalUsagePercentage":0,"isQuotaExceeded":false,"expiresAt":1791673619906,"upgradeUrl":"https://qoder.com/pricing?client=qoder","userQuota":{"total":300,"used":0,"remaining":300,"percentage":0,"unit":"credits"},"addOnQuota":{"total":100,"used":0,"remaining":100,"percentage":0,"unit":"credits","detailUrl":"https://qoder.com/account/usage"},"isPlanQuotaProrated":false}}"#;
 
@@ -899,6 +1003,31 @@ mod tests {
         assert_eq!(p.addon, None);
         assert_eq!(p.addon_used, None);
         assert_eq!(p.total, Some(300.0));
+    }
+
+    #[test]
+    fn earliest_expire_secs_prefers_pack_then_plan_cycle() {
+        // issue #102 调度口径：逐包 expire_ms 取 min（毫秒→秒）；
+        // 包未携带原始 ms（随订阅周期）或无包明细时回退 plan_expires_ms；
+        // 0/负值视为缺失，全缺失 → None
+        let row = json!({
+            "packages": [
+                {"expire_at": "2099-01-01", "expire_ms": 4_000_000_000_000i64},
+                {"expire_at": "2026-11-01", "expire_ms": 1_793_500_000_000i64},
+                {"expire_at": "2027-01-01", "expire_ms": 0},
+            ],
+            "plan_expires_ms": 1_791_673_619_906i64,
+        });
+        assert_eq!(earliest_expire_secs(&row), Some(1_793_500_000));
+        // 无逐包 ms → 订阅周期兜底
+        let row = json!({"packages": [{"expire_at": "2026-11-01", "expire_ms": 0}], "plan_expires_ms": 1_791_673_619_906i64});
+        assert_eq!(earliest_expire_secs(&row), Some(1_791_673_619));
+        // 无包明细（聚合口径）→ 订阅周期兜底
+        let row = json!({"packages": [], "plan_expires_ms": 1_791_673_619_906i64});
+        assert_eq!(earliest_expire_secs(&row), Some(1_791_673_619));
+        // 全缺失 → None
+        let row = json!({"packages": [], "plan_expires_ms": Value::Null});
+        assert_eq!(earliest_expire_secs(&row), None);
     }
 
     #[test]

@@ -15,6 +15,7 @@
 //!
 //! 入口：CLI 任务模式 `--task-run trae-capture-local`（对齐原 `python device_proxy.py
 //! --capture-local` 手动兜底用法）；另被 refresh_jwt 失败后的本地恢复自动调用。
+//! 扫描 Trae 客户端（双应用合并后唯一客户端）数据目录，设置 TRAE_APP_DIR 时只扫指定目录。
 
 use std::path::{Path, PathBuf};
 
@@ -22,8 +23,7 @@ use crate::state::AppState;
 
 use super::handler::{extract_user_id, update_account_jwt, valid_cloud_ide_jwt, ProxyCtx};
 
-/// 候选应用数据目录（对齐 Python `_trae_app_dirs`）：TRAE SOLO CN（Trae Work）+ Trae CN；
-/// 设置 TRAE_APP_DIR 时只扫指定目录（兼容旧环境变量）。
+/// 候选应用数据目录（双应用合并后仅 Trae CN）；设置 TRAE_APP_DIR 时只扫指定目录
 #[cfg(windows)]
 fn trae_app_dirs() -> Vec<PathBuf> {
     if let Ok(env) = std::env::var("TRAE_APP_DIR") {
@@ -35,14 +35,12 @@ fn trae_app_dirs() -> Vec<PathBuf> {
     if base.is_empty() {
         return vec![];
     }
-    vec![
-        Path::new(&base).join("TRAE SOLO CN"),
-        Path::new(&base).join("Trae CN"),
-    ]
+    vec![Path::new(&base).join("Trae CN")]
 }
 
-/// mac 版候选目录：`~/Library/Application Support/{TRAE SOLO CN, Trae CN}`
-///（实测两目录结构与 Windows Electron 布局一致：根目录 Cookies + Local Storage + Partitions）
+/// mac 版候选目录：`~/Library/Application Support/Trae CN`
+///（实测目录结构与 Windows Electron 布局一致：根目录 Cookies + Local Storage + Partitions；
+/// TRAE SOLO CN 已随双应用合并退役，不再扫描）
 #[cfg(target_os = "macos")]
 fn trae_app_dirs() -> Vec<PathBuf> {
     if let Ok(env) = std::env::var("TRAE_APP_DIR") {
@@ -55,10 +53,7 @@ fn trae_app_dirs() -> Vec<PathBuf> {
         return vec![];
     }
     let base = Path::new(&base).join("Library").join("Application Support");
-    vec![
-        base.join("TRAE SOLO CN"),
-        base.join("Trae CN"),
-    ]
+    vec![base.join("Trae CN")]
 }
 
 /// 离线场景构造 ProxyCtx（复用 handler 的账号写回通路；不启动代理、不 emit 前端事件）

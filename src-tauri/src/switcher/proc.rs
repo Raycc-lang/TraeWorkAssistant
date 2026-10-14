@@ -48,15 +48,20 @@ fn strip_exe_suffix(name: &str) -> &str {
 /// Helper 进程位于 `Contents/Frameworks/<X> Helper*.app/` 下不会命中（仅主进程），
 /// SIGTERM 主进程后 Helper 随主退出（与 Windows 仅关停主 exe 的语义一致）。
 #[cfg(target_os = "macos")]
-fn mac_main_matches(prof: &AppProfile, p: &sysinfo::Process) -> bool {
+fn mac_exe_is_main_of(p: &sysinfo::Process, name: &str) -> bool {
     p.exe()
         .map(|e| {
-            let s = e.to_string_lossy().to_lowercase();
-            prof.proc_names
-                .iter()
-                .any(|n| s.contains(&format!("/{}.app/contents/macos/", n.to_lowercase())))
+            e.to_string_lossy()
+                .to_lowercase()
+                .contains(&format!("/{}.app/contents/macos/", name.to_lowercase()))
         })
         .unwrap_or(false)
+}
+
+/// 档案级匹配：任一 proc_names（.app 主干名）命中即为主进程
+#[cfg(target_os = "macos")]
+fn mac_main_matches(prof: &AppProfile, p: &sysinfo::Process) -> bool {
+    prof.proc_names.iter().any(|n| mac_exe_is_main_of(p, n))
 }
 
 /// 进程匹配分派：Windows 按映像名（剥 .exe），macOS 按主 bundle 路径段
@@ -152,14 +157,25 @@ pub fn running_name_set() -> std::sync::Arc<std::collections::HashSet<String>> {
     set
 }
 
-/// 是否有任一映像名命中（Get-Process -Name 语义：精确名、大小写不敏感、自动兼容
-/// sysinfo 的 `.exe` 后缀形态）。环境检测专用，零子进程。
-#[cfg(windows)]
+/// 是否有任一目标进程在运行。环境检测/迁移守卫用，零子进程。
+/// Windows：Get-Process -Name 语义（精确名、大小写不敏感、自动兼容 sysinfo 的
+/// `.exe` 后缀形态）；macOS：映像名恒为 Electron（M-1 ⑥），`names` 视为 .app
+/// bundle 主干名，按主进程 bundle 路径段匹配（与 mac_main_matches 同源）。
 pub fn any_running(names: &[&str]) -> bool {
-    let set = running_name_set();
-    names
-        .iter()
-        .any(|n| set.contains(strip_exe_suffix(n).to_ascii_lowercase().as_str()))
+    #[cfg(windows)]
+    {
+        let set = running_name_set();
+        names
+            .iter()
+            .any(|n| set.contains(strip_exe_suffix(n).to_ascii_lowercase().as_str()))
+    }
+    #[cfg(target_os = "macos")]
+    {
+        snapshot()
+            .processes()
+            .values()
+            .any(|p| names.iter().any(|n| mac_exe_is_main_of(p, n)))
+    }
 }
 
 /// 精确映像名命中的进程 exe 全路径（首个命中）：`Get-Process -Name @(...) | Select -First 1`
@@ -180,7 +196,7 @@ pub fn running_exe_exact(names: &[&str]) -> Option<std::path::PathBuf> {
 }
 
 /// Stop-Trae 对译：三级关闭。
-/// 自身/父进程排除逻辑不再需要：精确映像名匹配（TRAE SOLO CN.exe 等）永不命中
+/// 自身/父进程排除逻辑不再需要：精确映像名匹配（Trae CN.exe 等）永不命中
 /// ai-work-assistant.exe；旧版进程名「Trae Work 助手」的兼容排除为死代码，删除
 ///（8.2 #2 有意差异）。
 pub fn stop_app(sess: &mut Session, sink: &dyn ProgressSink) -> Result<(), String> {
@@ -523,12 +539,9 @@ mod tests {
         assert!(name_matches(&p, "DOUBAO.EXE"));
         assert!(name_matches(&p, "Doubao"));
         assert!(!name_matches(&p, "DoubaoUpdate.exe"));
-        let tw = prof(TargetApp::TraeWork);
-        assert!(name_matches(&tw, "TRAE SOLO CN.exe"));
-        assert!(name_matches(&tw, "Trae.exe"));
-        // Trae 档案的白名单不含 Trae CN（防串台）
         let trae = prof(TargetApp::Trae);
         assert!(name_matches(&trae, "Trae CN.exe"));
+        // 白名单外（TRAE SOLO CN 随 Trae Work 退役）拒绝
         assert!(!name_matches(&trae, "TRAE SOLO CN.exe"));
         // 自身应用不应命中任何白名单
         let cb = prof(TargetApp::CodeBuddy);
@@ -538,9 +551,8 @@ mod tests {
     #[test]
     fn list_procs_不误杀前缀相似进程() {
         // 本测试进程名（ai-work-assistant 或其测试变体）不在任何白名单内；
-        // TraeWork 白名单含 "Trae"——若按前缀匹配会误命中 ai-work-assistant，
-        // 精确匹配则不会
-        let p = prof(TargetApp::TraeWork);
+        // Trae 白名单 "Trae CN" 与其无交集——精确映像名匹配永不误命中
+        let p = prof(TargetApp::Trae);
         let procs = list_procs(&p);
         // 自身测试进程绝不应命中任何档案白名单
         assert!(procs.iter().all(|(_, exe)| {

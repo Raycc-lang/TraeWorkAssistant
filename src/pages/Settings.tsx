@@ -25,8 +25,6 @@ export default function Settings() {
   const [taskInfo, setTaskInfo] = useState<string>('');
   const [busyTask, setBusyTask] = useState(false);
   const [querying, setQuerying] = useState(false);
-  const [deviceTarget, setDeviceTarget] = useState<'TraeWork' | 'Trae'>('TraeWork');
-  const [detecting, setDetecting] = useState(false);
   const [detectingCn, setDetectingCn] = useState(false);
 
   // 确认弹窗状态
@@ -155,28 +153,6 @@ export default function Settings() {
     process: '运行进程',
   };
 
-  const detectTrae = async () => {
-    setDetecting(true);
-    try {
-      const r = await withMinDelay(api.env.locate('trae_work'));
-      if (r.exe) {
-        update('trae_path', r.exe);
-        toast('success', `已自动定位并填入 Trae Work 路径（${LOCATE_SOURCE_LABEL[r.source] ?? r.source}${r.version ? `，版本 ${r.version}` : ''}）`);
-      } else {
-        toast(
-          'info',
-          platform === 'macos'
-            ? '未检测到 Trae Work，请手动指定 .app 应用路径（如 /Applications/TRAE SOLO CN.app）'
-            : '未检测到 Trae Work，请手动指定 exe 路径（自定义安装目录时常见，可右键快捷方式「打开文件所在位置」获取）',
-        );
-      }
-    } catch (e) {
-      toast('error', `检测失败：${String(e)}`);
-    } finally {
-      setDetecting(false);
-    }
-  };
-
   const detectTraeCn = async () => {
     setDetectingCn(true);
     try {
@@ -201,7 +177,7 @@ export default function Settings() {
 
   const handleResetDeviceIds = async () => {
     setConfirmResetDevice(false);
-    await resetDeviceIds(deviceTarget);
+    await resetDeviceIds('Trae');
   };
 
   if (!form) {
@@ -247,33 +223,9 @@ export default function Settings() {
 
           <h3 className="mb-1 font-medium">应用环境</h3>
           <p className="mb-3 text-xs text-slate-400">
-            两个 Trae 应用的安装路径，用于「打开应用」与「切换账号」时定位客户端；留空将自动探测。
+            Trae 客户端的安装路径，用于「打开应用」与「切换账号」时定位客户端；留空将自动探测。
           </p>
           <div className="space-y-3 text-sm">
-            <div>
-              <label className="label">Trae Work 安装路径</label>
-              <div className="flex items-center gap-2">
-                <input
-                  type="text"
-                  value={form.trae_path ?? ''}
-                  onChange={(e) => update('trae_path', e.target.value.trim() || null)}
-                  placeholder={
-                    platform === 'macos'
-                      ? '默认 /Applications/TRAE SOLO CN.app'
-                      : '默认 C:\\Users\\你\\AppData\\Local\\Programs\\TRAE SOLO CN\\TRAE SOLO CN.exe'
-                  }
-                  className="input flex-1"
-                />
-                <button onClick={detectTrae} disabled={detecting} className="btn-outline shrink-0">
-                  <Search size={15} /> {detecting ? '检测中…' : '自动检测'}
-                </button>
-              </div>
-              <p className="mt-1 text-xs text-slate-400">
-                {platform === 'macos'
-                  ? 'TRAE SOLO CN（Trae Work）的 .app 应用路径，安装到非标准目录时需填写。'
-                  : 'TRAE SOLO CN（Trae Work）的 exe 路径，自定义安装目录时需填写。'}
-              </p>
-            </div>
             <div>
               <label className="label">Trae 安装路径</label>
               <div className="flex items-center gap-2">
@@ -293,7 +245,7 @@ export default function Settings() {
                 </button>
               </div>
               <p className="mt-1 text-xs text-slate-400">
-                {platform === 'macos' ? 'Trae CN IDE 的 .app 应用路径。' : 'Trae CN IDE 的 exe 路径。'}
+                {platform === 'macos' ? 'Trae 客户端（Trae CN）的 .app 应用路径。' : 'Trae 客户端（Trae CN）的 exe 路径。'}
               </p>
             </div>
           </div>
@@ -337,19 +289,10 @@ export default function Settings() {
           <h3 className="mb-1 font-medium">{platform === 'windows' ? '6 层设备标识重置' : '设备标识重置（mac 5 层）'}</h3>
           <p className="mb-3 text-xs text-slate-500">
             {platform === 'windows'
-              ? '一次性重置所选应用的全部设备标识层：① machineid ② storage.json telemetry ③ storage.json aha.device ④ TinyStorage ⑤ 注册表 MachineGuid ⑥ webview 追踪数据。用于账号隔离与防关联，执行前请先关闭对应应用。'
-              : '一次性重置所选应用的设备标识层：① machineid ② storage.json telemetry ③ storage.json aha.device ④ TinyStorage ⑤ webview 追踪数据（mac 无注册表 MachineGuid 层，自动跳过）。用于账号隔离与防关联，执行前请先关闭对应应用。'}
+              ? '一次性重置 Trae 应用的全部设备标识层：① machineid ② storage.json telemetry ③ storage.json aha.device ④ TinyStorage ⑤ 注册表 MachineGuid ⑥ webview 追踪数据。用于账号隔离与防关联，执行前请先关闭对应应用。'
+              : '一次性重置 Trae 应用的设备标识层：① machineid ② storage.json telemetry ③ storage.json aha.device ④ TinyStorage ⑤ webview 追踪数据（mac 无注册表 MachineGuid 层，自动跳过）。用于账号隔离与防关联，执行前请先关闭对应应用。'}
           </p>
           <div className="flex flex-wrap items-center gap-2">
-            <select
-              value={deviceTarget}
-              onChange={(e) => setDeviceTarget(e.target.value as 'TraeWork' | 'Trae')}
-              disabled={deviceResetActive}
-              className="input h-9 w-36 text-sm"
-            >
-              <option value="TraeWork">Trae Work</option>
-              <option value="Trae">Trae</option>
-            </select>
             <button
               onClick={() => setConfirmResetDevice(true)}
               disabled={deviceResetActive}
@@ -588,7 +531,7 @@ export default function Settings() {
           <AlertTriangle size={20} className="mt-0.5 shrink-0 text-amber-500" />
           <div>
             <p>
-              将重置 <span className="font-semibold">{deviceTarget === 'Trae' ? 'Trae（Trae CN IDE）' : 'Trae Work（TRAE SOLO CN）'}</span> 的以下全部设备标识层：
+              将重置 <span className="font-semibold">Trae（Trae CN）</span> 的以下全部设备标识层：
             </p>
             <ul className="mt-2 space-y-0.5 text-xs text-slate-400">
               <li>① machineid</li>

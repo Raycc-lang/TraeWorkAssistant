@@ -252,6 +252,19 @@ impl ApiPool {
             .any(|e| e.credits.is_some() && !e.reserve_filter_active(now))
     }
 
+    /// Qoder 池启动保鲜判定（issue #102）：是否存在会被 selectable 持续排除的
+    /// 钉死快照——零/负余额（零积分过滤无新鲜度门槛，充值后不拨新不恢复）或
+    /// 积分已到期（续期后同理）。与 has_stale_credits 的 reserve 新鲜度口径互补：
+    /// 后者 reserve=0 时短路 false，覆盖不到本判定的两种场景
+    pub fn has_zero_or_expired_credits(&self) -> bool {
+        let entries = safe_lock(&self.entries);
+        let now = now_ts();
+        entries.values().any(|e| {
+            e.credits.is_some_and(|c| c <= 0.0)
+                || e.credits_expire_at.is_some_and(|exp| exp > 0 && exp < now)
+        })
+    }
+
     /// 账号在途计数共享句柄（F-77）：InflightGuard 取号后 bind_account 使用；
     /// 不存在则创建（计数从 0 开始，bind 时 +1）
     pub fn inflight_handle(&self, uid: &str) -> Arc<std::sync::atomic::AtomicU32> {
@@ -420,6 +433,23 @@ impl ApiPool {
         }
     }
 
+    /// Qoder 池运行期三键拨新（issue #102 运行期保鲜）：credits + credits_expire_at +
+    /// credits_fetched_at 一并回写。与 update_credits（Trae/WB 只拨余额+时间戳）不同，
+    /// Qoder 的 selectable 到期过滤与 smart 排序键①「先到期先消耗」依赖
+    /// credits_expire_at——旧值钉死会让充值/续期后的账号持续被排除直到网关重启。
+    /// 未提及的账号保持原值，不触碰冷却/inflight/禁用等运行态（对齐 update_credits 纪律）
+    pub fn update_credits_snapshot(&self, snapshot: &HashMap<String, (f64, Option<i64>)>) {
+        let mut entries = safe_lock(&self.entries);
+        let now = now_ts();
+        for (uid, (c, expire)) in snapshot {
+            if let Some(e) = entries.get_mut(uid) {
+                e.credits = Some(*c);
+                e.credits_fetched_at = Some(now);
+                e.credits_expire_at = *expire;
+            }
+        }
+    }
+
     /// 从 WorkBuddy 账号同步池（T2.1/F-28）：WB 上游账号进同一调度引擎，
     /// 携带区域/企业域信息供上游 headers 使用
     pub fn sync_from_wb(&self, accounts: &[WbSyncAccount], enabled: &[String]) {
@@ -468,9 +498,10 @@ impl ApiPool {
     }
 
     /// 从 Qoder 账号同步池（p3-3）：Qoder 专用池实例（`ApiSharedState.qoder_pool`），
-    /// 全量重建语义同 sync_from_wb。Qoder 按倍率计费无积分余额概念，
-    /// credits 恒 None（selectable 不做积分过滤）；machine_id 透传账号记录值
-    ///（可能为空——请求时由 identity 回调解析 effective 凭证补齐）
+    /// 全量重建语义同 sync_from_wb。积分/到期快照随 QoderSyncAccount 装配
+    ///（issue #102 智能调度三键生效 + issue #91 reserve 保留额过滤）；
+    /// machine_id 透传账号记录值（可能为空——请求时由 identity 回调解析
+    /// effective 凭证补齐）
     pub fn sync_from_qoder(&self, accounts: &[QoderSyncAccount], enabled: &[String]) {
         let mut entries = safe_lock(&self.entries);
         entries.clear();
@@ -485,9 +516,9 @@ impl ApiPool {
                     uid: a.uid.clone(),
                     name: a.name.clone(),
                     jwt: a.access_token.clone(),
-                    credits: None,
-                    credits_expire_at: None,
-                    credits_fetched_at: None,
+                    credits: a.credits,
+                    credits_expire_at: a.credits_expire_at,
+                    credits_fetched_at: a.credits_fetched_at,
                     disabled: a.needs_relogin,
                     err_count: 0,
                     until: 0,
@@ -1063,6 +1094,14 @@ pub struct QoderSyncAccount {
     pub access_token: String,
     pub machine_id: String,
     pub needs_relogin: bool,
+    /// 余额快照（issue #102 三池对齐）：qoder_credits 任务回写 QoderAccount.credits_balance；
+    /// None = 无快照/旧数据，reserve 过滤 fail-open
+    pub credits: Option<f64>,
+    /// 最早积分包到期（Unix 秒，issue #102）：smart 排序键①「先到期先消耗」与
+    /// selectable 到期过滤的数据源；None = 无到期信息
+    pub credits_expire_at: Option<i64>,
+    /// 余额快照采集时间（Unix 秒）：reserve 过滤新鲜度门槛（issue #91 口径）
+    pub credits_fetched_at: Option<i64>,
 }
 
 /// 候选过滤：healthy + 未 tried + 积分未过期 + 非零积分 + 非 hard_credit 冷却
@@ -1926,6 +1965,9 @@ mod tests {
                     access_token: "tk".into(),
                     machine_id: "mid".into(),
                     needs_relogin: false,
+                    credits: None,
+                    credits_expire_at: None,
+                    credits_fetched_at: None,
                 },
                 crate::api_server::pool::QoderSyncAccount {
                     uid: "qd-dead".into(),
@@ -1933,6 +1975,9 @@ mod tests {
                     access_token: "tk".into(),
                     machine_id: String::new(),
                     needs_relogin: true,
+                    credits: None,
+                    credits_expire_at: None,
+                    credits_fetched_at: None,
                 },
                 // 空令牌账号不入池（无法签名）
                 crate::api_server::pool::QoderSyncAccount {
@@ -1941,6 +1986,9 @@ mod tests {
                     access_token: String::new(),
                     machine_id: String::new(),
                     needs_relogin: false,
+                    credits: None,
+                    credits_expire_at: None,
+                    credits_fetched_at: None,
                 },
             ],
             &["qd-1".to_string(), "qd-dead".to_string(), "qd-empty".to_string()],
@@ -1960,11 +2008,109 @@ mod tests {
                 access_token: "tk".into(),
                 machine_id: String::new(),
                 needs_relogin: true,
+                credits: None,
+                credits_expire_at: None,
+                credits_fetched_at: None,
             }],
             &["qd-dead".to_string()],
         );
         assert_eq!(pool.count(), 1);
         assert!(pool.pick_excluding_constrained(&HashSet::new(), None, None).is_none());
+    }
+
+    #[test]
+    fn qoder_sync_carries_credits_snapshot() {
+        // issue #102：Qoder 余额/到期/快照时间透传入池——smart 排序三键
+        //（最早到期 → 倍率 → 积分和）与 reserve 保留额过滤的数据源
+        let pool = ApiPool::new();
+        pool.sync_from_qoder(
+            &[crate::api_server::pool::QoderSyncAccount {
+                uid: "qd-c".into(),
+                name: "n".into(),
+                access_token: "tk".into(),
+                machine_id: String::new(),
+                needs_relogin: false,
+                credits: Some(42.0),
+                credits_expire_at: Some(1_999_999_999),
+                credits_fetched_at: Some(1_700_000_000),
+            }],
+            &["qd-c".to_string()],
+        );
+        let entries = safe_lock(&pool.entries);
+        let e = entries.get("qd-c").unwrap();
+        assert_eq!(e.credits, Some(42.0));
+        assert_eq!(e.credits_expire_at, Some(1_999_999_999));
+        assert_eq!(e.credits_fetched_at, Some(1_700_000_000));
+    }
+
+    #[test]
+    fn qoder_update_credits_snapshot_three_keys_and_runtime_state_kept() {
+        // issue #102 运行期拨新：三键同拨；未提及账号不动；运行态（冷却/成功数）不受影响
+        let pool = ApiPool::new();
+        pool.sync_from_qoder(
+            &[
+                crate::api_server::pool::QoderSyncAccount {
+                    uid: "qd-a".into(), name: String::new(), access_token: "tk".into(),
+                    machine_id: String::new(), needs_relogin: false,
+                    credits: Some(0.0), credits_expire_at: Some(1), credits_fetched_at: Some(1),
+                },
+                crate::api_server::pool::QoderSyncAccount {
+                    uid: "qd-b".into(), name: String::new(), access_token: "tk".into(),
+                    machine_id: String::new(), needs_relogin: false,
+                    credits: Some(5.0), credits_expire_at: Some(1_999_999_999),
+                    credits_fetched_at: Some(1),
+                },
+            ],
+            &["qd-a".to_string(), "qd-b".to_string()],
+        );
+        // 运行态预置：qd-a 软冷却中 + 有成功计数，拨新不得触碰
+        {
+            let mut entries = safe_lock(&pool.entries);
+            let a = entries.get_mut("qd-a").unwrap();
+            a.until = 1_234_567_890;
+            a.successes = 7;
+        }
+        let mut m: HashMap<String, (f64, Option<i64>)> = HashMap::new();
+        m.insert("qd-a".to_string(), (120.0, Some(1_999_999_999)));
+        pool.update_credits_snapshot(&m);
+        {
+            let entries = safe_lock(&pool.entries);
+            let a = entries.get("qd-a").unwrap();
+            assert_eq!(a.credits, Some(120.0));
+            assert_eq!(a.credits_expire_at, Some(1_999_999_999));
+            assert!(a.credits_fetched_at.unwrap() > 1, "快照时间拨新");
+            assert_eq!(a.until, 1_234_567_890, "软冷却不被触碰");
+            assert_eq!(a.successes, 7, "运行态不被触碰");
+            // 未提及账号保持原值
+            let b = entries.get("qd-b").unwrap();
+            assert_eq!(b.credits, Some(5.0));
+            assert_eq!(b.credits_expire_at, Some(1_999_999_999));
+            assert_eq!(b.credits_fetched_at, Some(1));
+        }
+    }
+
+    #[test]
+    fn qoder_has_zero_or_expired_credits_detects_pinned_snapshot() {
+        let pool = ApiPool::new();
+        pool.sync_from_qoder(
+            &[crate::api_server::pool::QoderSyncAccount {
+                uid: "qd-0".into(), name: String::new(), access_token: "tk".into(),
+                machine_id: String::new(), needs_relogin: false,
+                credits: Some(0.0), credits_expire_at: None, credits_fetched_at: Some(1),
+            }],
+            &["qd-0".to_string()],
+        );
+        assert!(pool.has_zero_or_expired_credits(), "零余额快照应触发保鲜");
+        // 拨新为正余额 + 未到期 → 不再触发
+        let mut m: HashMap<String, (f64, Option<i64>)> = HashMap::new();
+        m.insert("qd-0".to_string(), (9.9, Some(1_999_999_999)));
+        pool.update_credits_snapshot(&m);
+        assert!(!pool.has_zero_or_expired_credits());
+        // 已到期快照同样触发（余额为正也被到期过滤排除）
+        let mut m2: HashMap<String, (f64, Option<i64>)> = HashMap::new();
+        m2.insert("qd-0".to_string(), (9.9, Some(1)));
+        pool.update_credits_snapshot(&m2);
+        assert!(pool.has_zero_or_expired_credits());
     }
 
     #[test]

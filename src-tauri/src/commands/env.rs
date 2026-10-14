@@ -23,20 +23,6 @@ pub struct EnvStatus {
 // 以下命令含耗时操作（注册表全量搜索、PowerShell 进程调用、最多 5s 的进程关闭轮询），
 // 一律标记 async 派发到线程池执行，避免阻塞 UI 主线程（与 updater 冻结修复同因）。
 
-#[tauri::command(async)]
-pub fn env_check(_app: AppHandle, state: State<AppState>) -> EnvStatus {
-    // F-45 统一探测：env_check 与设置页 app_locate 共用同一探测链（app_locate_inner
-    // 平台分派：Windows 手动指定 → 默认路径 → 注册表 → 运行进程；mac settings →
-    // bundle 探测 → mdfind → 进程回退），自定义安装不再恒报「未检测到」（issue #45）
-    let loc = app_locate_inner(&state, "trae_work");
-    EnvStatus {
-        installed: loc.exe.is_some(),
-        running: is_running(),
-        version: loc.version,
-        path: loc.exe,
-    }
-}
-
 /// F-75 M0-0.5：平台标志下发（os + arch），前端存 store.platform 控制入口显隐与文案。
 /// 零参数零副作用，启动时调用一次。
 #[tauri::command]
@@ -67,49 +53,9 @@ pub fn open_trae_website(_app: AppHandle) -> Result<(), String> {
     Ok(())
 }
 
-/// 启动本地 Trae Work 客户端。
-/// 若传入 proxy_port（代理运行中），自动注入 `--proxy-server` 让 Trae 走本地代理，
-/// 无需用户在 Trae 设置里手动配置代理。
-#[tauri::command(async)]
-pub fn open_trae_app(_app: AppHandle, state: State<AppState>, proxy_port: Option<u16>) -> Result<(), String> {
-    // 统一探测（app_locate_inner 平台分派）：mac 命中 .app bundle、Windows 命中 exe。
-    let exe = app_locate_inner(&state, "trae_work")
-        .exe
-        .ok_or("未检测到本地 Trae Work 安装，请在「环境配置」中指定路径")?;
-    persist_detected_path(&state, "trae_path", &exe);
-    // 直开（不注入代理）前，清理可能指向已停止本地代理的残留系统代理，避免请求被 RESET
-    if proxy_port.is_none() {
-        crate::commands::proxy::cleanup_stale_local_proxy(&state);
-    }
-    // Electron 单实例：已运行的窗口会忽略新启动参数，注入代理前先三级关闭现有进程确保生效
-    // （无代理时正常打开，不杀进程。）
-    if proxy_port.is_some() {
-        crate::commands::process::graceful_kill_app("TraeWork")?;
-    }
-    #[cfg(target_os = "macos")]
-    {
-        // mac：LaunchServices `open` 单实例激活 .app bundle，--args 透传代理参数给主进程
-        let mut cmd = crate::platform::cmd::sys_command("open");
-        cmd.arg(&exe);
-        if let Some(port) = proxy_port {
-            cmd.args(["--args", &format!("--proxy-server=http://127.0.0.1:{port}")]);
-        }
-        cmd.spawn().map_err(|e| format!("启动 Trae Work 失败: {e}"))?;
-        Ok(())
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        let mut cmd = Command::new(&exe);
-        if let Some(port) = proxy_port {
-            // Electron/Chromium 支持 --proxy-server 启动参数
-            cmd.arg(format!("--proxy-server=http://127.0.0.1:{port}"));
-        }
-        cmd.spawn().map_err(|e| format!("启动 Trae Work 失败: {e}"))?;
-        Ok(())
-    }
-}
-
-/// 检测 Trae CN IDE（与 Trae Work/SOLO CN 是两个独立应用）
+/// 检测 Trae 客户端（双应用合并后唯一客户端）。
+/// 原 `env_check` / `open_trae_app`（Trae Work 域）已随双应用合并退役，
+/// 本命令为唯一 Trae 环境入口。
 #[tauri::command(async)]
 pub fn env_check_trae_cn(_app: AppHandle, state: State<AppState>) -> EnvStatus {
     let loc = app_locate_inner(&state, "trae");
@@ -121,12 +67,13 @@ pub fn env_check_trae_cn(_app: AppHandle, state: State<AppState>) -> EnvStatus {
     }
 }
 
-/// 打开 Trae CN IDE。与 Trae Work 同款代理注入：传入 proxy_port 时以 --proxy-server 启动，
-/// 让 Trae 的流量也走本地 MITM 代理（捕获账号/观察请求）。
+/// 打开 Trae 客户端（双应用合并后唯一客户端）。传入 proxy_port（代理运行中）时以
+/// `--proxy-server` 启动，让 Trae 的流量走本地 MITM 代理（捕获账号/观察请求）。
 #[tauri::command(async)]
 pub fn open_trae_cn_app(_app: AppHandle, state: State<AppState>, proxy_port: Option<u16>) -> Result<(), String> {
-    // 统一探测（同 open_trae_app）：mac 命中 .app bundle、Windows 命中 exe。
-    let exe = app_locate_inner(&state, "trae")
+    // 统一探测（app_locate_inner 平台分派）：mac 命中 .app bundle、Windows 命中 exe。
+    let loc = app_locate_inner(&state, "trae");
+    let exe = loc
         .exe
         .ok_or("未检测到 Trae 安装，请在「环境配置」中指定 Trae 安装路径")?;
     persist_detected_path(&state, "trae_cn_path", &exe);
@@ -137,6 +84,21 @@ pub fn open_trae_cn_app(_app: AppHandle, state: State<AppState>, proxy_port: Opt
     // Electron 单实例：已运行的窗口会忽略新启动参数，注入代理前先三级关闭现有进程确保生效
     if proxy_port.is_some() {
         crate::commands::process::graceful_kill_app("Trae")?;
+    }
+    // Agent 窗口修正（2026-10-14 合并版实测）：启动窗口类型取 live storage.json 的
+    // runtimeWindow.lastTask（缺省回落 Agent）。客户端未运行时补丁为 Agent，保证
+    // 顶部打开与切换恢复两条路径恒开 Agent 窗口；运行中不写（退出时会被客户端
+    // 自身状态覆盖，写了也无效）。
+    if !is_running_cn() {
+        // 复用 app_locate 的 user_data_dir（与 app_profile/档案表同源，两平台
+        // 分派：Windows=%APPDATA%\Trae CN、mac=~/Library/Application Support/Trae CN；
+        // 审查修复 2026-10-14：原手拼 %APPDATA%\Trae CN 为第三处硬编码）
+        let live_dir = std::path::PathBuf::from(&loc.user_data_dir);
+        // best-effort 不阻断打开，但失败落日志（与 restore 路径的 Warn 口径一致，
+        // 便于 storage.json 异常时排查「为何开的是 IDE 窗口」）
+        if let Err(e) = crate::switcher::icube::apply_agent_window_fixup(&live_dir) {
+            crate::fs_utils::app_log_default(&format!("Agent 窗口修正失败（打开路径）: {e}"));
+        }
     }
     #[cfg(target_os = "macos")]
     {
@@ -197,8 +159,8 @@ pub(crate) fn version_of(path: &str) -> Option<String> {
 }
 
 /// 原实现（保留作 PE 资源读取失败时的兜底）：ProductVersion 优先，缺失回退 FileVersion。
-/// 实测 Electron 系客户端两者差异巨大（TRAE SOLO CN.exe FileVersion=2.3.83557 而
-/// ProductVersion=0.1.65，CodeBuddy CN.exe FileVersion=1.106.1.0 而 ProductVersion=4.12.0），
+/// 实测 Electron 系客户端两者差异巨大（CodeBuddy CN.exe FileVersion=1.106.1.0 而
+/// ProductVersion=4.12.0），
 /// 旧版恒读 FileVersion 导致顶栏版本显示为构建号而非产品版本
 #[cfg(windows)]
 fn powershell_version_of(path: &str) -> Option<String> {
@@ -311,7 +273,7 @@ fn version_cached(path: &str, compute: impl FnOnce() -> Option<String>) -> Optio
     v
 }
 
-/// Trae CN IDE 进程检测：Windows 用 sysinfo 进程表枚举 + 短 TTL 复用（main 合并，
+/// Trae 客户端进程检测：Windows 用 sysinfo 进程表枚举 + 短 TTL 复用（main 合并，
 /// 原 tasklist 子进程 ~260ms）；mac 按 bundle 主进程路径段匹配（M-1 ⑥：映像名均
 /// 为 Electron，按名字比对恒不命中）
 fn is_running_cn() -> bool {
@@ -329,21 +291,6 @@ fn is_running_cn() -> bool {
     }
 }
 
-fn is_running() -> bool {
-    #[cfg(windows)]
-    {
-        crate::switcher::proc::any_running(&["TRAE SOLO CN"])
-    }
-    #[cfg(target_os = "macos")]
-    {
-        crate::commands::process::mac_app_running(&["TRAE SOLO CN", "TRAE SOLO"])
-    }
-    #[cfg(not(any(windows, target_os = "macos")))]
-    {
-        false
-    }
-}
-
 // ── F-01：安装位置自动识别 app_locate（跨应用通用，平台分派探测链）────────
 // Windows 四级探测：用户手动指定（app_settings.json 持久化值）→ 默认路径候选 →
 // 注册表卸载键 → 运行进程反查（F-45 对齐全库原有语义：默认路径优先、注册表兜底）。
@@ -352,7 +299,7 @@ fn is_running() -> bool {
 
 #[derive(Serialize)]
 pub struct AppLocate {
-    /// 应用标识：trae_work | trae | doubao | workbuddy
+    /// 应用标识：trae | doubao | workbuddy
     pub app: String,
     /// 可执行文件路径（macOS 形态为 .app bundle 目录路径，供 LaunchServices `open` 启动）
     pub exe: Option<String>,
@@ -379,23 +326,11 @@ struct AppProfile {
 
 #[cfg(not(target_os = "macos"))]
 fn app_profile(target_app: Option<&str>) -> AppProfile {
-    let key = target_app.unwrap_or("trae_work").to_lowercase();
+    let key = target_app.unwrap_or("trae").to_lowercase();
     let appdata = std::env::var("APPDATA").unwrap_or_default();
     let local = std::env::var("LOCALAPPDATA").unwrap_or_default();
     let home = std::env::var("USERPROFILE").unwrap_or_default();
     match key.as_str() {
-        "trae" | "trae_cn" | "traecn" | "ide" => AppProfile {
-            display: "Trae",
-            reg_patterns: &["Trae CN"],
-            reg_exe_names: &["Trae CN.exe"],
-            exe_candidates: &[
-                "%LOCALAPPDATA%\\Programs\\Trae CN\\Trae CN.exe",
-                "%ProgramFiles%\\Trae CN\\Trae CN.exe",
-            ],
-            proc_names: &["Trae CN"],
-            user_data_dir: format!("{appdata}\\Trae CN"),
-            settings_key: Some("trae_cn_path"),
-        },
         "doubao" => AppProfile {
             display: "豆包",
             reg_patterns: &["Doubao", "豆包"],
@@ -432,25 +367,18 @@ fn app_profile(target_app: Option<&str>) -> AppProfile {
             user_data_dir: format!("{home}\\.codebuddy"),
             settings_key: Some("codebuddy_path"),
         },
-        // trae_work / traework / work / solo 及其它值 → 默认 Trae Work
+        // trae / trae_cn / traecn / ide 及其它值 → 默认 Trae（双应用合并后唯一客户端）
         _ => AppProfile {
-            display: "Trae Work",
-            // 末位 "TRAE" 泛模式兜底：兼容旧 detect_trae 的 DisplayName contains
-            // "TRAE" 全量匹配（裸名 "TRAE" / 未来新形态等），仅在前两个精确模式
-            // 未命中时才触发第三次注册表扫描
-            reg_patterns: &["TRAE SOLO", "Trae Work", "TRAE"],
-            reg_exe_names: &["TRAE SOLO CN.exe", "TRAE SOLO.exe", "Trae.exe"],
+            display: "Trae",
+            reg_patterns: &["Trae CN"],
+            reg_exe_names: &["Trae CN.exe"],
             exe_candidates: &[
-                "%LOCALAPPDATA%\\Programs\\TRAE SOLO CN\\TRAE SOLO CN.exe",
-                "%LOCALAPPDATA%\\Programs\\TRAE SOLO\\TRAE SOLO.exe",
-                "%ProgramFiles%\\TRAE SOLO CN\\TRAE SOLO CN.exe",
-                "%ProgramFiles%\\TRAE SOLO\\TRAE SOLO.exe",
-                "%LOCALAPPDATA%\\Programs\\Trae\\Trae.exe",
-                "%ProgramFiles%\\Trae\\Trae.exe",
+                "%LOCALAPPDATA%\\Programs\\Trae CN\\Trae CN.exe",
+                "%ProgramFiles%\\Trae CN\\Trae CN.exe",
             ],
-            proc_names: &["TRAE SOLO CN", "TRAE SOLO", "Trae"],
-            user_data_dir: format!("{appdata}\\TRAE SOLO CN"),
-            settings_key: Some("trae_path"),
+            proc_names: &["Trae CN"],
+            user_data_dir: format!("{appdata}\\Trae CN"),
+            settings_key: Some("trae_cn_path"),
         },
     }
 }
@@ -823,7 +751,6 @@ fn app_locate_windows(state: &State<AppState>, app: &str) -> AppLocate {
     if let Some(sk) = profile.settings_key {
         let settings = state.settings();
         let custom = match sk {
-            "trae_path" => settings.trae_path,
             "trae_cn_path" => settings.trae_cn_path,
             "doubao_path" => settings.doubao_path,
             "workbuddy_path" => settings.workbuddy_path,
@@ -868,7 +795,7 @@ fn app_locate_windows(state: &State<AppState>, app: &str) -> AppLocate {
 /// async 派发：内部有注册表全量搜索与 PowerShell 调用，同步会冻结 UI。
 #[tauri::command(async)]
 pub fn app_locate(state: State<AppState>, target_app: Option<String>) -> AppLocate {
-    app_locate_inner(&state, target_app.as_deref().unwrap_or("trae_work"))
+    app_locate_inner(&state, target_app.as_deref().unwrap_or("trae"))
 }
 
 /// AppLocate.app 值域统一（合并审查 #7）：display → 英文 slug，双平台一致。

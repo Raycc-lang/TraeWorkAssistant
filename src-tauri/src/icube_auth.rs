@@ -104,7 +104,7 @@ pub struct DeviceCredential {
     pub private_key_pem: String,
     pub machine_id: String,
     pub app_version: String,
-    /// 来源客户端（Trae CN / TRAE SOLO CN 等），诊断日志用
+    /// 来源客户端（恒 Trae CN，双应用合并后唯一客户端），诊断日志用
     #[allow(dead_code)]
     pub source_app: String,
 }
@@ -136,10 +136,6 @@ fn mac_app_version(app: &str) -> String {
     use crate::switcher::locate::{bundle_exe_matches, is_bundle_dir, read_info_plist_value};
     let (names, bundle_ids): (&[&str], &[&str]) = match app {
         "Trae CN" | "Trae" => (&["Trae", "Trae CN"], &["cn.trae.app"]),
-        "TRAE SOLO CN" | "Trae Work" => (
-            &["Trae Work", "TRAE SOLO CN", "TRAE SOLO", "Trae"],
-            &["cn.trae.solo.app"],
-        ),
         _ => return String::new(),
     };
     let home = std::env::var("HOME").unwrap_or_default();
@@ -181,7 +177,7 @@ fn app_version_for(localappdata: &std::path::Path, app: &str) -> String {
     }
 }
 
-/// 扫描本机各 Trae 客户端 storage.json 提取设备凭证（多个客户端各有一套）。
+/// 扫描本机 Trae 客户端（双应用合并后唯一客户端）storage.json 提取设备凭证。
 /// 找不到/解密失败返回空表——DeviceProof 不可用时调用方回落无 proof 变体。
 pub fn extract_device_credentials() -> Vec<DeviceCredential> {
     // F-75 跨平台收口：storage.json 基根 Windows=%APPDATA% / mac=Application Support
@@ -192,7 +188,7 @@ pub fn extract_device_credentials() -> Vec<DeviceCredential> {
     };
     let localappdata = crate::platform::local_data_root_lossy();
     let mut out = Vec::new();
-    for app in ["Trae CN", "TRAE SOLO CN", "Trae", "Trae Work"] {
+    for app in ["Trae CN"] {
         let path = appdata
             .join(app)
             .join("User")

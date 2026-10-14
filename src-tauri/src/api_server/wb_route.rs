@@ -703,9 +703,9 @@ fn run_wb_stream(
                     let (error_info, sent_any, failed_inline, usage, eof_truncated) =
                         wb_sse::stream_forward_ex_ns(win_lines, tx, proto, chat_id, model, ns_encoded);
                     let duration_ms = start_ts.elapsed().as_millis() as u64;
-                    // 用量记账口径（审查修复，对齐 qoder_route）：不再逐尝试落行——
-                    // 换号中间态（空完成/流内错误轮换）不记，usage 由请求终局
-                    // （成功/就地收尾/池耗尽）统一落一行，防 requests/errors 虚高。
+                    // 用量记账口径（审查修复，对齐 qoder_route；main 审查问题6 同目标）：
+                    // 不再逐尝试落行——换号中间态（空完成/流内错误轮换）不记，usage 由
+                    // 请求终局（成功/就地收尾/池耗尽）统一落一行，防 requests/errors 虚高。
                     // 本次尝试的 usage 暂存，终局分支消费。
                     let attempt_usage = usage
                         .as_ref()
@@ -1133,7 +1133,8 @@ pub async fn wb_aggregate_chat(
                                     empty_hits += 1;
                                     state.wb_pool.note_error(win_uid, ErrKind::Server);
                                     note_model_failure(&state, &model);
-                                    state.record_usage_ttfb(true, &model, win_uid, &key_id, false, stream, duration_ms, 0, 0, Some(ttfb_ms));
+                                    // 每请求终态单行（审查问题6）：换号是中间态不落账
+                                    // （终局由后续成功行/耗尽 none 行统一落）
                                     state.logger.log_request_ttfb(
                                         "buddy", "POST", "/v2/chat/completions", &model, stream, 502, win_uid,
                                         duration_ms, Some(ttfb_ms), &key_name,
@@ -1172,7 +1173,8 @@ pub async fn wb_aggregate_chat(
                                 }
                                 *safe_lock(&state.last_error) =
                                     Some(format!("wb uid={} code={} msg={}", win_uid, code, msg));
-                                state.record_usage_ttfb(true, &model, win_uid, &key_id, false, stream, duration_ms, 0, 0, Some(ttfb_ms));
+                                // 每请求终态单行（审查问题6）：换号是中间态不落账
+                                // （终局由后续成功行/耗尽 none 行统一落）
                                 state.logger.log_request_ttfb(
                                     "buddy", "POST", "/v2/chat/completions", &model, stream, 200, win_uid,
                                     duration_ms, Some(ttfb_ms), &key_name,
@@ -1184,7 +1186,7 @@ pub async fn wb_aggregate_chat(
                             _ => {
                                 state.wb_pool.note_error(win_uid, ErrKind::Server);
                                 note_model_failure(&state, &model);
-                                state.record_usage_ttfb(true, &model, win_uid, &key_id, false, stream, duration_ms, 0, 0, Some(ttfb_ms));
+                                // 每请求终态单行（审查问题6）：换号是中间态不落账
                                 state.logger.log_request_ttfb(
                                     "buddy", "POST", "/v2/chat/completions", &model, stream, 502, win_uid,
                                     duration_ms, Some(ttfb_ms), &key_name,
@@ -1269,7 +1271,7 @@ pub async fn wb_aggregate_chat(
                                     Some(format!("wb uid={} status={}", picked.uid, status));
                                 // 三池统一：每请求一行终态记账（中间态不记，防虚高）——
                                 // 换号为中间步，usage 由终态路径（成功/池耗尽）统一落一行
-                                //（审查 P2-4，对齐 qoder_route 聚合口径）
+                                //（审查 P2-4，对齐 qoder_route 聚合口径；main 侧审查问题6 同目标）
                                 state.logger.log_request(
                                     "buddy", "POST", "/v2/chat/completions", &model, stream, status, &picked.uid,
                                     start_ts.elapsed().as_millis() as u64,

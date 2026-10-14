@@ -1,7 +1,8 @@
-//! 应用档案表（F-48 表驱动）：5 应用 × 3 快照布局（原 trae-switch-bridge.ps1
-//! 82-198 行对译）。icube 布局（TraeWork/Trae）同为 icube 内核的 VSCode fork，
+//! 应用档案表（F-48 表驱动）：6 应用 × 4 快照布局（原 trae-switch-bridge.ps1
+//! 82-198 行对译）。icube 布局（Trae/Qoder）同为 icube 内核的 VSCode fork，
 //! 登录态文件结构完全同构，按档案参数化复用全部切换逻辑；chromium（豆包）/
 //! authfile（WorkBuddy/CodeBuddy）布局各有独立快照管线。
+//! （2026-10-14：Trae Work 与 Trae CN 合并为单一客户端，TraeWork 档案退役删除）
 
 use std::path::PathBuf;
 
@@ -133,6 +134,10 @@ pub struct AppProfile {
     /// 不可作身份信号——locate.rs bundle 白名单 OR 分支消费。
     #[allow(dead_code)] // mac locate 接线消费；Windows 构建不编译消费点
     pub mac_bundle_ids: &'static [&'static str],
+    /// 恢复快照后把 `runtimeWindow.lastTask.windowType` 补丁为 Agent（合并版 Trae
+    /// 客户端启动窗口类型取该键，缺省回落 Agent；快照冻结旧窗口类型会让恢复后
+    /// 打开 IDE 窗口。2026-10-14 实测，见 switcher/icube.rs apply_agent_window_fixup）
+    pub force_agent_window: bool,
 }
 
 impl AppProfile {
@@ -201,6 +206,7 @@ pub fn profile_for(app: TargetApp, app_data_dir: &std::path::Path) -> AppProfile
             mac_supported: true,
             mac_data_dir_guess: Some("~/Library/Application Support/Trae CN"),
             mac_bundle_ids: &["cn.trae.app"],
+            force_agent_window: true,
         },
         TargetApp::Doubao => AppProfile {
             app_name: "豆包",
@@ -229,6 +235,7 @@ pub fn profile_for(app: TargetApp, app_data_dir: &std::path::Path) -> AppProfile
             mac_supported: true,
             mac_data_dir_guess: Some("~/Library/Application Support/Doubao"),
             mac_bundle_ids: &["com.bot.pc.doubao"],
+            force_agent_window: false,
         },
         TargetApp::WorkBuddy => AppProfile {
             app_name: "WorkBuddy",
@@ -257,6 +264,7 @@ pub fn profile_for(app: TargetApp, app_data_dir: &std::path::Path) -> AppProfile
             mac_supported: true,
             mac_data_dir_guess: Some("~/.workbuddy"),
             mac_bundle_ids: &["com.tencent.workbuddy.mac"],
+            force_agent_window: false,
         },
         TargetApp::CodeBuddy => AppProfile {
             app_name: "CodeBuddy",
@@ -295,36 +303,7 @@ pub fn profile_for(app: TargetApp, app_data_dir: &std::path::Path) -> AppProfile
             mac_supported: true,
             mac_data_dir_guess: Some("~/.codebuddy"),
             mac_bundle_ids: &["com.tencent.codebuddycn"],
-        },
-        TargetApp::TraeWork => AppProfile {
-            app_name: "Trae Work",
-            layout: Layout::Icube,
-            data_dir: roaming_dir("TRAE SOLO CN"),
-            profiles_dir: data.join("data").join("profiles"),
-            settings_path_key: "trae_path",
-            // 同 Trae：3s 恒超时强杀 → WAL 残留回放，提至 8s 优雅落盘
-            graceful_wait_secs: 8,
-            proc_names: &["TRAE SOLO CN", "TRAE SOLO", "Trae"],
-            proc_patterns: &["Trae*", "TRAE*"],
-            exe_names: &["TRAE SOLO CN.exe", "TRAE SOLO.exe", "Trae.exe"],
-            lnk_patterns: &["*TRAE*", "*Trae*"],
-            reg_patterns: &["*TRAE*", "*Trae*"],
-            exe_candidates: vec![
-                PathBuf::from(format!("{local}\\Programs\\TRAE SOLO CN\\TRAE SOLO CN.exe")),
-                PathBuf::from(format!("{local}\\Programs\\TRAE SOLO\\TRAE SOLO.exe")),
-                PathBuf::from(format!("{program_files}\\TRAE SOLO CN\\TRAE SOLO CN.exe")),
-                PathBuf::from(format!("{program_files}\\TRAE SOLO\\TRAE SOLO.exe")),
-                PathBuf::from(format!("{local}\\Programs\\Trae\\Trae.exe")),
-                PathBuf::from(format!("{program_files}\\Trae\\Trae.exe")),
-                PathBuf::from("D:\\Programs\\TRAE SOLO CN\\TRAE SOLO CN.exe"),
-            ],
-            cb_global_storage_dir: None,
-            icube_items: super::icube::TRAE_ICUBE_ITEMS,
-            // M-1 侦察 ①（2026-09-20 实测确认）：~/Library/Application Support/TRAE SOLO CN
-            // 存在且 globalStorage 布局与 Windows 同构（差异项同 Trae）
-            mac_supported: true,
-            mac_data_dir_guess: Some("~/Library/Application Support/TRAE SOLO CN"),
-            mac_bundle_ids: &["cn.trae.solo.app"],
+            force_agent_window: false,
         },
         TargetApp::Qoder => AppProfile {
             // 【跨平台审查 2026-10-03】Qoder 档案是 macOS 分支的单点扩展位——
@@ -373,6 +352,7 @@ pub fn profile_for(app: TargetApp, app_data_dir: &std::path::Path) -> AppProfile
             mac_supported: true,
             mac_data_dir_guess: Some("~/Library/Application Support/QoderCN"),
             mac_bundle_ids: &["com.aliyun.lingma.ide"],
+            force_agent_window: false,
         },
         TargetApp::QoderWork => AppProfile {
             // 【跨平台审查 2026-10-03】ElectronRoot 布局快照管线
@@ -410,6 +390,7 @@ pub fn profile_for(app: TargetApp, app_data_dir: &std::path::Path) -> AppProfile
             mac_supported: true,
             mac_data_dir_guess: Some("~/Library/Application Support/com.qodercn.app.stable"),
             mac_bundle_ids: &["com.qodercn.app"],
+            force_agent_window: false,
         },
     }
 }
@@ -423,24 +404,8 @@ mod tests {
     }
 
     #[test]
-    fn 七应用档案字段与ps常量表一致() {
+    fn 六应用档案字段与ps常量表一致() {
         let data = temp_data();
-        let tw = profile_for(TargetApp::TraeWork, &data);
-        assert_eq!(tw.app_name, "Trae Work");
-        assert_eq!(tw.layout, Layout::Icube);
-        #[cfg(windows)]
-        assert_eq!(
-            tw.data_dir,
-            PathBuf::from(std::env::var("APPDATA").unwrap()).join("TRAE SOLO CN")
-        );
-        assert_eq!(tw.profiles_dir, data.join("data").join("profiles"));
-        assert_eq!(tw.settings_path_key, "trae_path");
-        assert_eq!(tw.graceful_wait_secs, 8);
-        assert_eq!(tw.proc_names, &["TRAE SOLO CN", "TRAE SOLO", "Trae"]);
-        assert_eq!(tw.exe_candidates.len(), 7);
-        assert!(tw.cb_global_storage_dir.is_none());
-        assert_eq!(tw.icube_items.len(), 15);
-
         let db = profile_for(TargetApp::Doubao, &data);
         assert_eq!(db.layout, Layout::Chromium);
         assert_eq!(db.graceful_wait_secs, 8);
@@ -461,6 +426,9 @@ mod tests {
         assert_eq!(trae.profiles_dir, data.join("data").join("profiles_trae"));
         assert_eq!(trae.exe_candidates.len(), 3);
         assert_eq!(trae.icube_items.len(), 15);
+        // 合并版实测（2026-10-14）：仅 Trae 开启恢复后 Agent 窗口修正
+        assert!(trae.force_agent_window);
+        assert!(!db.force_agent_window);
 
         // F-80 M3：Qoder IDE 档案（icube 布局，复用 Trae 切号管线；M0 实测数据目录 QoderCN）
         let qd = profile_for(TargetApp::Qoder, &data);
@@ -500,13 +468,13 @@ mod tests {
     }
 
     #[test]
-    fn 五应用档案_mac灰度_m1侦察后五域放开() {
+    fn 四应用档案_mac灰度_m1侦察后四域放开() {
         // F-75 M0-0.6：mac_supported 仅在 M-1 侦察确认后放开。M-1 真机侦察
-        //（2026-09-20）：Trae/TraeWork/WorkBuddy/豆包四域布局实测确认 → true；
+        //（2026-09-20）：Trae/WorkBuddy/豆包三域布局实测确认 → true；
         // CodeBuddy 首次侦察时客户端未启动，复测时已通过 WorkBuddy OAuth 扫码
         // 登录，L2/L3/authfile 三路径全部存在 → 一并放开
+        //（TraeWork 域已随双应用合并退役，2026-10-14）
         let confirmed = [
-            (TargetApp::TraeWork, "Trae Work"),
             (TargetApp::Trae, "Trae"),
             (TargetApp::Doubao, "豆包"),
             (TargetApp::WorkBuddy, "WorkBuddy"),
@@ -520,11 +488,11 @@ mod tests {
     }
 
     #[test]
-    fn 五应用档案_mac数据目录预填_完整() {
-        // M1-1.4 预填假设表（设计 §3.4）：M-1 实测（2026-09-20）确认四域猜测值与
-        // 真实布局一致；CodeBuddy 维持猜测待补侦察
+    fn 四应用档案_mac数据目录预填_完整() {
+        // M1-1.4 预填假设表（设计 §3.4）：M-1 实测（2026-09-20）确认猜测值与
+        // 真实布局一致；CodeBuddy 复测后放开
+        //（TraeWork 域已随双应用合并退役，2026-10-14）
         let cases = [
-            (TargetApp::TraeWork, Some("~/Library/Application Support/TRAE SOLO CN")),
             (TargetApp::Trae, Some("~/Library/Application Support/Trae CN")),
             (TargetApp::Doubao, Some("~/Library/Application Support/Doubao")),
             (TargetApp::WorkBuddy, Some("~/.workbuddy")),
@@ -538,10 +506,10 @@ mod tests {
     #[test]
     fn current_account_file_位于profiles根() {
         let data = temp_data();
-        let tw = profile_for(TargetApp::TraeWork, &data);
+        let trae = profile_for(TargetApp::Trae, &data);
         assert_eq!(
-            tw.current_account_file(),
-            data.join("data").join("profiles").join("current_account.txt")
+            trae.current_account_file(),
+            data.join("data").join("profiles_trae").join("current_account.txt")
         );
     }
 
@@ -549,12 +517,12 @@ mod tests {
     #[test]
     fn exe_matches_大小写不敏感与白名单外拒绝() {
         let data = temp_data();
-        let tw = profile_for(TargetApp::TraeWork, &data);
-        assert!(exe_matches(std::path::Path::new("C:\\x\\trae solo cn.EXE"), &tw));
-        assert!(exe_matches(std::path::Path::new("D:\\a\\Trae.exe"), &tw));
-        // 白名单外的 exe（如 Trae CN.exe 属于 Trae 档案）拒绝——防串台
-        assert!(!exe_matches(std::path::Path::new("C:\\x\\Trae CN.exe"), &tw));
-        assert!(!exe_matches(std::path::Path::new("C:\\x\\Doubao.exe"), &tw));
+        let trae = profile_for(TargetApp::Trae, &data);
+        assert!(exe_matches(std::path::Path::new("C:\\x\\Trae CN.exe"), &trae));
+        assert!(exe_matches(std::path::Path::new("D:\\a\\trae cn.EXE"), &trae));
+        // 白名单外的 exe 拒绝（TRAE SOLO CN 随 Trae Work 退役，恒不在白名单）
+        assert!(!exe_matches(std::path::Path::new("C:\\x\\TRAE SOLO CN.EXE"), &trae));
+        assert!(!exe_matches(std::path::Path::new("C:\\x\\Doubao.exe"), &trae));
     }
 
     #[cfg(target_os = "macos")]
@@ -562,34 +530,28 @@ mod tests {
     fn exe_matches_mac_bundle段匹配() {
         // M-1 侦察 ⑥：mac 主进程可执行名同为 Electron，按路径 bundle 段归属
         let data = temp_data();
-        let tw = profile_for(TargetApp::TraeWork, &data);
-        // 主进程：…/TRAE SOLO CN.app/Contents/MacOS/Electron
-        assert!(exe_matches(
-            std::path::Path::new("/Applications/TRAE SOLO CN.app/Contents/MacOS/Electron"),
-            &tw
-        ));
-        // Helper 内层 bundle 路径仍含外层 /TRAE SOLO CN.app 段 → 归属正确
-        assert!(exe_matches(
-            std::path::Path::new(
-                "/Applications/TRAE SOLO CN.app/Contents/Frameworks/TRAE SOLO CN Helper (GPU).app/Contents/MacOS/TRAE SOLO CN Helper (GPU)"
-            ),
-            &tw
-        ));
-        // bundle 根（locate 语义）
-        assert!(exe_matches(std::path::Path::new("/Applications/TRAE SOLO CN.app"), &tw));
-        // 串台拒绝：Trae CN 的 bundle 不属于 TraeWork 档案
-        assert!(!exe_matches(
-            std::path::Path::new("/Applications/Trae CN.app/Contents/MacOS/Electron"),
-            &tw
-        ));
-
         let trae = profile_for(TargetApp::Trae, &data);
+        // 主进程：…/Trae CN.app/Contents/MacOS/Electron
         assert!(exe_matches(
             std::path::Path::new("/Applications/Trae CN.app/Contents/MacOS/Electron"),
             &trae
         ));
+        // Helper 内层 bundle 路径仍含外层 /Trae CN.app 段 → 归属正确
+        assert!(exe_matches(
+            std::path::Path::new(
+                "/Applications/Trae CN.app/Contents/Frameworks/Trae CN Helper (GPU).app/Contents/MacOS/Trae CN Helper (GPU)"
+            ),
+            &trae
+        ));
+        // bundle 根（locate 语义）
+        assert!(exe_matches(std::path::Path::new("/Applications/Trae CN.app"), &trae));
+        // 串台拒绝：退役的 TRAE SOLO CN bundle 不属于 Trae 档案（防旧客户端残留误归属）
         assert!(!exe_matches(
             std::path::Path::new("/Applications/TRAE SOLO CN.app/Contents/MacOS/Electron"),
+            &trae
+        ));
+        assert!(!exe_matches(
+            std::path::Path::new("/Applications/Doubao.app/Contents/MacOS/Electron"),
             &trae
         ));
     }
