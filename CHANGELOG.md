@@ -6,11 +6,15 @@
 
 ---
 
-## [未发布]
+## [1.4.16] · 2026-10-14 · 多架构 Docker 镜像发布
 
 ### 新增
 
 - **多架构 Docker 镜像（issue #107）**：镜像同时发布 `linux/amd64` + `linux/arm64`。arm64 走 GitHub public 仓库免费原生 runner（`ubuntu-24.04-arm`），非 QEMU 模拟（Rust + rusqlite C 编译在模拟下极慢）；两平台并行按 digest 推送，末尾合并为多架构 manifest 并 inspect 校验。Dockerfile 零改动（基础镜像均官方多架构），GHA 缓存按平台隔离 scope。
+
+### 验证
+
+- 工作流 YAML 语法校验通过（js-yaml）· 纯 CI 改动，无 Rust/前端代码变更；双平台构建与 manifest 合并由推送后 Actions 首跑验证。
 
 ---
 
