@@ -1101,7 +1101,9 @@ pub fn completion_to_text(v: &Value, model: &str) -> Value {
     resp
 }
 
-fn u64_pair(u: &Value) -> (u64, u64) {
+/// 宽口径 token 提取（pub(crate)：wb_route/custom_route 记账点统一复用，
+/// 消除各处单键 `as_u64` 窄口径——别名形态/字符串数字不再静默得 0）
+pub(crate) fn u64_pair(u: &Value) -> (u64, u64) {
     let get = |keys: &[&str]| -> u64 {
         keys.iter()
             .find_map(|k| u.get(*k).and_then(token_number))

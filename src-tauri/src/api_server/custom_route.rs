@@ -102,11 +102,10 @@ fn now_ts() -> u64 {
         .unwrap_or(0)
 }
 
+/// 宽口径提取（对齐 wb_sse::u64_pair）：prompt/input、completion/output 别名
+/// 与字符串数字形态均识别，不再静默得 0
 fn usage_pair(u: &Value) -> (u64, u64) {
-    (
-        u.get("prompt_tokens").and_then(|v| v.as_u64()).unwrap_or(0),
-        u.get("completion_tokens").and_then(|v| v.as_u64()).unwrap_or(0),
-    )
+    super::wb_sse::u64_pair(u)
 }
 
 fn chat_id_for(proto: Protocol) -> String {

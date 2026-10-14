@@ -171,7 +171,8 @@ export const api = {
   env: {
     // TraeWork 合并后唯一客户端检测（原 env_check 已删，统一走 Trae CN 通道）
     check: () => invoke<EnvStatus>('env_check_trae_cn'),
-    // F-01：跨应用安装位置自动识别（trae | doubao | workbuddy）
+    // F-01：跨应用安装位置自动识别（trae | doubao | workbuddy | codebuddy；
+    // qoder 系客户端定位在 env.rs 的 qoder 专用通道，不走 app_locate）
     locate: (targetApp?: string) => invoke<AppLocate>('app_locate', { targetApp }),
     openSite: () => invoke('open_trae_website'),
     openApp: (proxyPort?: number) => invoke('open_trae_cn_app', { proxyPort }),

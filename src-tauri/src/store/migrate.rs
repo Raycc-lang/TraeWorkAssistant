@@ -984,15 +984,28 @@ fn slot_base_name(name: &str) -> String {
     s
 }
 
-/// 移动且绝不覆盖：目标已存在（重试残留等）时加时间戳后缀
+/// 移动且绝不覆盖：目标已存在（重试残留等）时加时间戳后缀；同秒撞名
+/// （秒级时间戳 + 两个同名目标）时递增序号直至找到空位（审查修复：
+/// 原实现同秒第二个同名文件会静默覆盖第一个时间戳文件）
 fn rename_no_clobber(src: &Path, dst: &Path) -> std::io::Result<()> {
     if dst.exists() {
-        let stamped = format!(
-            "{}_{}",
-            dst.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default(),
-            chrono::Local::now().format("%Y%m%d%H%M%S")
-        );
-        return std::fs::rename(src, dst.with_file_name(stamped));
+        let base = dst
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_default();
+        let stamp = chrono::Local::now().format("%Y%m%d%H%M%S").to_string();
+        let mut seq = 1u32;
+        let target = loop {
+            let candidate = dst.with_file_name(format!(
+                "{base}_{stamp}{suffix}",
+                suffix = if seq == 1 { String::new() } else { format!(".{seq}") }
+            ));
+            if !candidate.exists() {
+                break candidate;
+            }
+            seq += 1;
+        };
+        return std::fs::rename(src, target);
     }
     std::fs::rename(src, dst)
 }

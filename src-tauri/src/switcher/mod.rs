@@ -90,7 +90,11 @@ impl TargetApp {
             "CodeBuddy" => Ok(TargetApp::CodeBuddy),
             "Qoder" => Ok(TargetApp::Qoder),
             "QoderWork" => Ok(TargetApp::QoderWork),
-            other => Err(format!("未知应用类型: {other}")),
+            // 合法值清单 + 旧值指引：TraeWork 为合并前旧值（存量持久化字符串
+            // 由 store 迁移一次性改写，若此处出现多为旧版本数据未迁移）
+            other => Err(format!(
+                "未知应用类型: {other}（合法值: Trae/Doubao/WorkBuddy/CodeBuddy/Qoder/QoderWork；TraeWork 已于 v3.7.12 并入 Trae，请更新应用到最新版本后重试）"
+            )),
         }
     }
 }
