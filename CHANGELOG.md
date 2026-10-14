@@ -13,6 +13,7 @@
 ### 修复与加固
 
 - **Web-only OAuth 设备指纹按账号隔离**：容器内无本机 Trae 客户端凭证时，每次 OAuth 登录会话生成一套独立 synthetic 设备，登录成功按 uid 持久化；AuthCode `DeviceInfo` 交换、refresh `DeviceProof`、签到与积分请求共用同一身份，多账号不再共享一台设备触发「当前设备今日已经签到」。
+- **API 管理近 30 天趋势图补 Qoder 池（issue #103）**：前端漏拉 `api_qoder_usage_stats`，趋势图/图例/合计补齐 Qoder 系列。
 - **OAuth 设备指纹生命周期**：`account_delete` 同步清理 `device_map` 与 synthetic 身份，删除重登得到全新设备；同 uid 重新 OAuth 覆盖为本次新设备。
 - **移除 synthetic 全局首凭证兜底**：刷新链路找不到账号绑定身份时如实报错，防设备漂移。**行为变更：存量 Web-only 部署绑定旧共享设备的账号需重新 OAuth。**
 - **保留官方交换 host 白名单**：AuthCode 交换继续限定官方 API 域。
