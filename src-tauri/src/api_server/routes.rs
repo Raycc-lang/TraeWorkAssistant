@@ -1712,16 +1712,11 @@ fn stream_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: String, str
                         };
                         // 用量记账（流式结束即落盘；F-76① TTFT 入账；对冲接管记生效账号）。
                         // 每请求终态单行（审查问题6）：换号重试为中间态不落账，避免
-                        // requests 虚高——判定与下方换号分支同口径（空完成未流出 /
-                        // 账号级错误未流出）；终态（成功 / 就地收尾 / 错误透传）恰落一行
-                        let rotating = match &error_info {
-                            None => false,
-                            Some((code, msg)) => {
-                                (super::is_empty_completion(*code, msg) && !sent_any)
-                                    || (!sent_any
-                                        && classify_solo_error(*code, msg) != ErrKind::None)
-                            }
-                        };
+                        // requests 虚高——判定与下方换号分支同口径：流内错误只要
+                        // 未流出（!sent_any）一律换号重试（inline_error_action 统一
+                        // 口径，含 ErrKind::None 请求级错误），三类 break 均为
+                        // !sent_any；终态（成功 / 就地收尾 / 错误透传）恰落一行
+                        let rotating = error_info.is_some() && !sent_any;
                         if !rotating {
                             let (pt, ct) = up_usage.as_ref().map(extract_tokens).unwrap_or((0, 0));
                             // M4 审查修复：缓存读 tokens 旁路入账（宽口径别名提取；

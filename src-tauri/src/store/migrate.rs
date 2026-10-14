@@ -479,13 +479,21 @@ fn move_to_backup(data_dir: &Path, rel: &str, corrupt: bool) -> std::io::Result<
     let dst = backup_dir.join(rel);
     std::fs::create_dir_all(dst.parent().unwrap_or(&backup_dir))?;
     if dst.exists() {
-        // 同名冲突：加时间戳后缀，绝不覆盖既有备份
+        // 同名冲突：加时间戳后缀，绝不覆盖既有备份；同秒撞名时递增 .2/.3
+        // 序号（对齐 rename_no_clobber 的审查 P2 口径——原生 rename 会静默
+        // 覆盖已存在目标，仅时间戳时同秒第二个文件会吞掉第一个）
         let stamped = format!(
             "{}_{}",
             file_name.trim_end_matches(".json"),
             chrono::Local::now().format("%Y%m%d%H%M%S")
         );
-        return std::fs::rename(&src, dst.with_file_name(format!("{stamped}.json")));
+        let mut cand = dst.with_file_name(format!("{stamped}.json"));
+        let mut seq = 2u32;
+        while cand.exists() {
+            cand = dst.with_file_name(format!("{stamped}.{seq}.json"));
+            seq += 1;
+        }
+        return std::fs::rename(&src, cand);
     }
     std::fs::rename(&src, dst)
 }
@@ -1228,7 +1236,10 @@ fn annotate_traework_source(sidecar: &Path) {
     if let Ok(s) = serde_json::to_string(&v) {
         let tmp = sidecar.with_extension("json.aiwork-tmp");
         if std::fs::write(&tmp, s).is_ok() {
-            let _ = std::fs::rename(&tmp, sidecar);
+            // rename 失败（杀软/句柄占用）时清理临时文件，防池根永久残留
+            if std::fs::rename(&tmp, sidecar).is_err() {
+                let _ = std::fs::remove_file(&tmp);
+            }
         }
     }
 }

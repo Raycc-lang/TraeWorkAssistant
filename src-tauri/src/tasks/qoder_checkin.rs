@@ -712,7 +712,13 @@ fn learn_from_min_headers(
     let headers = minimal_auth_headers(access_token);
     match fetch_campaigns(agent, &headers, urls) {
         Ok(campaigns) => {
-            let learned = learn_daily_campaign_ids(&campaigns, now_secs);
+            // 严格档优先，产空回退宽松档（与主列表重学同口径：宽松档仅在
+            // 严格档产空时兜底）。最小头补学是 409 同轮自愈链的最后一环，
+            // 服务端字段口径变更时若只用严格档，自愈闭环仍会全天失效
+            let mut learned = learn_daily_campaign_ids(&campaigns, now_secs);
+            if learned.is_empty() {
+                learned = learn_daily_campaign_ids_lenient(&campaigns);
+            }
             let view: Vec<String> = campaigns
                 .iter()
                 .map(|c| {

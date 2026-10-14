@@ -259,12 +259,14 @@ impl ApiSharedState {
         if cached == 0 {
             return;
         }
+        // 入口取定 day（G3 对齐）：记账与脏标记共用同一 day，防跨零点时
+        // cached_tokens 落旧日行、脏标新日行导致旧行修改永不被 flush
+        let day = usage::today_key();
         let mut guard = self
             .usage
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        guard.record_cached_in(bucket, cached);
-        let day = usage::today_key();
+        guard.record_cached_in(bucket, &day, cached);
         drop(guard);
         self.usage_dirty
             .lock()

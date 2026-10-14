@@ -391,10 +391,11 @@ impl UsageFile {
 
     /// 按桶记录一次缓存读 tokens 测量到当日 entry（M4 审查修复：
     /// DayStats.cached_tokens 维度的旁路入口，不扩 record 系列签名）
-    pub fn record_cached_in(&mut self, bucket: UsageBucket, cached: u64) {
-        let day = today_key();
+    /// day 由调用方入口取定传入（G3 对齐）：防方法内部自取 today_key 与
+    /// 调用方脏标记跨零点分裂，旧行修改永不被 flush（重启丢账）
+    pub fn record_cached_in(&mut self, bucket: UsageBucket, day: &str, cached: u64) {
         self.bucket_mut(bucket)
-            .entry(day)
+            .entry(day.to_string())
             .or_default()
             .record_cached(cached);
     }
