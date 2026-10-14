@@ -6,47 +6,26 @@
 
 ---
 
+## [1.4.13] · 2026-10-13 · 指纹诊断闭环 + 模板规则合并语义 + Trae OAuth 每账号合成设备
 
-## [Unreleased] · 2026-10-13 · Trae OAuth 每账号合成设备身份
-
-### 修复与加固
-
-- **Trae Web-only OAuth 设备指纹按账号隔离**：容器内无本机 Trae 客户端凭证时，每次 OAuth 登录会话生成一套独立 synthetic 设备身份；AuthCode `DeviceInfo` 交换、成功后的 refresh `DeviceProof`、签到与积分请求的 `device_map` 绑定共用同一身份，避免多个账号共享一台合成设备触发上游「当前设备今日已经签到」。
-- **同 uid 重新 OAuth 覆盖设备身份**：同一账号再次 OAuth 仍按既有逻辑合并更新凭证（不新增账号），但会把该账号 `device_map` 与 per-account synthetic 身份覆盖为本次新设备。
-- **删除账号清理设备指纹**：`account_delete` 在既有删除口径外同步清理该账号 `device_map` 与 synthetic 身份；重新 OAuth 即得到新设备。
-- **OAuth 登录窗口 pending 身份可匹配**：AuthCode 交换发生在最终 uid 解析前，设备凭证查找先命中本次登录的 pending synthetic 身份，避免退回无 `DeviceInfo` 变体导致 20405 `Device proof required`。
-- **移除 synthetic 全局首凭证兜底**：刷新链路不再悄悄回退到共享旧设备；找不到账号绑定身份时如实报错，防设备漂移。
-- **保留官方交换 host 白名单**：AuthCode 交换继续限定官方 API 域，防止伪造回调把令牌发往第三方主机。
-
-### 验证
-
-- `cargo check -p aiwork-core`
-- `cargo test -p aiwork-core -- --test-threads=1`：672 通过 / 7 忽略
-- `cargo test --workspace`：672 + 12 通过 / 7 忽略
-- `npm test`：61 通过
-- `npx tsc --noEmit`：0 错误
-- `cargo build --release -p aiwork-server`
-- Docker 重启后 `/health`：`{"running":true,"status":"ok"}`
-
----
-
-## [1.4.13] · 2026-10-13 · 移植 main：指纹诊断闭环 + 模板规则合并语义
-
-> 合并点 `main@f5e3f48` → `main@dea9ceb`（2 个提交，手工语义移植，未 merge）。桌面/OS 专属改动跳过。
+> 含 `main@f5e3f48` → `main@dea9ceb` 移植（手工语义移植，未 merge）与 PR #101（OAuth 设备隔离）。桌面/OS 专属改动跳过。
 
 ### 新增
 
-- **指纹诊断闭环（issue #99）**：11128 拦截自动提取指纹样本（去重落日志），流式/聚合、WB/Qoder 全管线覆盖；池耗尽诊断行结构化，指纹封禁收尾补落样本。
-- **模板规则合并语义（issue #99）**：默认表全量生效，自定义表覆盖/追加；`to` 可空（null=停用、空串=剥离）；前端指纹清洗面板支持逐条停用。
-- **落池观测**：dispatch 落池时落 pool/model/bind/fallback_from 结构化日志。
+- **指纹诊断闭环（issue #99）**：11128 拦截自动提取指纹样本（去重落日志），流式/聚合、WB/Qoder 全管线覆盖；池耗尽诊断行结构化。
+- **模板规则合并语义（issue #99）**：默认表全量生效，自定义表覆盖/追加；`to` 可空（null=停用、空串=剥离）；前端支持逐条停用。
+- **落池观测**：dispatch 落池落 pool/model/bind/fallback_from 结构化日志。
+- **Trae OAuth 每账号合成设备（PR #101）**：Web-only 容器无本机 Trae 客户端凭证时，每次 OAuth 登录会话生成一套独立 synthetic 设备，登录成功按 uid 持久化；AuthCode `DeviceInfo` 交换、refresh `DeviceProof`、签到与积分请求共用同一身份，多账号不再共享一台设备触发「当前设备今日已经签到」。
 
 ### 修复与加固
 
+- **OAuth 设备指纹生命周期**：`account_delete` 同步清理 `device_map` 与 synthetic 身份，删除重登得到全新设备；同 uid 重新 OAuth 覆盖为本次新设备。
+- **移除 synthetic 全局首凭证兜底**：刷新链路找不到账号绑定身份时如实报错，防设备漂移。**行为变更：存量 Web-only 部署绑定旧共享设备的账号需重新 OAuth。**
+- **保留官方交换 host 白名单**：AuthCode 交换继续限定官方 API 域。
 - **日志本地时区**：`api_logger` 时间戳改 chrono 本地时间，容器 `TZ` 生效。
-- **usage 宽口径**：token 数提取支持 f64/字符串形态，不再静默得 0。
+- **usage 宽口径**：token 数提取支持 f64/字符串形态并过滤负值，不再静默得 0。
 - **OAuth 掩码豁免**：≤12 位纯数字串原样返回。
-- **调度幂等与重试**：wb-checkin / wb-growth 抢锁失败改 `skipped_busy` 跳过；成长任务失败区分可重试与永久失败，可重试自动重试。
-- **审查收尾修复**：wb-checkin / wb-growth 凭证类失败事件补结构化 `permanent` 标记，调度重试判定改结构化字段权威（显式 false 不被文案翻案、缺省退化文案匹配），不再依赖中文措辞稳定；`sse.rs` token 宽口径解析补负值过滤（数字/浮点/字符串三分支，对齐 `wb_sse` u64 口径）。
+- **调度幂等与重试**：wb-checkin / wb-growth 抢锁失败改 `skipped_busy` 跳过；重试判定以结构化 `permanent` 字段为权威，可重试失败自动重试。
 - **模板映射校验**：校验提示明确 `to` 可为字符串/空串/null。
 
 ### 跳过（桌面/OS 专属）
@@ -55,7 +34,7 @@
 
 ### 验证
 
-- `cargo test --workspace` 674+12 通过（7 忽略）· `tsc` 0 错误 · `vitest` 61 通过。
+- `cargo test --workspace` 674+12 通过（7 忽略）· `tsc` 0 错误 · `vitest` 61 通过 · Docker `/health` ok。
 
 ---
 
