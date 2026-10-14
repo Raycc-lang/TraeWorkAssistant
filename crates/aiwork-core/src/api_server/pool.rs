@@ -257,13 +257,16 @@ impl ApiPool {
     /// Qoder 池启动保鲜判定（issue #102）：是否存在会被 selectable 持续排除的
     /// 钉死快照——零/负余额（零积分过滤无新鲜度门槛，充值后不拨新不恢复）或
     /// 积分已到期（续期后同理）。与 has_stale_credits 的 reserve 新鲜度口径互补：
-    /// 后者 reserve=0 时短路 false，覆盖不到本判定的两种场景
+    /// 后者 reserve=0 时短路 false，覆盖不到本判定的两种场景。
+    /// disabled（needs_relogin）账号排除：其快照刷新注定永久失败，纳入判定只会
+    /// 让每次启动都空跑一轮全池刷新并落「刷新失败」噪音日志（审查 P1）
     pub fn has_zero_or_expired_credits(&self) -> bool {
         let entries = safe_lock(&self.entries);
         let now = now_ts();
         entries.values().any(|e| {
-            e.credits.is_some_and(|c| c <= 0.0)
-                || e.credits_expire_at.is_some_and(|exp| exp > 0 && exp < now)
+            !e.disabled
+                && (e.credits.is_some_and(|c| c <= 0.0)
+                    || e.credits_expire_at.is_some_and(|exp| exp > 0 && exp < now))
         })
     }
 
@@ -2145,6 +2148,39 @@ mod tests {
         m2.insert("qd-0".to_string(), (9.9, Some(1)));
         pool.update_credits_snapshot(&m2);
         assert!(pool.has_zero_or_expired_credits());
+    }
+
+    #[test]
+    fn qoder_has_zero_or_expired_credits_ignores_disabled() {
+        // 审查 P1：disabled（needs_relogin）账号的快照刷新注定永久失败，
+        // 不纳入保鲜判定——否则每次启动都空跑一轮注定失败的全池刷新并落噪音日志
+        let pool = ApiPool::new();
+        pool.sync_from_qoder(
+            &[crate::api_server::pool::QoderSyncAccount {
+                uid: "qd-dead".into(), name: String::new(), access_token: "tk".into(),
+                machine_id: String::new(), needs_relogin: true, group_id: String::new(),
+                credits: Some(0.0), credits_expire_at: None, credits_fetched_at: Some(1),
+            }],
+            &["qd-dead".to_string()],
+        );
+        assert!(!pool.has_zero_or_expired_credits(), "disabled 零余额不触发保鲜");
+        // 混合场景：disabled 账号之外另有健康零余额账号 → 仍触发
+        pool.sync_from_qoder(
+            &[
+                crate::api_server::pool::QoderSyncAccount {
+                    uid: "qd-dead".into(), name: String::new(), access_token: "tk".into(),
+                    machine_id: String::new(), needs_relogin: true, group_id: String::new(),
+                    credits: Some(0.0), credits_expire_at: None, credits_fetched_at: Some(1),
+                },
+                crate::api_server::pool::QoderSyncAccount {
+                    uid: "qd-live".into(), name: String::new(), access_token: "tk".into(),
+                    machine_id: String::new(), needs_relogin: false, group_id: String::new(),
+                    credits: Some(0.0), credits_expire_at: None, credits_fetched_at: Some(1),
+                },
+            ],
+            &["qd-dead".to_string(), "qd-live".to_string()],
+        );
+        assert!(pool.has_zero_or_expired_credits(), "健康账号零余额仍触发保鲜");
     }
 
     #[test]
