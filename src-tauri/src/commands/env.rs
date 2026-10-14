@@ -647,13 +647,14 @@ fn app_locate_macos(state: &State<AppState>, app: &str) -> AppLocate {
             format!("{home}/.codebuddy"),
             Some("codebuddy_path"),
         ),
-        // trae_work / traework / work / solo 及其它值 → 默认 Trae Work
+        // trae_work / traework / work / solo 及其它值 → 默认 Trae（对齐 main 双应用合并：
+        // Windows 侧同款兜底；Trae Work 档案与 trae_path 设置键已随合并退役）
         _ => (
-            "Trae Work",
-            &["TRAE SOLO CN", "TRAE SOLO", "Trae"],
-            &["cn.trae.solo.app"],
-            format!("{home}/Library/Application Support/TRAE SOLO CN"),
-            Some("trae_path"),
+            "Trae",
+            &["Trae CN"],
+            &["cn.trae.app"],
+            format!("{home}/Library/Application Support/Trae CN"),
+            Some("trae_cn_path"),
         ),
     };
 
@@ -661,7 +662,6 @@ fn app_locate_macos(state: &State<AppState>, app: &str) -> AppLocate {
     if let Some(sk) = settings_key {
         let settings = state.settings();
         let custom = match sk {
-            "trae_path" => settings.trae_path,
             "trae_cn_path" => settings.trae_cn_path,
             "doubao_path" => settings.doubao_path,
             "workbuddy_path" => settings.workbuddy_path,

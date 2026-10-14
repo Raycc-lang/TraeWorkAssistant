@@ -70,7 +70,15 @@ export default function Settings() {
     if (!form) return;
     setSaving(true);
     try {
-      await withMinDelay(saveSettings(form));
+      // 只发脏字段 patch（store.saveSettings 契约：后端 settings_set 为真 patch 语义，
+      // 全量发送会把编辑期间经其他通道（如系统设置弹框）刚保存的字段回滚成旧值）
+      const patch: Partial<SettingsType> = {};
+      (Object.keys(form) as (keyof SettingsType)[]).forEach((k) => {
+        if (JSON.stringify(form[k]) !== JSON.stringify(settings?.[k])) {
+          (patch as Record<string, unknown>)[k as string] = form[k];
+        }
+      });
+      await withMinDelay(saveSettings(patch));
       baselineRef.current = form; // 保存成功后以提交内容为新基线，恢复对外部变化的跟随
       toast('success', '配置已保存');
     } catch {

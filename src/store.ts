@@ -429,16 +429,18 @@ export const useAppStore = create<AppState>((set, get) => ({
       onDeviceResetProgress: (line) =>
         set((s) => ({ deviceResetProgress: [...s.deviceResetProgress.slice(-99), line] })),
       onDeviceResetDone: (e) => {
+        // 层级数按平台分派（mac 5 层 / Windows 6 层，与 Settings.tsx 文案同口径）
+        const layers = get().platform === 'macos' ? '5 层' : '6 层';
         set((s) => ({
           deviceResetActive: false,
           deviceResetProgress: [
             ...s.deviceResetProgress.slice(-99),
-            e.success ? '[完成] 6 层设备标识重置成功' : '[失败] 设备标识重置未完成，请查看日志',
+            e.success ? `[完成] ${layers}设备标识重置成功` : '[失败] 设备标识重置未完成，请查看日志',
           ],
         }));
         get().pushToast(
           e.success ? 'success' : 'error',
-          e.success ? '6 层设备标识重置完成' : '设备标识重置失败，请查看日志',
+          e.success ? `${layers}设备标识重置完成` : '设备标识重置失败，请查看日志',
         );
       },
       onProfileProgress: (line) =>
@@ -1019,7 +1021,10 @@ export const useAppStore = create<AppState>((set, get) => ({
     set({ deviceResetActive: true, deviceResetProgress: [] });
     try {
       await api.resetDeviceIds(targetApp);
-      get().pushToast('info', '正在执行 6 层设备标识重置（Trae）…');
+      get().pushToast(
+        'info',
+        `正在执行 ${get().platform === 'macos' ? '5 层' : '6 层'}设备标识重置（Trae）…`,
+      );
     } catch (err) {
       set({ deviceResetActive: false });
       get().pushToast('error', `设备标识重置失败：${String(err)}`);

@@ -361,14 +361,13 @@ pub fn switch_account(
     // 不阻塞命令返回；与原 stdout 读线程一致的异步语义）
     let app2 = app.clone();
     let uid_for_dc = user_id.clone();
-    let is_doubao2 = is_doubao;
-    let is_qoder2 = is_qoder;
-    let is_qoder_work2 = is_qoder_work;
+    let is_trae2 = is_trae;
     run_in_background(app2, "switch-progress", "switch-done", args, migrate_job, Some(Box::new(move |_app, dc_dir| {
         // 切换成功后补充该账号的账户中心（icube-dc）id 预留记录（只记录不展示）
-        // 仅 icube 布局（Trae）有意义；豆包快照无 storage.json，跳过；
-        // Qoder/QoderWork 无 icube-dc 通道（qoder_uid 另行回填），同样跳过
-        if !is_doubao2 && !is_qoder2 && !is_qoder_work2 {
+        // 仅 icube 布局（Trae，含默认）有意义——正向白名单；Doubao/Qoder 系/
+        // WorkBuddy/CodeBuddy 均无 icube-dc 通道（原排除黑名单漏了 Buddy，
+        // 会把 Buddy 账号误写进 Trae 的 dc 表，随合并审查改正向白名单）
+        if is_trae2 {
             let _ = crate::commands::trae_apps::backfill_dc_id_for(dc_dir, &uid_for_dc);
         }
     })));
@@ -469,16 +468,15 @@ pub fn save_current_login(
         None,
         state.data_dir.clone(),
     )?;
-    let is_doubao = target_app.as_deref() == Some("Doubao");
-    let is_qoder = target_app.as_deref() == Some("Qoder");
-    let is_qoder_work = target_app.as_deref() == Some("QoderWork");
+    // dc 回填正向白名单：仅 icube 布局（Trae，含默认）有意义（同 switch_account）
+    let is_trae = matches!(target_app.as_deref(), None | Some("Trae"));
     let app2 = app.clone();
     let uid_for_dc = user_id.clone();
     run_in_background(app2, "save-login-progress", "save-login-done", args, None, Some(Box::new(move |_app, dc_dir| {
         // 保存登录态成功后同样补充 dc id 预留记录（快照刚生成，来源最可靠）
-        // 仅 icube 布局（Trae）有意义；豆包快照无 storage.json，跳过；
-        // Qoder/QoderWork 无 icube-dc 通道，同样跳过
-        if !is_doubao && !is_qoder && !is_qoder_work {
+        // 仅 icube 布局（Trae，含默认）有意义——正向白名单（Buddy/Doubao/
+        // Qoder 系均无 icube-dc 通道，不误写 Trae 的 dc 表）
+        if is_trae {
             let _ = crate::commands::trae_apps::backfill_dc_id_for(dc_dir, &uid_for_dc);
         }
     })));

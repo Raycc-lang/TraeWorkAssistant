@@ -198,17 +198,20 @@ impl ApiSharedState {
         completion_tokens: u64,
         ttfb_ms: Option<u64>,
     ) {
+        // 入口取定 day（对齐 record_usage_qoder 的 G3 模式）：记账与脏标记共用
+        // 同一 day——此前 record_ttfb 内部自取 today_key 与下方脏标记各取一次，
+        // 跨零点时账落旧日行、脏标新日行，旧行修改永不被 flush（重启丢失）
+        let day = usage::today_key();
         let mut guard = self
             .usage
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        guard.record_ttfb(
-            is_wb, model, uid, key_id, ok, is_stream, duration_ms, prompt_tokens,
+        let bucket = if is_wb { usage::UsageBucket::Wb } else { usage::UsageBucket::Trae };
+        guard.record_in_ttfb_on(
+            bucket, &day, model, uid, key_id, ok, is_stream, duration_ms, prompt_tokens,
             completion_tokens, ttfb_ms,
         );
         // 批次 C 削峰：只记内存 + 标脏，SQLite 落盘由 flusher（2s）/stop 时统一执行
-        let bucket = if is_wb { usage::UsageBucket::Wb } else { usage::UsageBucket::Trae };
-        let day = usage::today_key();
         drop(guard);
         self.usage_dirty
             .lock()
@@ -229,16 +232,19 @@ impl ApiSharedState {
         prompt_tokens: u64,
         completion_tokens: u64,
     ) {
+        // 入口取定 day（同 record_usage_ttfb 的 G3 对齐，防跨零点账/脏标记分裂）
+        let day = usage::today_key();
         let mut guard = self
             .usage
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        guard.record_in(
+        guard.record_in_ttfb_on(
             usage::UsageBucket::Custom,
+            &day,
             model, "custom", key_id, ok, is_stream, duration_ms, prompt_tokens, completion_tokens,
+            None,
         );
         // 批次 C 削峰：同 record_usage_ttfb，仅标脏不落盘
-        let day = usage::today_key();
         drop(guard);
         self.usage_dirty
             .lock()

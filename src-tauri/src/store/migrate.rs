@@ -785,9 +785,10 @@ pub fn migrate_traework_merge(data_dir: &Path) -> Option<String> {
     if store.kv_get::<bool>(TRAEWORK_MERGE_MARKER) {
         return None;
     }
-    if crate::switcher::proc::any_running(&["Trae CN", "TRAE SOLO CN"]) {
+    if crate::switcher::proc::any_running(&["Trae CN", "TRAE SOLO CN", "TRAE SOLO", "Trae"]) {
         // 运行中：仅当确有存量才提示跳过，否则静默（下次启动廉价复查，不置标记）。
-        // 旧 TRAE SOLO CN 一并检测：用户尚未卸载旧客户端且正在运行时同样暂缓搬迁，
+        // 旧客户端一并检测（TRAE SOLO CN / TRAE SOLO / Trae 旧形态，对齐 env.rs mac
+        // 定位链名单）：用户尚未卸载旧客户端且正在运行时同样暂缓搬迁，
         // 保守对齐 §5.8「复用优雅关闭语义」
         if traework_merge_pending(&store, data_dir) {
             return Some("TraeWork 合并迁移跳过：Trae 客户端正在运行，将在下次启动重试".into());

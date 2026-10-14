@@ -460,14 +460,17 @@ fn save_identity_guard(
             "客户端当前未登录（最新会话日志无登录请求记录），已拒绝保存，\
              避免把未登录现场写入账号 {uid} 的快照；请先在客户端登录账号 {uid} 后再「保存当前登录态」。"
         );
-        // 还原现场：用户客户端原本开着（stop 后被我们关掉），拉回来；
+        // 还原现场：仅当客户端原本在运行（调用方 stop 前经 is_running 确认）才拉回，
+        // 与 Mismatch 分支同款 was_running 门控——避免把原本没开的客户端意外拉起；
         // 失败仅 Warn，不影响拒绝结果
-        if let Err(e) = proc::start_app(sess, sink) {
-            sink.step(
-                "guard",
-                StepStatus::Warn,
-                &format!("客户端重启失败，请手动打开: {e}"),
-            );
+        if was_running {
+            if let Err(e) = proc::start_app(sess, sink) {
+                sink.step(
+                    "guard",
+                    StepStatus::Warn,
+                    &format!("客户端重启失败，请手动打开: {e}"),
+                );
+            }
         }
         sink.step("fatal", StepStatus::Error, &format!("失败: {msg}"));
         return Err(fatal_line(&format!("[fatal] {msg}")));

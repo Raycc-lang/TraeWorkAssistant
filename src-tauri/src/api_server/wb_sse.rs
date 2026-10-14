@@ -512,8 +512,9 @@ pub fn stream_forward_ex_ns(
                     // resp_created 置位），哨兵上抛前补发 response.failed 收尾——
                     // Codex 等客户端在 created 后等待终态事件，悬空流会一直等待；
                     // error.code=empty_completion 保留哨兵语义（调用方仍按空完成
-                    // 换号重试，返回元组的 sent_any/failed_inline 语义不变）
-                    if resp_created {
+                    // 换号重试，返回元组的 sent_any/failed_inline 语义不变）。
+                    // 发送前检查在线（对齐下方 EOF 分支门控，避免向已关闭通道写帧）
+                    if resp_created && !tx.is_closed() {
                         let mut resp = responses_object(chat_id, model, "failed", vec![], None);
                         resp["error"] = json!({
                             "code": "empty_completion",
