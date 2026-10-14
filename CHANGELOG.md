@@ -17,6 +17,7 @@
 - **OAuth 设备指纹生命周期**：`account_delete` 同步清理 `device_map` 与 synthetic 身份，删除重登得到全新设备；同 uid 重新 OAuth 覆盖为本次新设备。
 - **移除 synthetic 全局首凭证兜底**：刷新链路找不到账号绑定身份时如实报错，防设备漂移。**行为变更：存量 Web-only 部署绑定旧共享设备的账号需重新 OAuth。**
 - **保留官方交换 host 白名单**：AuthCode 交换继续限定官方 API 域。
+- **审查收尾修复**：重启后粘贴回调的 fallback 优先复用仍存活的 pending 合成身份（防重新生成覆盖导致交换设备漂移）；pending 转正删除失败补日志；refresh 链路注释与移除首凭证兜底后的实现对齐。
 
 ### 验证
 

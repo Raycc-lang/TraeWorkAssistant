@@ -423,6 +423,23 @@ fn generate_and_persist_login_device(
     Ok(cred)
 }
 
+/// 无在途会话（重启后粘贴回调）时的 fallback 设备：Web-only 无本机凭证时优先复用
+/// 登录 URL 签发时持久化的 pending 合成身份（跨重启存活，与授权 URL device_id 同源），
+/// 避免重新生成覆盖旧身份导致交换设备与授权会话漂移；pending 缺失或桌面有本机
+/// 凭证时按既有轮转规则重选（Web-only 下会生成新 pending 覆盖旧值，此时旧身份已
+/// 无法与本次回调对应，属可接受损失）
+fn fallback_login_device_id(state: &AppState) -> String {
+    if icube_device_creds(&state.data_dir).is_empty() {
+        let store = crate::store::db(&state.data_dir);
+        let pending: serde_json::Value =
+            store.kv_get(&format!("{}pending", SYNTHETIC_DEVICE_KEY_PREFIX));
+        if let Some(cred) = crate::icube_auth::device_credential_from_json(&pending) {
+            return cred.device_id;
+        }
+    }
+    select_login_device(state).0
+}
+
 fn take_pending_login_device(
     state: &AppState,
     device_id: &str,
@@ -431,7 +448,16 @@ fn take_pending_login_device(
     let store = crate::store::db(&state.data_dir);
     let saved: serde_json::Value = store.kv_get(&key);
     let cred = crate::icube_auth::device_credential_from_json(&saved)?;
-    if cred.device_id != device_id || store.kv_delete(&key).is_err() {
+    if cred.device_id != device_id {
+        return None;
+    }
+    if store.kv_delete(&key).is_err() {
+        // 删除失败不转正：账号 device_map 已回写该设备但 per-account 凭证缺失，
+        // 后续 refresh 将失配，落日志供溯源（审查修复）
+        fs_utils::app_log(
+            &state.data_dir,
+            &format!("OAuth: pending 合成身份删除失败（device_id={device_id}），账号身份未转正，后续刷新可能失配"),
+        );
         return None;
     }
     Some(cred)
@@ -684,7 +710,7 @@ pub fn oauth_parse_callback(
         .unwrap_or_else(|e| e.into_inner())
         .as_ref()
         .map(|p| p.device_id.clone())
-        .unwrap_or_else(|| select_login_device(state).0);
+        .unwrap_or_else(|| fallback_login_device_id(state));
 
     let mut access_token = params
         .get("accessToken")
@@ -1202,18 +1228,19 @@ pub(crate) struct RefreshExchangeError {
 /// 旧协议（cloudide/api/v3/trae 端点 + ClientSecret 体）保留为兜底探测变体。
 /// 成功返回 (access_token, Option<新 refresh_token>（可能轮换）, 原始响应体)
 /// `device_id_override`：账号绑定的设备（issue #76）——device_map 条目或本次登录
-/// 会话设备。命中本机凭证时用该凭证做 DeviceProof/DeviceID（刷新与登录同设备）；
-/// 未命中（伪设备条目）或无凭证时**整体回退既有口径**：签名用首个凭证、请求
-/// DeviceID 走 kv bound_device_id → 本机设备（docker 既有 20403 修复，历史行为）
+/// 会话设备。命中凭证（本机客户端或 per-account synthetic）时用该凭证做
+/// DeviceProof/DeviceID（刷新与登录同设备）；未命中（伪设备条目/存量共享设备/无凭证）
+/// **不回退首个凭证**（PR #101 移除，防设备漂移），仅走无凭证旧协议变体如实报错；
+/// 请求 DeviceID 仍走 kv bound_device_id → 本机设备（docker 既有 20403 修复口径）
 pub(crate) fn exchange_token_refresh(
     state: &AppState,
     refresh_token: &str,
     device_id_override: Option<&str>,
 ) -> Result<(String, Option<String>, serde_json::Value), RefreshExchangeError> {
     let client_id = oauth_client().client_id.clone();
-    // issue #76：按账号绑定设备匹配凭证。matched 只在「override 确实命中本机
-    // 凭证」时为 Some——区分「命中走同源凭证」与「未命中维持历史兜底」两种口径，
-    // 不能让未命中也落到 cred.is_some() 分支（那会绕过 bound_device_id 修复）
+    // issue #76：按账号绑定设备匹配凭证。matched 只在「override 确实命中凭证
+    //（本机客户端或 per-account synthetic）」时为 Some；未命中不再兜底首个凭证
+    //（PR #101 移除），cred 与 matched 同值，未命中走无凭证变体如实报错
     let matched_cred = device_id_override.and_then(|d| find_cred_by_device(state, d));
     let cred = matched_cred.clone();
     let dev = load_or_create_oauth_device(state);
