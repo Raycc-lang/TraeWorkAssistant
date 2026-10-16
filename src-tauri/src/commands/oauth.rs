@@ -392,6 +392,10 @@ fn find_cred_by_device(
         return cred;
     }
     let map = crate::store::docs::device_map_load(&store);
+    // 反查确定性说明（审查 L3）：多 uid 共享同一 device_id（存量共享条目）时 find
+    // 命中顺序不确定，但 per-uid synthetic 设备 ID 全局唯一，至多一条能通过末端
+    // filter 校验——命中错 uid 时末端校验不通过返回 None，语义不受影响。
+    // 依赖该不变量，勿改成「首个命中即返回」
     let uid = map
         .iter()
         .find(|(_, e)| e.device_id == device_id)
@@ -534,10 +538,12 @@ fn fallback_login_device_id(state: &AppState) -> String {
     select_login_device(state).0
 }
 
-/// pending 合成身份转正：设备匹配时取出并删除暂存键，交由调用方持久化为
-/// per-uid 身份。删除失败不转正（账号 device_map 已回写该设备但凭证缺失会导致
-/// 后续刷新失配），落日志供溯源
-fn take_pending_login_device(
+/// pending 合成身份预取（只读不删，审查 L1 修复）：设备匹配则返回凭证，交由调用方
+/// **先持久化 per-uid 身份、成功后再删 pending**——旧顺序「先删 pending 再 persist」
+/// 在 persist 失败时两头皆失（pending 已删、per-uid 缺失、device_map 已回写该设备，
+/// 三级匹配全未命中致后续刷新失配）；反转后 persist 失败时 pending 仍存活，
+/// 刷新可经第一级命中，设备身份不丢
+fn peek_pending_login_device(
     state: &AppState,
     device_id: &str,
 ) -> Option<crate::icube_auth::DeviceCredential> {
@@ -548,14 +554,19 @@ fn take_pending_login_device(
     if cred.device_id != device_id {
         return None;
     }
-    if store.kv_delete(&key).is_err() {
+    Some(cred)
+}
+
+/// pending 暂存键删除（转正收尾；失败仅落日志——残留 pending 与 per-uid 同设备
+/// 同凭证，刷新经第一级命中语义等价，且会被下次登录生成的新身份覆盖，无害）
+fn delete_pending_login_device(state: &AppState, device_id: &str) {
+    let key = format!("{SYNTHETIC_DEVICE_KEY_PREFIX}pending");
+    if crate::store::db(&state.data_dir).kv_delete(&key).is_err() {
         fs_utils::app_log(
             &state.data_dir,
-            &format!("OAuth: pending 合成身份删除失败（device_id={device_id}），账号身份未转正，后续刷新可能失配"),
+            &format!("OAuth: pending 合成身份删除失败（device_id={device_id}），残留键将被下次登录覆盖，无碍"),
         );
-        return None;
     }
-    Some(cred)
 }
 
 /// 将合成身份持久化为指定账号的设备身份（kv `{prefix}{uid}`，供刷新签 DeviceProof）
@@ -1645,12 +1656,14 @@ pub fn oauth_login(
     let callback_info = oauth_parse_callback(state.clone(), callback_url)?;
 
     // issue #76：本次登录会话设备（回调签发时轮转选定，回调解析已透传；
-    // 极端场景下缺失则重选——选择是确定性的，同状态下两次调用结果一致）。
+    // 极端场景下缺失则走 fallback_login_device_id——pending 合成身份优先复用
+    // （与授权 URL device_id 同源），其次轮转/生成新身份，避免直接 select_login_device
+    // 覆盖 pending 导致交换设备漂移；与 oauth_parse_callback L866 回退同构）。
     // 登录 URL 参数 / ExchangeToken DeviceInfo / 刷新交换 / device_map 回写全链路同源
     let login_device_id = callback_info
         .device_id
         .clone()
-        .unwrap_or_else(|| select_login_device(&state).0);
+        .unwrap_or_else(|| fallback_login_device_id(&state));
 
     // 2. 如果回调中没有 accessToken，则用 refresh_token 换取
     let new_pair = if let Some(ref at) = callback_info.access_token {
@@ -1722,12 +1735,15 @@ pub fn oauth_login(
     // 转正为 per-uid 身份，供后续刷新签 DeviceProof；同 uid 重新 OAuth 即换新设备
     //（覆盖旧键，兑现「重新 OAuth 登录轮换设备凭证」的错误转译承诺）。
     // 登录落在真实凭证上时清掉遗留的 per-uid synthetic（死状态清理）
-    if let Some(cred) = take_pending_login_device(&state, &login_device_id) {
-        if let Err(e) = persist_account_synthetic_device(&state, &user_id, &cred) {
-            fs_utils::app_log(
+    if let Some(cred) = peek_pending_login_device(&state, &login_device_id) {
+        // 审查 L1：先 persist 后删 pending——persist 失败时保留 pending（刷新可经
+        // 第一级命中），不再出现「pending 已删 + per-uid 缺失」的双失状态
+        match persist_account_synthetic_device(&state, &user_id, &cred) {
+            Ok(()) => delete_pending_login_device(&state, &login_device_id),
+            Err(e) => fs_utils::app_log(
                 &state.data_dir,
-                &format!("OAuth: 账号合成设备身份持久化失败: {e}"),
-            );
+                &format!("OAuth: 账号合成设备身份持久化失败（pending 保留，刷新可经会话身份命中）: {e}"),
+            ),
         }
     } else if icube_device_creds().iter().any(|c| c.device_id == login_device_id) {
         remove_account_synthetic_device(&state, &user_id);

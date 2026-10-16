@@ -1932,8 +1932,11 @@ pub fn refresh_jwt_impl(state: &AppState, user_id: &str, force: bool) -> Result<
     // 调用 ExchangeToken（2026-09-16 协议迁移：固化协议 DeviceProof 主变体 +
     // 旧协议兜底探测；仅旧形态数字 code != 0 判为服务端明确拒绝——
     // 旧实现 unwrap_or(-1) 会把无 code 字段的异构响应误判为拒绝，第 1 次即误标失效）
-    // issue #76：按账号绑定设备匹配凭证做 DeviceProof（登录回写 device_map 后
-    // 与登录设备同源）；伪设备条目/无本机凭证时内部回退首个凭证（历史行为）
+    // issue #76/#110：按账号绑定设备匹配凭证做 DeviceProof（登录回写 device_map 后
+    // 与登录设备同源）；凭证三级匹配（pending → 本机真实凭证 → device_map 反查
+    // per-uid synthetic）未命中时不再兜底首个凭证（防设备漂移），走无凭证变体如实
+    // 报错——存量共享伪设备账号若三级均未命中，刷新将降级为旧协议变体，建议重新
+    // OAuth 登录轮换设备凭证
     let bound_device = resolve_device(state, user_id).device_id;
     let exchange = crate::commands::oauth::exchange_token_refresh(
         state,

@@ -184,6 +184,8 @@ pub fn humanize_device_signed(message: &str) -> String {
 }
 
 /// 签到/状态错误文案统一转译入口：设备绑定上限（issue #76）+ 设备当日已签（issue #110）
+/// append-only 契约：两级转译仅在原文后追加引导、不改写原文——run_round 对转译后
+/// 消息再做 is_device_signed_error 特征词判定依赖此前提，改写式实现会丢特征词
 pub fn humanize_checkin_error(message: &str) -> String {
     humanize_device_signed(&humanize_device_limit(message))
 }
