@@ -221,12 +221,14 @@ pub fn generate_synthetic_device_credential(app_version: &str) -> Result<DeviceC
         .to_pkcs8_pem(p256::pkcs8::LineEnding::LF)
         .map_err(|e| format!("合成设备私钥 PEM 编码失败: {e}"))?;
     // deviceId 形态对齐真实客户端：15 位数字串（与 load_or_create_oauth_device
-    // 原随机逻辑同口径，仅需唯一性非密码学均匀）
+    // 原随机逻辑同口径，仅需唯一性非密码学均匀）。fail-closed：RNG 故障直接
+    // 报错，不回落确定性输出造成跨机撞号
+    let did_hex = crate::commands::oauth::random_hex_result(30)?;
     let device_id: String = (0..15)
-        .map(|_| {
-            let n = (crate::commands::oauth::random_hex(2).chars().next().unwrap_or('0') as u8)
-                .wrapping_rem(10);
-            (b'0' + n) as char
+        .map(|i| {
+            // did_hex 由 random_hex_result 保证为 hex 字符，解析不可失败
+            let b = u8::from_str_radix(&did_hex[i * 2..i * 2 + 2], 16).unwrap_or(0);
+            (b'0' + (b % 10)) as char
         })
         .collect();
     Ok(DeviceCredential {

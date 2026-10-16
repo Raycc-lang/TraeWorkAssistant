@@ -1429,7 +1429,8 @@ fn task_cli_arg(name: &str) -> Option<&'static str> {
 /// 按其原触发计划（每日 / 每周+星期+时刻，解析自任务 XML）重建为 GUI 子系统 exe 直调
 /// （release 主程序 windows_subsystem="windows"，无控制台窗口）。
 /// 幂等：仅迁移 Command 为旧形态的任务，迁移后再次运行自动跳过；
-/// 任一任务迁移失败则不落一次性完成标记，下次启动重试。
+/// 仅瞬时失败（查询任务定义 / schtasks 报错）不落一次性完成标记，下次启动重试；
+/// 确定性跳过（双周计划、畸形时刻等无法无损重建）计数留痕，仍置位标记。
 /// main.rs 启动期后台线程调用（CSV 枚举 + 逐任务 XML 查询可达数秒，不阻塞启动）。
 pub fn try_migrate_cmd_wrapped_tasks(data_dir: &std::path::Path) -> Option<String> {
     // 一次性完成标记：全量迁移成功后置位，跳过后续启动的枚举扫描
@@ -1453,22 +1454,29 @@ pub fn try_migrate_cmd_wrapped_tasks(data_dir: &std::path::Path) -> Option<Strin
         .collect();
     let exe = std::env::current_exe().ok()?;
     let mut migrated = 0usize;
+    let mut skipped = 0usize;
     let mut failed = 0usize;
     let mut notes: Vec<String> = Vec::new();
     for name in targets {
         let Some(arg) = task_cli_arg(&name) else { continue };
         let Some(xml) = query_task_xml(&name) else {
-            // 计入 failed：进摘要落日志留痕，且不置完成标记 → 下次启动重试
+            // 瞬时失败：计 failed 不置完成标记 → 下次启动重试
             failed += 1;
             notes.push(format!("任务迁移失败 {name}：查询任务定义失败"));
             continue;
         };
-        let Some(command) = xml_tag_text(&xml, "Command") else { continue };
+        let Some(command) = xml_tag_text(&xml, "Command") else {
+            // 确定性跳过：任务定义缺 Command 标签无法分类，重试无意义
+            skipped += 1;
+            notes.push(format!("任务迁移跳过 {name}：任务定义缺少 Command 标签（保留旧任务继续工作）"));
+            continue;
+        };
         if !is_legacy_tr_command(&command) {
             continue; // 已是直调形态（新版本注册），幂等跳过
         }
         let (Some(hhmm), Some(schedule)) = (xml_start_hhmm(&xml), parse_task_schedule(&xml)) else {
-            failed += 1;
+            // 确定性跳过：双周计划 / 畸形时刻无法无损重建，重试无意义
+            skipped += 1;
             notes.push(format!("任务迁移跳过 {name}：无法解析触发计划（保留旧任务继续工作）"));
             continue;
         };
@@ -1503,22 +1511,22 @@ pub fn try_migrate_cmd_wrapped_tasks(data_dir: &std::path::Path) -> Option<Strin
             }
         }
     }
-    if migrated == 0 && failed == 0 {
-        // 无旧形态任务，无事可做（下轮启动再扫：CSV 枚举 + 存在目标任务时
-        // 的逐任务 XML 查询；全部迁移成功置位标记后不再进入本路径）
-        return None;
-    }
     if failed == 0 {
-        // 全部成功：清掉豆包遗留 .cmd 启动器（其 schtasks 条目已改为直调），
-        // 置一次性完成标记；标记落库失败仅影响下次启动多扫一轮，不重试
+        // 收口（无旧形态任务 / 全部迁移成功 / 仅剩确定性跳过）：清掉豆包遗留
+        // .cmd 启动器，置一次性完成标记，后续启动不再进入本路径；标记落库失败
+        // 仅影响下次启动多扫一轮。取舍：置位后旧版本重注册出的旧形态任务不再
+        // 自动迁移（极小概率，重装新版即恢复直调）
         for f in ["task_doubao_renew.cmd", "task_doubao_quota.cmd"] {
             let _ = std::fs::remove_file(data_dir.join(f));
         }
         let _ = crate::store::db(data_dir)
             .kv_set("schtasks_direct_tr_migrated", &serde_json::json!(true));
+        if migrated == 0 && skipped == 0 {
+            return None; // 无旧形态任务且无可记录事项
+        }
     }
     let summary = format!(
-        "[计划任务迁移] issue #112 旧形态 /TR 重建：{migrated} 成功 / {failed} 失败：{}",
+        "[计划任务迁移] issue #112 旧形态 /TR 重建：{migrated} 成功 / {skipped} 跳过 / {failed} 失败：{}",
         notes.join("；")
     );
     Some(summary)
