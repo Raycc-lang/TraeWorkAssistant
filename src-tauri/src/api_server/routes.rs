@@ -2019,8 +2019,8 @@ fn stream_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: String, str
                 String::new()
             };
             let diag_line = format!(
-                "{exhaust_tag} [{:02}:{:02}:{:02}] tried={} empty_hits={} pool=trae reasons=[{}]{}",
-                h, m, s, tried.len(), empty_hits, diag_summary.join(", "), sample_note,
+                "{exhaust_tag} [{:02}:{:02}:{:02}] tried={} attempts={} empty_hits={} pool=trae reasons=[{}]{}",
+                h, m, s, tried.len(), attempts, empty_hits, diag_summary.join(", "), sample_note,
             );
             state.logger.log_debug_line(format!("[DEBUG] {diag_line}"));
         }
@@ -2469,8 +2469,8 @@ async fn aggregate_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: St
                 String::new()
             };
             state.logger.log_debug_line(format!(
-                "[DEBUG] {exhaust_tag}(non-stream) tried={} empty_hits={} pool=trae reasons=[{}]{}",
-                tried.len(), empty_hits, diag_summary.join(", "), sample_note,
+                "[DEBUG] {exhaust_tag}(non-stream) tried={} attempts={} empty_hits={} pool=trae reasons=[{}]{}",
+                tried.len(), attempts, empty_hits, diag_summary.join(", "), sample_note,
             ));
         }
         Err(AggregateFail::NoHealthy(exhaust_msg))

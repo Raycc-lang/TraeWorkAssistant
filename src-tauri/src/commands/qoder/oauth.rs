@@ -5,6 +5,8 @@
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
 use std::path::Path;
+// 唯一使用点在 cfg(windows) open_in_browser，门控避免 macOS 构建未用导入警告
+#[cfg(windows)]
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 
