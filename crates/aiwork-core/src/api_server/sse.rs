@@ -278,6 +278,11 @@ fn stream_convert_src(
                     ));
                 }
                 "done" | "turn_completion" => {
+                    // 审查 Low 修复：上游偶发双完成事件（done + turn_completion），
+                    // 首个完成帧已发则忽略后续，防同一 SSE 流拼接第二份收尾帧
+                    if saw_done {
+                        continue;
+                    }
                     if !has_content {
                         // 空完成（影子风控/上游异常）：不发收尾帧，以哨兵错误上抛
                         // 调用方换号重试（issue #57，不再把空响应伪装成正常完成）
@@ -419,6 +424,11 @@ fn stream_convert_text_src(
                     ));
                 }
                 "done" | "turn_completion" => {
+                    // 审查 Low 修复：上游偶发双完成事件（done + turn_completion），
+                    // 首个完成帧已发则忽略后续，防同一 SSE 流拼接第二份收尾帧
+                    if saw_done {
+                        continue;
+                    }
                     if !has_content {
                         // 空完成（影子风控/上游异常）：不发收尾帧，以哨兵错误上抛
                         // 调用方换号重试（issue #57）
@@ -930,6 +940,12 @@ fn stream_convert_anthropic_src(
                     usage = Some(json!(ev.usage.clone().unwrap_or(json!({}))));
                 }
                 "done" | "turn_completion" => {
+                    // 上游偶发双完成（sibling 两转换器同款守卫）：二次完成会重发全部
+                    // tool_use 块 + message_delta/message_stop，对 Claude Code 等严格
+                    // 客户端属协议违规——首帧后静默忽略后续完成事件
+                    if saw_done {
+                        continue;
+                    }
                     if !ev.finish_reason.is_empty() {
                         finish_reason = ev.finish_reason;
                     }

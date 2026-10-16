@@ -54,6 +54,8 @@ fn merge_pool_set(
     qoder_hedge_threshold_ms: Option<u64>,
     // Qoder 会话粘性开关（F-80-余 v2）；None = 保留原值
     qoder_sticky_enabled: Option<bool>,
+    // Qwen3.8-Flash 免费活动倍率覆盖开关（issue #111）；None = 保留原值
+    qoder_flash_free_rate: Option<bool>,
     // Qoder 池入池白名单（qd- 前缀账号 id）；None = 保留原值，
     // Some(list) = 覆盖（Qoder 页账号池勾选保存；空数组 = fail-open 全量入池）
     qoder_uids: Option<Vec<String>>,
@@ -120,6 +122,7 @@ fn merge_pool_set(
         qoder_hedge_threshold_ms: qoder_hedge_threshold_ms
             .unwrap_or(existing.qoder_hedge_threshold_ms),
         qoder_sticky_enabled: qoder_sticky_enabled.unwrap_or(existing.qoder_sticky_enabled),
+        qoder_flash_free_rate: qoder_flash_free_rate.unwrap_or(existing.qoder_flash_free_rate),
         qoder_group_ids: qoder_group_ids.unwrap_or_else(|| existing.qoder_group_ids.clone()),
         qoder_strategy: qoder_strategy.unwrap_or_else(|| existing.qoder_strategy.clone()),
         // 标签筛选不参与 merge_pool_set（pool_set 命令在 merge 后追加应用），原样保留
@@ -169,6 +172,8 @@ pub fn pool_set(
     qoder_hedge_threshold_ms: Option<u64>,
     // Qoder 会话粘性开关；None = 保留原值
     qoder_sticky_enabled: Option<bool>,
+    // Qwen3.8-Flash 免费活动倍率覆盖开关（issue #111，默认开）；None = 保留原值
+    qoder_flash_free_rate: Option<bool>,
     // Qoder 池入池白名单（qd- 前缀账号 id）；None = 保留原值，
     // Some(list) = 覆盖（Qoder 页账号池勾选保存；空数组 = fail-open 全量入池）
     qoder_uids: Option<Vec<String>>,
@@ -215,6 +220,7 @@ pub fn pool_set(
         qoder_enabled,
         qoder_hedge_threshold_ms,
         qoder_sticky_enabled,
+        qoder_flash_free_rate,
         qoder_uids,
         qoder_group_ids,
         qoder_strategy,
@@ -319,6 +325,11 @@ pub fn pool_set(
             pool_file.qoder_sticky_enabled,
             std::sync::atomic::Ordering::Relaxed,
         );
+        // Qwen3.8-Flash 免费活动倍率覆盖热应用（issue #111）
+        shared.qoder_flash_free_rate.store(
+            pool_file.qoder_flash_free_rate,
+            std::sync::atomic::Ordering::Relaxed,
+        );
     }
     // 成员/分组热应用：此前仅策略/参数热生效，成员变更要求重启服务；
     // 现统一走凭据/成员变更联动热重载，保存账号池后立即生效
@@ -365,16 +376,30 @@ pub fn push_credits_if_running(state: &AppState) {
     };
     let credits_file: RemainingCreditsFile =
         crate::store::docs::remaining_credits_load(&crate::store::db(&state.data_dir));
-    // 池积分语义与 apply_pool_snapshot 一致：优先 general 表，回退旧总积分表
-    let pool_credits: std::collections::HashMap<String, f64> = credits_file
+    // 三键拨新（issue #109）：此前只拨余额两键，credits_expire_at 钉死在装配时刻——
+    // 网关启动后新登录/新刷新的账号池内 expire=None，被 expire_first
+    // 「有过期时间者优先」恒压（调度持续命中带旧到期信息的老账号，新会话同样命中）；
+    // 充值续期后的新到期也进不了池，旧值已过期的账号甚至被 selectable 整体排除。
+    // 积分与到期均对齐 apply_pool_snapshot 装配口径：优先 general 表，到期用
+    // merge_pool_expire_times（general 优先、混合口径兜底），池状态与重启后一致
+    let expire_times = crate::api_server::runtime::merge_pool_expire_times(&credits_file);
+    let pool_snapshot: std::collections::HashMap<String, (f64, Option<i64>)> = credits_file
         .credits
         .iter()
-        .map(|(uid, c)| (uid.clone(), credits_file.general.get(uid).copied().unwrap_or(*c)))
+        .map(|(uid, c)| {
+            (
+                uid.clone(),
+                (
+                    credits_file.general.get(uid).copied().unwrap_or(*c),
+                    expire_times.get(uid).copied(),
+                ),
+            )
+        })
         .collect();
-    shared.pool.update_credits(&pool_credits);
+    shared.pool.update_credits_snapshot(&pool_snapshot);
     crate::fs_utils::app_log(
         &state.data_dir,
-        &format!("API服务池积分回写(运行期): n={}", pool_credits.len()),
+        &format!("API服务池积分回写(运行期): n={}", pool_snapshot.len()),
     );
 }
 
@@ -659,7 +684,7 @@ pub fn api_unified_models(
     let Some(shared) = crate::api_server::runtime::gateway_shared() else {
         return Err("网关未启动".into());
     };
-    let (wb_enabled, trae_enabled, qoder_enabled, trae_ok, buddy_ok, qoder_ok) = (
+    let (wb_enabled, trae_enabled, qoder_enabled, trae_ok, buddy_ok, qoder_ok, qoder_flash_free) = (
         shared
             .wb_enabled
             .load(std::sync::atomic::Ordering::Relaxed),
@@ -672,6 +697,10 @@ pub fn api_unified_models(
         shared.pool.has_selectable(),
         shared.wb_pool.has_selectable(),
         shared.qoder_pool.has_selectable(),
+        // Qwen3.8-Flash 免费活动覆盖（issue #111），与取号/排序同口径
+        shared
+            .qoder_flash_free_rate
+            .load(std::sync::atomic::Ordering::Relaxed),
     );
     let data_dir = state.data_dir.clone();
     let mut list = crate::api_server::unified_catalog::unified_models_ex(
@@ -680,6 +709,7 @@ pub fn api_unified_models(
         trae_enabled && trae_ok,
         buddy_ok,
         Some((qoder_enabled, qoder_ok)),
+        qoder_flash_free,
     );
     if available_only.unwrap_or(false) {
         list.retain(|m| m.sources.iter().any(|s| s.enabled));
@@ -844,6 +874,7 @@ mod pool_merge_tests {
             qoder_enabled_uids: vec!["qd-1".into()],
             qoder_hedge_threshold_ms: 6000,
             qoder_sticky_enabled: true,
+            qoder_flash_free_rate: true,
             qoder_account_concurrency_limit: 3,
             qoder_pool_sticky_ttl_secs: 900,
             qoder_sticky_ttl_secs: 3600,
@@ -882,6 +913,7 @@ mod pool_merge_tests {
         qoder_enabled: Option<bool>,
         qoder_hedge_threshold_ms: Option<u64>,
         qoder_sticky_enabled: Option<bool>,
+        qoder_flash_free_rate: Option<bool>,
         qoder_uids: Option<Vec<String>>,
         qoder_group_ids: Option<Vec<String>>,
         qoder_strategy: Option<String>,
@@ -921,6 +953,7 @@ mod pool_merge_tests {
             p.qoder_enabled,
             p.qoder_hedge_threshold_ms,
             p.qoder_sticky_enabled,
+            p.qoder_flash_free_rate,
             p.qoder_uids,
             p.qoder_group_ids,
             p.qoder_strategy,

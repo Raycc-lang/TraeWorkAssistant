@@ -317,8 +317,17 @@ pub fn build_shared(state: &AppState) -> Arc<ApiSharedState> {
                     2,
                 );
                 match note {
-                    "no_credential" | "expired_needs_relogin" | "auth_dead" | "pat_rejected"
-                    | "refresh_failed" => Err(note.to_string()),
+                    // 暂态失败（网络/5xx → refresh_failed；refresh_busy（H3）→ 他进程
+                    // 刷新中）带标记前缀，网关侧走 Server 熔断可自愈；仅永久失效
+                    //（凭证缺失/过期需重登/PAT 被拒/refresh_token 被拒）走 SessionDead
+                    // 永久禁用（此前 refresh_failed 裸 Err 会被误标永久禁用）
+                    "refresh_failed" | "refresh_busy" => Err(format!(
+                        "{}qoder 凭证暂不可用(uid={uid}, status={note}；网络/服务端暂态或他进程正在刷新，稍后自动恢复)",
+                        crate::tasks::qoder_common::TRANSIENT_ERR_TAG
+                    )),
+                    "no_credential" | "expired_needs_relogin" | "auth_dead" | "pat_rejected" => {
+                        Err(note.to_string())
+                    }
                     _ => Ok(creds),
                 }
             })
@@ -355,6 +364,8 @@ pub fn build_shared(state: &AppState) -> Arc<ApiSharedState> {
         qoder_pool_sticky_ttl_secs: std::sync::atomic::AtomicU64::new(
             pool_file.qoder_pool_sticky_ttl_secs,
         ),
+        // Qwen3.8-Flash 免费活动倍率覆盖（issue #111，api_pool.json，serde default 兼容旧文件）
+        qoder_flash_free_rate: std::sync::atomic::AtomicBool::new(pool_file.qoder_flash_free_rate),
         // Trae 池会话粘性存储（per-pool 批次新增）："t:" 命名空间与 wb/qoder 互不串绑
         trae_sticky: StickyStore::load_ns(&state.data_dir, super::wb_sticky::TRAE_NS),
         wb_sticky: StickyStore::load(&state.data_dir),
@@ -409,9 +420,9 @@ pub fn build_shared(state: &AppState) -> Arc<ApiSharedState> {
     // 积分快照时后台刷新一次——reserve 过滤对陈旧快照 fail-open，刷新拨新后
     // 自动恢复生效。三池口径：
     //   Trae 池：refresh_remaining_credits_impl 逐账号刷新，经 push_credits 回写拨新；
-    //   WB 池：wb_credits_snapshot_task 快照后按 ok=true 账号经 update_credits 拨新
-    //     （只更新余额+时间戳，不触碰运行期健康状态；此前 WB 池无运行期拨新
-    //     路径，陈旧快照会一直 fail-open）；
+    //   WB 池：wb_credits_snapshot_task 快照后经 write_back_pool_balances 内部
+    //     运行池句柄 update_credits_snapshot 三键拨新（issue #109 同类：
+    //     credits/expire/fetched_at，ok=true 账号，失败账号保留旧值）；
     //   Qoder 池（issue #102）：run_snapshot_task 快照后按 ok 行经
     //     update_credits_snapshot 三键拨新（credits/expire_at/fetched_at）——
     //     selectable 零积分与到期过滤均无新鲜度自愈，装配时 Some(0.0)/已过期的
@@ -458,33 +469,28 @@ pub fn build_shared(state: &AppState) -> Arc<ApiSharedState> {
                 }
             }
             if wb_stale {
-                match crate::commands::workbuddy::wb_credits_snapshot_task(&st2) {
+                // 拨新在 wb_credits_snapshot_task 内部经运行池句柄完成（ok 行三键拨新，
+                // 对齐下方 Qoder 池口径）。docker 适配：main 版传 runtime Mutex 句柄；
+                // server 单体直接传本函数装配好的 shared2（Arc<ApiSharedState>）
+                match crate::commands::workbuddy::wb_credits_snapshot_task(&st2, Some(&shared2)) {
                     Ok(parsed) => {
-                        // 仅 ok=true 账号拨新，失败账号保留旧值防误清
-                        //（对齐 write_back_pool_balances 的到期回写口径）
-                        let mut m: std::collections::HashMap<String, f64> =
-                            std::collections::HashMap::new();
-                        if let Some(accounts) = parsed.get("accounts").and_then(|v| v.as_array()) {
-                            for acc in accounts {
-                                let ok = acc
-                                    .get("ok")
-                                    .and_then(serde_json::Value::as_bool)
-                                    .unwrap_or(true);
-                                if !ok {
-                                    continue;
-                                }
-                                if let (Some(uid), Some(bal)) = (
-                                    acc.get("user_id").and_then(|v| v.as_str()),
-                                    acc.get("balance").and_then(|v| v.as_f64()),
-                                ) {
-                                    m.insert(uid.to_string(), bal);
-                                }
-                            }
-                        }
-                        shared2.wb_pool.update_credits(&m);
+                        // 计 ok=true 且 balance 可解析（实际拨新）账号，对齐
+                        // write_back_pool_balances 的 snapshot 收集口径（Trae(ok_count)/Qoder(ok 行)）
+                        let n = parsed
+                            .get("accounts")
+                            .and_then(|v| v.as_array())
+                            .map(|a| {
+                                a.iter()
+                                    .filter(|x| {
+                                        x.get("ok").and_then(|v| v.as_bool()).unwrap_or(true)
+                                            && x.get("balance").and_then(|v| v.as_f64()).is_some()
+                                    })
+                                    .count()
+                            })
+                            .unwrap_or(0);
                         fs_utils::app_log(
                             &st2.data_dir,
-                            &format!("API服务启动-积分保鲜: WB池拨新完成 accounts={}", m.len()),
+                            &format!("API服务启动-积分保鲜: WB池拨新完成 accounts={}", n),
                         );
                     }
                     Err(e) => fs_utils::app_log(
@@ -522,7 +528,7 @@ pub fn build_shared(state: &AppState) -> Arc<ApiSharedState> {
 /// - 通用剩余表未覆盖的老缓存账号（升级前未刷新过）→ 回退混合口径 expire_times
 /// - 已刷新但通用包均长期有效/耗尽的账号（general 有键而 general_expire_times 无键）
 ///   → 不回退，无到期约束（混合口径里的 Work 包到期不得泄漏进调度）
-fn merge_pool_expire_times(rc: &crate::models::RemainingCreditsFile) -> std::collections::HashMap<String, i64> {
+pub(crate) fn merge_pool_expire_times(rc: &crate::models::RemainingCreditsFile) -> std::collections::HashMap<String, i64> {
     let mut out: std::collections::HashMap<String, i64> = rc
         .expire_times
         .iter()

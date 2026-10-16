@@ -258,6 +258,7 @@ pub fn dispatch(admin: &AdminState, name: &str, args: Value) -> Result<Value, St
             let days = opt_arg(&args, "days")?;
             to_json(checkin_cmd::checkin_trends(state, days))
         }
+        "checkin_device_conflicts" => to_json(checkin_cmd::checkin_device_conflicts(state)),
 
         // ==================== misc（JWT/日志/设置） ====================
         "jwt_parse" => {
@@ -314,6 +315,7 @@ pub fn dispatch(admin: &AdminState, name: &str, args: Value) -> Result<Value, St
             let qoder_enabled = opt_arg(&args, "qoder_enabled")?;
             let qoder_hedge_threshold_ms = opt_arg(&args, "qoder_hedge_threshold_ms")?;
             let qoder_sticky_enabled = opt_arg(&args, "qoder_sticky_enabled")?;
+            let qoder_flash_free_rate = opt_arg(&args, "qoder_flash_free_rate")?;
             let qoder_uids = opt_arg(&args, "qoder_uids")?;
             let qoder_group_ids = opt_arg(&args, "qoder_group_ids")?;
             let qoder_strategy = opt_arg(&args, "qoder_strategy")?;
@@ -348,6 +350,7 @@ pub fn dispatch(admin: &AdminState, name: &str, args: Value) -> Result<Value, St
                 qoder_enabled,
                 qoder_hedge_threshold_ms,
                 qoder_sticky_enabled,
+                qoder_flash_free_rate,
                 qoder_uids,
                 qoder_group_ids,
                 qoder_strategy,

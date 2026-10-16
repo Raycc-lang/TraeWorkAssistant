@@ -6,6 +6,28 @@
 
 ---
 
+## [Unreleased] · 移植 main：Qwen3.8-Flash 免费豁免 + 运行期积分三键拨新 + 审查修复批
+
+> 合并点 `main@b0f81db` → `main@f5f2cd3`（16 个提交，手工语义移植，未 merge）。桌面/OS 专属（计划任务 schtasks、TraeWork 迁移引导、switcher 文案、Accounts.tsx 注释）、CI（@tauri-apps/cli 回钉与 lock 同步、build-windows.yml）、纯文档（buddy 国际版方案）跳过；5468e05/541f33b/d9bf500 已随前次移植包含。
+
+### 新增
+
+- **Qwen3.8-Flash 免费活动倍率覆盖（issue #111）**：上游免费活动期 `usage.billable=false` 实际不扣分，但 model/list 目录价随低峰折扣漂移（0.1→0.08）不反映免费，零积分账号被积分过滤挡在该模型之外。`entry_is_free`（倍率 0 判免费，credits 缺失 fail-closed）+ `apply_flash_free_override`（改写条目倍率为 0，norm_model_id 归一容忍命名漂移，只改调用方副本不动进程缓存）+ `resolve_overridden`/`list_overridden` 便捷入口；兜底表 qfmodel 对齐 2026-10-16 远程实抓。调度层 selectable 及全部取号链新增 `skip_credit_filters`——免费模型豁免零积分/保留阈值/积分过期过滤，账号级状态过滤（禁用/冷却/专一）不豁免；Trae/WB 池调用点恒传 false 零行为变化，healthz/徽章口径恒不豁免。路由层 Qoder 流式/非流式取号豁免 + 免费档消耗按 0 落账（防名义值虚增用量）；dispatch 智能排序与池健康预检同口径；`/v1/models` 与管理端聚合目录倍率展示 0×。配置 `api_pool.json` 新增 `qoder_flash_free_rate`（serde default 开，兼容旧文件）、pool_set 持久化 + 热应用 + cmd_bridge 透传；资源调度页新增开关（上游活动结束后关闭恢复官方同步倍率）。
+
+### 修复与加固
+
+- **运行期积分三键拨新（issue #109）**：Trae/WB 池运行期回写此前只拨余额两键，`credits_expire_at` 钉死在网关装配时刻——expire_first「先到期先消耗」下新登录账号（expire=None）被「有过期时间者优先」恒压、充值续期新到期进不了池、已过期账号被 selectable 整体排除。删除两键 `update_credits` 统一 `update_credits_snapshot` 三键（credits + expire + fetched_at）；`push_credits_if_running` 到期经 `merge_pool_expire_times` 对齐装配口径；`write_back_pool_balances` 增加运行池句柄（docker 适配 `Arc<ApiSharedState>`，锁外拨新），页面/后台 SWR/快照四条刷新链路即时生效；调度器 wb-credits-snapshot 透传句柄。
+- **记账与 SSE 守卫批**：toolexec 失败终局保留真实消耗 + 盲发非 CREDITS 防线 + 记账宽口径统一（`u64_pair` 宽口径对字符串/浮点形态不再静默得 0）；SSE 双完成守卫（轮内 completed 后不再受理首字/新行）+ 第三守卫（终态记账幂等）；断连期间 usage 事件补记缓存读 tokens 终态旁路记账。
+- **签到链**：设备当日已签错误转译（`ALREADY_CHECKED_IN` 归 Already 并从重试轮排除，不再整轮失败）+ 签到前设备冲突预警（`checkin_device_conflicts` 命令 + 前端提示）；claim 请求统一最小头形态（issue #114 风控按请求形态拦截）；`secs_until_next_checkin_reset` 重置窗口。
+- **迁移与刷新**：kv 迁移原子化（tmp+rename，防半写）+ no-clobber（已存在的 legacy 记录不覆盖）；Qoder 活动刷新跨进程守卫；qoder_credits 混合账户到期口径 `earliest_expire_secs`；签到奖励运行期回写 `apply_credits_delta`（签到充值后无需重启即恢复可选）。
+- **healthz 三池口径**：健康判定逐池独立（此前 WB 池空时整体 no_healthy 误报）。
+
+### 验证
+
+- `cargo test --workspace` 701+12 通过（7 忽略）· `tsc` 0 错误 · `vitest` 61 通过。
+
+---
+
 ## [1.4.16] · 2026-10-14 · 多架构 Docker 镜像发布
 
 ### 新增

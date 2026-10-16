@@ -32,7 +32,7 @@ use super::pool::PickedAccount;
 use super::retry::{retry_plan, RetryAction};
 use super::wb_payload;
 use super::wb_sse;
-use super::wb_sse::{cache_write_tokens_of, cached_tokens_of, token_number};
+use super::wb_sse::{cache_write_tokens_of, cached_tokens_of, u64_pair};
 use super::wb_sticky::SessionKey;
 use super::wb_upstream::{self, WbCreds};
 use super::{classify_error, ApiSharedState, ErrKind, InflightGuard};
@@ -328,7 +328,7 @@ fn race_first_byte(
     let spawn_backup = move || -> Option<(Box<dyn Read + Send>, HedgeLease)> {
         let (picked2, ev) = state2
             .wb_pool
-            .pick_excluding_constrained_ev(&tried2, allowed2.as_ref(), dedicated2.as_deref())?;
+            .pick_excluding_constrained_ev(&tried2, allowed2.as_ref(), dedicated2.as_deref(), false)?;
         // F-77⑤ 可观测：对冲取号同样记录 busy 让位/降级事件
         if let Some(ev) = ev {
             state2.logger.log_sched_event(&ev);
@@ -541,7 +541,7 @@ fn run_wb_stream(
             }
             state
                 .wb_pool
-                .pick_by_uid(&b.uid)
+                .pick_by_uid(&b.uid, false)
                 .map(|_| (b.uid, b.conv_id))
         });
     let sticky_uid: Option<String> = sticky0.as_ref().map(|(u, _)| u.clone());
@@ -555,7 +555,7 @@ fn run_wb_stream(
         .and_then(|(u, _)| {
             state
                 .wb_pool
-                .pick_sticky_yield(u, allowed_set.as_ref())
+                .pick_sticky_yield(u, allowed_set.as_ref(), false)
                 .map(|(p, ev)| {
                     if let Some(ev) = ev {
                         state.logger.log_sched_event(&ev);
@@ -563,7 +563,7 @@ fn run_wb_stream(
                     p
                 })
         })
-        .or_else(|| dedicated.as_deref().and_then(|uid| state.wb_pool.pick_by_uid(uid)));
+        .or_else(|| dedicated.as_deref().and_then(|uid| state.wb_pool.pick_by_uid(uid, false)));
 
     let mut tried: HashSet<String> = HashSet::new();
     let mut refreshed: HashSet<String> = HashSet::new(); // 401 刷新每账号一次
@@ -571,14 +571,18 @@ fn run_wb_stream(
     let mut last_11128_sample: Option<String> = None; // 11128 诊断样本按请求去重
 
     loop {
-        // 客户端断连检测：通道关闭即终止轮换/重试，不再占用账号并发槽（对齐 routes.rs stream_chat）
+        // 客户端断连检测：通道关闭即终止轮换/重试，不再占用账号并发槽（对齐 routes.rs stream_chat）。
+        // 审查 M5：断连也是请求终局，补记一行失败用量（未取号 → "none"，与下方
+        // 轮换耗尽收尾同口径），防用量页 requests 缺口
         if tx.is_closed() {
+            let duration_ms = start_ts.elapsed().as_millis() as u64;
+            state.record_usage(true, model, "none", key_id, false, true, duration_ms, 0, 0);
             return;
         }
         // ── 取号：粘性/专一命中优先，否则按 Key 约束 + 调度策略；换号后仅走策略 ──
         let picked = match first_pick.take() {
             Some(p) => p,
-            None => match state.wb_pool.pick_excluding_constrained_ev(&tried, allowed_set.as_ref(), dedicated.as_deref()) {
+            None => match state.wb_pool.pick_excluding_constrained_ev(&tried, allowed_set.as_ref(), dedicated.as_deref(), false) {
                 Some((p, ev)) => {
                     // F-77⑤ 可观测：busy_yield / busy_fallback 调度事件
                     if let Some(ev) = ev {
@@ -592,7 +596,7 @@ fn run_wb_stream(
                     // 审查 P2：轮换耗尽收尾对齐 routes.rs（issue #57 可观测）——
                     // 空完成主导 → 明示渠道指纹拦截语义（账号/模型无关，提示更新
                     // wb_template_map.json），否则维持原文案；code 保持 no_healthy_account
-                    let (healthy_total, _) = state.wb_pool.selectable_stats_in(None);
+                    let (healthy_total, _) = state.wb_pool.selectable_stats_in(None, false);
                     let (exhaust_msg, exhaust_tag) =
                         super::routes::exhaust_message(empty_hits, tried.len(), healthy_total);
                     state.logger.log_request(
@@ -676,8 +680,11 @@ fn run_wb_stream(
 
         let mut same_attempt: u32 = 0;
         loop {
-            // 客户端断连检测：重试等待/长路径期间离开则终止（同账号 guard 随 Drop 释放）
+            // 客户端断连检测：重试等待/长路径期间离开则终止（同账号 guard 随 Drop 释放）。
+            // 审查 M5：断连为请求终局，补记一行失败用量（已绑定 picked 账号）
             if tx.is_closed() {
+                let duration_ms = start_ts.elapsed().as_millis() as u64;
+                state.record_usage(true, model, &picked.uid, key_id, false, true, duration_ms, 0, 0);
                 return;
             }
             let ttfb_start = Instant::now();
@@ -720,20 +727,19 @@ fn run_wb_stream(
                         wb_sse::stream_forward_ex(win_lines, tx, proto, chat_id, model, encoded);
                     let duration_ms = start_ts.elapsed().as_millis() as u64;
                     {
-                        let (pt, ct) = usage
-                            .as_ref()
-                            .map(|u| {
-                                (
-                                    u.get("prompt_tokens").and_then(|v| v.as_u64()).unwrap_or(0),
-                                    u.get("completion_tokens").and_then(|v| v.as_u64()).unwrap_or(0),
-                                )
-                            })
-                            .unwrap_or((0, 0));
+                        // 宽口径提取（别名 + 字符串数字形态，审查 P2）
+                        let (pt, ct) = usage.as_ref().map(u64_pair).unwrap_or((0, 0));
                         // F-76① TTFT 入账：用量页 P50/P95/TTFT 分位统计。
                         // 每请求终态单行（审查问题6）：换号重试（空完成未流出 /
                         // 错误未流出，对应下方两处 break）为中间态不落账，避免
                         // requests 虚高；终态（成功 / 就地收尾 / 流内失败透传）恰落一行
                         if !(error_info.is_some() && !sent_any) {
+                            // M4 审查修复：缓存读 tokens 旁路入账（宽口径别名提取；
+                            // 上游未下发得 0 不入账，与 credits「不得伪造」口径一致）
+                            state.record_usage_cached(
+                                super::usage::UsageBucket::Wb,
+                                usage.as_ref().map(cached_tokens_of).unwrap_or(0),
+                            );
                             state.record_usage_ttfb(
                                 true, model, win_uid, key_id, error_info.is_none() && !failed_inline,
                                 true, duration_ms, pt, ct, Some(ttfb_ms),
@@ -826,8 +832,10 @@ fn run_wb_stream(
                                 body_vec, model, &picked.uid, &conv_id, effort.as_deref(), true, &templates,
                             );
                             std::thread::sleep(std::time::Duration::from_millis(200));
-                            // 断连检测：重试等待期间客户端离开则终止
+                            // 断连检测：重试等待期间客户端离开则终止（审查 M5：补记失败终态用量）
                             if tx.is_closed() {
+                                let duration_ms = start_ts.elapsed().as_millis() as u64;
+                                state.record_usage(true, model, &picked.uid, key_id, false, true, duration_ms, 0, 0);
                                 return;
                             }
                             continue;
@@ -855,7 +863,10 @@ fn run_wb_stream(
                             same_attempt += 1;
                             std::thread::sleep(std::time::Duration::from_millis(delay_ms.min(60_000)));
                             // 断连检测：重试等待期间客户端离开则终止，不再占用该账号并发槽
+                            // （审查 M5：补记失败终态用量）
                             if tx.is_closed() {
+                                let duration_ms = start_ts.elapsed().as_millis() as u64;
+                                state.record_usage(true, model, &picked.uid, key_id, false, true, duration_ms, 0, 0);
                                 return;
                             }
                             continue;
@@ -970,7 +981,7 @@ pub async fn wb_aggregate_chat(
                 }
                 state
                     .wb_pool
-                    .pick_by_uid(&b.uid)
+                    .pick_by_uid(&b.uid, false)
                     .map(|_| (b.uid, b.conv_id))
             });
         let sticky_uid: Option<String> = sticky0.as_ref().map(|(u, _)| u.clone());
@@ -983,7 +994,7 @@ pub async fn wb_aggregate_chat(
             .and_then(|(u, _)| {
                 state
                     .wb_pool
-                    .pick_sticky_yield(u, allowed_set.as_ref())
+                    .pick_sticky_yield(u, allowed_set.as_ref(), false)
                     .map(|(p, ev)| {
                         if let Some(ev) = ev {
                             state.logger.log_sched_event(&ev);
@@ -991,7 +1002,7 @@ pub async fn wb_aggregate_chat(
                         p
                     })
             })
-            .or_else(|| dedicated.as_deref().and_then(|uid| state.wb_pool.pick_by_uid(uid)));
+            .or_else(|| dedicated.as_deref().and_then(|uid| state.wb_pool.pick_by_uid(uid, false)));
 
         let mut tried: HashSet<String> = HashSet::new();
         let mut refreshed: HashSet<String> = HashSet::new();
@@ -1001,7 +1012,7 @@ pub async fn wb_aggregate_chat(
         loop {
             let picked = match first_pick.take() {
                 Some(p) => p,
-                None => match state.wb_pool.pick_excluding_constrained_ev(&tried, allowed_set.as_ref(), dedicated.as_deref()) {
+                None => match state.wb_pool.pick_excluding_constrained_ev(&tried, allowed_set.as_ref(), dedicated.as_deref(), false) {
                     Some((p, ev)) => {
                         if let Some(ev) = ev {
                             state.logger.log_sched_event(&ev);
@@ -1012,7 +1023,7 @@ pub async fn wb_aggregate_chat(
                         state.record_usage(true, &model, "none", &key_id, false, stream,
                             start_ts.elapsed().as_millis() as u64, 0, 0);
                         // 审查 P2：轮换耗尽收尾对齐 routes.rs——空完成主导 → 指纹拦截语义
-                        let (healthy_total, _) = state.wb_pool.selectable_stats_in(None);
+                        let (healthy_total, _) = state.wb_pool.selectable_stats_in(None, false);
                         let (exhaust_msg, exhaust_tag) =
                             super::routes::exhaust_message(empty_hits, tried.len(), healthy_total);
                         // issue #99 ①：影子风控收尾落原始指纹样本（非流式路径无
@@ -1125,10 +1136,13 @@ pub async fn wb_aggregate_chat(
                                     break;
                                 }
                                 r["model"] = json!(model);
-                                let (pt, ct) = r.get("usage").map(|u| (
-                                    u.get("prompt_tokens").and_then(|v| v.as_u64()).unwrap_or(0),
-                                    u.get("completion_tokens").and_then(|v| v.as_u64()).unwrap_or(0),
-                                )).unwrap_or((0, 0));
+                                // 宽口径提取（别名 + 字符串数字形态，审查 P2）
+                                let (pt, ct) = r.get("usage").map(u64_pair).unwrap_or((0, 0));
+                                // M4 审查修复：缓存读 tokens 旁路入账（未下发得 0 不入账）
+                                state.record_usage_cached(
+                                    super::usage::UsageBucket::Wb,
+                                    r.get("usage").map(cached_tokens_of).unwrap_or(0),
+                                );
                                 // F-76① TTFT 入账
                                 state.record_usage_ttfb(true, &model, win_uid, &key_id, true, stream, duration_ms, pt, ct, Some(ttfb_ms));
                                 state.wb_pool.note_success(win_uid);
@@ -1438,12 +1452,16 @@ pub async fn wb_tool_exec_chat(
         let mut last_err: Option<String> = None;
         // F-76① TTFT：各轮首字耗时（最终轮即最终回复的首字延迟）
         let mut last_ttfb_ms: Option<u64> = None;
+        // 请求级 usage 累加（跨账号跨轮次，含失败账号与中间轮的真实消耗）——
+        // 失败终局记账带上（审查 P1：原硬编码 0,0 把已消耗的 tokens 全部丢弃）；
+        // 成功终局仍以 completion 写回值为准（只含最终成功账号，维持不变）
+        let mut req_acc_usage = (0u64, 0u64);
         let resp_id = format!("resp_{}", now_ts());
 
         'accounts: loop {
             let picked = match state
                 .wb_pool
-                .pick_excluding_constrained_ev(&tried, allowed_set.as_ref(), dedicated.as_deref())
+                .pick_excluding_constrained_ev(&tried, allowed_set.as_ref(), dedicated.as_deref(), false)
             {
                 Some((p, ev)) => {
                     if let Some(ev) = ev {
@@ -1553,17 +1571,12 @@ pub async fn wb_tool_exec_chat(
                             break Err("空完成（影子风控/上游异常）".to_string());
                         }
                         if let Some(u) = completion.get("usage") {
+                            // 宽口径提取（别名 + 字符串数字形态，审查 P2）；
+                            // 同步累加请求级口径（审查 P1：失败终局带上真实消耗）。
                             // 饱和累加：异常上游的超大 token 值不 panic / 不回绕错账
-                            acc_usage = (
-                                acc_usage.0.saturating_add(
-                                    u.get("prompt_tokens").and_then(token_number).unwrap_or(0),
-                                ),
-                                acc_usage.1.saturating_add(
-                                    u.get("completion_tokens")
-                                        .and_then(token_number)
-                                        .unwrap_or(0),
-                                ),
-                            );
+                            let (pt, ct) = u64_pair(u);
+                            acc_usage = (acc_usage.0.saturating_add(pt), acc_usage.1.saturating_add(ct));
+                            req_acc_usage = (req_acc_usage.0.saturating_add(pt), req_acc_usage.1.saturating_add(ct));
                             acc_cached = acc_cached.saturating_add(cached_tokens_of(u));
                             acc_cache_write =
                                 acc_cache_write.saturating_add(cache_write_tokens_of(u));
@@ -1729,11 +1742,17 @@ pub async fn wb_tool_exec_chat(
         let duration_ms = start_ts.elapsed().as_millis() as u64;
         match final_completion {
             Some(mut completion) => {
-                let (pt, ct) = completion.get("usage").map(|u| (
-                    u.get("prompt_tokens").and_then(|v| v.as_u64()).unwrap_or(0),
-                    u.get("completion_tokens").and_then(|v| v.as_u64()).unwrap_or(0),
-                )).unwrap_or((0, 0));
+                // 宽口径提取（别名 + 字符串数字形态，审查 P2）；
+                // completion 写回值为最终账号跨轮累加（acc_usage），维持不变
+                let (pt, ct) = completion.get("usage").map(u64_pair).unwrap_or((0, 0));
                 let usage_uid = success_uid.as_deref().unwrap_or("wb-toolexec");
+                // M4 审查修复：缓存读 tokens 旁路入账——聚合终态 usage 经
+                // write_back_acc_usage 写回 cache_read_token，cached_tokens_of
+                // 键集覆盖该键可直接提取；未下发得 0 不入账
+                state.record_usage_cached(
+                    super::usage::UsageBucket::Wb,
+                    completion.get("usage").map(cached_tokens_of).unwrap_or(0),
+                );
                 // F-76① TTFT 入账：最终轮首字耗时
                 state.record_usage_ttfb(true, &model, usage_uid, &key_id, true, stream, duration_ms, pt, ct, last_ttfb_ms);
                 state.logger.log_request_ttfb(
@@ -1747,14 +1766,16 @@ pub async fn wb_tool_exec_chat(
                 Ok((completion, ws_items, resp_id))
             }
             None => {
-                state.record_usage(true, &model, "wb-toolexec", &key_id, false, stream, duration_ms, 0, 0);
+                // 失败终局带上请求级真实消耗（审查 P1：跨账号跨轮次已消耗的
+                // tokens 原硬编码 0,0 全部丢弃，含失败账号与中间轮回喂）
+                state.record_usage(true, &model, "wb-toolexec", &key_id, false, stream, duration_ms, req_acc_usage.0, req_acc_usage.1);
                 state.logger.log_request(
                     "buddy", "POST", "/v1/responses", &model, stream, 502, "wb-toolexec",
                     duration_ms, &key_name, "", last_err.as_deref(),
                 );
                 // 审查 P2：轮换耗尽收尾对齐 routes.rs——空完成主导 → 指纹拦截语义
                 Err(last_err.unwrap_or_else(|| {
-                    let (healthy_total, _) = state.wb_pool.selectable_stats_in(None);
+                    let (healthy_total, _) = state.wb_pool.selectable_stats_in(None, false);
                     let (exhaust_msg, exhaust_tag) =
                         super::routes::exhaust_message(empty_hits, tried.len(), healthy_total);
                     // issue #99 ①：影子风控收尾落原始指纹样本（chat_body 轮末已追加

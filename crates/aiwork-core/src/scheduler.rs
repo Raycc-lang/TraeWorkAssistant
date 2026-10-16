@@ -660,7 +660,12 @@ fn run_task(key: &str, st: &AppState) -> Result<Value, String> {
         //（issue #61 批次：用量刷全账号聚合缓存 workbuddy_usage_official_all_cache，
         // force 跳过 10min 缓存；原单账号缓存分支前端无调用方，属刷错目标一并修复）
         "wb-credits-snapshot" => {
-            let parsed = crate::commands::workbuddy::wb_credits_snapshot_task(st)?;
+            // 运行池句柄：网关运行池三键拨新（issue #109 同类）。main 版透传
+            // run_task 的 runtime 参数（CLI None 跳过）；docker 网关常驻单体，
+            // 经 gateway_shared() 取（None = 网关未注册，写回跳过拨新不报错）
+            let shared = crate::api_server::runtime::gateway_shared();
+            let parsed =
+                crate::commands::workbuddy::wb_credits_snapshot_task(st, shared.as_ref())?;
             let usage =
                 match crate::commands::workbuddy::workbuddy_usage_official_all_impl(st, true) {
                     Ok(_) => "已刷新",

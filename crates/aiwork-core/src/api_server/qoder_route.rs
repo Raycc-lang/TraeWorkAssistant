@@ -472,6 +472,8 @@ fn race_qoder_first_byte(
     }
     let state2 = state.clone();
     let tried2 = tried.clone();
+    // issue #111：对冲取号与主路径同口径——免费模型豁免积分维度过滤
+    let free2 = qoder_upstream::entry_is_free(entry);
     let allowed2 = allowed.cloned();
     let dedicated2 = dedicated.map(str::to_string);
     let peek2 = peek.clone();
@@ -481,7 +483,7 @@ fn race_qoder_first_byte(
     let spawn_backup = move || -> Option<(Box<dyn std::io::Read + Send>, QoderHedgeLease)> {
         let (picked2, ev) = state2
             .qoder_pool
-            .pick_excluding_constrained_ev(&tried2, allowed2.as_ref(), dedicated2.as_deref())?;
+            .pick_excluding_constrained_ev(&tried2, allowed2.as_ref(), dedicated2.as_deref(), free2)?;
         // F-77⑤ 可观测：对冲取号同样记录 busy 让位/降级事件
         if let Some(ev) = ev {
             state2.logger.log_sched_event(&ev);
@@ -675,6 +677,21 @@ fn run_qoder_stream(
         .and_then(Value::as_str)
         .unwrap_or("system")
         .to_string();
+    // issue #111：免费档模型（倍率 0）零消耗，取号豁免积分维度过滤
+    //（零积分/保留阈值/积分过期），账号级状态过滤保持不变。
+    // 免费活动覆盖（资源调度页开关）：在地区专属判定之后应用——
+    // entry_is_global_only 比较原始条目相等性，提前改写会破坏判定
+    let entry = {
+        let mut e = entry;
+        qoder_upstream::apply_flash_free_override(
+            &mut e,
+            state
+                .qoder_flash_free_rate
+                .load(std::sync::atomic::Ordering::Relaxed),
+        );
+        e
+    };
+    let free_model = qoder_upstream::entry_is_free(&entry);
 
     // F-35 子 Key 约束（qoder 池作用域；匿名/无约束 Key 全空 → 走默认调度）
     let (allowed_set, dedicated) = super::api_keys::constraints_for(&state.data_dir, key_id)
@@ -697,7 +714,7 @@ fn run_qoder_stream(
                 if allowed_set.as_ref().is_some_and(|a| !a.contains(&b.uid)) {
                     return None;
                 }
-                state.qoder_pool.pick_by_uid(&b.uid).map(|_| b.uid)
+                state.qoder_pool.pick_by_uid(&b.uid, free_model).map(|_| b.uid)
             })
     } else {
         None
@@ -718,7 +735,7 @@ fn run_qoder_stream(
     let mut first_pick: Option<super::pool::PickedAccount> = sticky0.as_ref().and_then(|u| {
         state
             .qoder_pool
-            .pick_sticky_yield(u, allowed_set.as_ref())
+            .pick_sticky_yield(u, allowed_set.as_ref(), free_model)
             .map(|(p, ev)| {
                 if let Some(ev) = ev {
                     state.logger.log_sched_event(&ev);
@@ -731,8 +748,15 @@ fn run_qoder_stream(
     let mut empty_hits: usize = 0; // 空完成计数：轮换耗尽收尾区分指纹拦截与账号耗尽
 
     loop {
-        // 客户端断连检测：通道关闭即终止轮换/重试（对齐 run_wb_stream）
+        // 客户端断连检测：通道关闭即终止轮换/重试（对齐 run_wb_stream）。
+        // 审查 M5：断连也是请求终局，补记一行失败用量（未取号 → "none"，
+        // 与下方轮换耗尽收尾同口径），防用量页 requests 缺口
         if tx.is_closed() {
+            state.record_usage_qoder(
+                model, "none", key_id, false, true,
+                start_ts.elapsed().as_millis() as u64, 0, 0, None, None, None,
+                &session_ctx(&peek),
+            );
             return;
         }
         // 模型级冷却中（并发请求刚记入窗口）：不再逐账号硬打已知故障的上游
@@ -760,7 +784,7 @@ fn run_qoder_stream(
             Some(p) => p,
             None => match state
                 .qoder_pool
-                .pick_excluding_constrained_ev(&tried, allowed_set.as_ref(), dedicated.as_deref())
+                .pick_excluding_constrained_ev(&tried, allowed_set.as_ref(), dedicated.as_deref(), free_model)
             {
                 Some((p, ev)) => {
                     if let Some(ev) = ev {
@@ -775,7 +799,7 @@ fn run_qoder_stream(
                     // 空完成主导 → 明示渠道指纹拦截语义（账号/模型无关，提示更新
                     // wb_template_map.json），否则维持无健康账号文案；
                     // code 保持 no_healthy_account（客户端兼容）
-                    let (healthy_total, _) = state.qoder_pool.selectable_stats_in(None);
+                    let (healthy_total, _) = state.qoder_pool.selectable_stats_in(None, free_model);
                     let (exhaust_msg, exhaust_tag) =
                         super::routes::exhaust_message(empty_hits, tried.len(), healthy_total);
                     state.logger.log_request(
@@ -895,8 +919,14 @@ fn run_qoder_stream(
         #[allow(unused_assignments)]
         let mut hedge_taken = false;
         loop {
-            // 断连检测：重试等待/长路径期间离开则终止（guard 随 Drop 释放）
+            // 断连检测：重试等待/长路径期间离开则终止（guard 随 Drop 释放）。
+            // 审查 M5：断连为请求终局，补记一行失败用量（已绑定 picked 账号）
             if tx.is_closed() {
+                state.record_usage_qoder(
+                    model, &picked.uid, key_id, false, true,
+                    start_ts.elapsed().as_millis() as u64, 0, 0, None, None, None,
+                    &session_ctx(&peek),
+                );
                 return;
             }
             // F-76① TTFT 采样（同 wb_route：各次尝试独立计时，竞速胜者首字即 TTFB）
@@ -948,18 +978,19 @@ fn run_qoder_stream(
                         .lock()
                         .unwrap_or_else(|e| e.into_inner())
                         .clone();
-                    let (pt, ct) = usage
-                        .as_ref()
-                        .map(|u| {
-                            (
-                                u.get("prompt_tokens").and_then(|v| v.as_u64()).unwrap_or(0),
-                                u.get("completion_tokens")
-                                    .and_then(|v| v.as_u64())
-                                    .unwrap_or(0),
-                            )
-                        })
-                        .unwrap_or((0, 0));
+                    // M1 修复（审查）：as_u64 窄口径对字符串/浮点数字段形态静默
+                    // 得 0——改用 wb_sse::u64_pair 宽口径（与 wb/Trae 记账同源）
+                    let (pt, ct) = usage.as_ref().map(wb_sse::u64_pair).unwrap_or((0, 0));
+                    // M4：缓存读 tokens 同源宽口径提取，终态旁路记账（0 值不入账）
+                    let cached = usage.as_ref().map(wb_sse::cached_tokens_of).unwrap_or(0);
                     let (credits, original_credits) = extract_billing(usage.as_ref());
+                    // issue #111：免费档调度（免费活动覆盖开启或目录价 0）消耗按 0
+                    // 落账——上游 billable=false 实际不扣分，名义值照记会虚增用量
+                    let (credits, original_credits) = if free_model {
+                        (Some(0.0), Some(0.0))
+                    } else {
+                        (credits, original_credits)
+                    };
                     // 记账改为「终态落一行」（审查修复）：此前每次尝试都无条件调用——
                     // 失败后 `break` 换号的中间态也记一次，同一逻辑请求被记成
                     // N 次（requests/errors 虚高），与非流式「每请求一行、中间态不记」
@@ -1028,6 +1059,12 @@ fn run_qoder_stream(
                                         note_model_cooldown(model, secs);
                                         queue_same += 1;
                                         if !sleep_interruptible(Duration::from_secs(secs), Some(tx)) {
+                                            // 审查 M5：断连为请求终局，补记失败终态用量
+                                            state.record_usage_qoder(
+                                                model, &win_uid, key_id, false, true,
+                                                start_ts.elapsed().as_millis() as u64, 0, 0,
+                                                None, None, None, &session_ctx(&peek),
+                                            );
                                             return; // 客户端断连：提前退出
                                         }
                                         continue;
@@ -1079,6 +1116,8 @@ fn run_qoder_stream(
                                 // 流未开始：错误不下发，允许换号重试（中间态不记账）
                                 break;
                             }
+                            // 就地收尾终局：记 usage（部分成功按实际 usage 落账）
+                            state.record_usage_cached(super::usage::UsageBucket::Qoder, cached);
                             record_usage(false);
                             state.logger.log_request_ttfb(
                                 "qoder", "POST", "/v1/chat/completions", model, true, 200,
@@ -1099,6 +1138,8 @@ fn run_qoder_stream(
                                 );
                                 return;
                             }
+                            // 成功终局：缓存读 tokens 旁路同落（M4；0 值不入账）
+                            state.record_usage_cached(super::usage::UsageBucket::Qoder, cached);
                             record_usage(true);
                             clear_model_cooldown(model); // 审查修复：成功即清模型级冷却
                             state.qoder_pool.note_success(&win_uid);
@@ -1131,6 +1172,12 @@ fn run_qoder_stream(
                                 Duration::from_millis(delay_ms.min(60_000)),
                                 Some(tx),
                             ) {
+                                // 审查 M5：断连为请求终局，补记失败终态用量
+                                state.record_usage_qoder(
+                                    model, &picked.uid, key_id, false, true,
+                                    start_ts.elapsed().as_millis() as u64, 0, 0,
+                                    None, None, None, &session_ctx(&peek),
+                                );
                                 return;
                             }
                             continue;
@@ -1277,6 +1324,19 @@ pub async fn qoder_aggregate_chat(
             .and_then(Value::as_str)
             .unwrap_or("system")
             .to_string();
+        // issue #111：免费档模型（倍率 0）零消耗，取号豁免积分维度过滤，同流式路径。
+        // 免费活动覆盖（资源调度页开关）在地区专属判定之后应用（同流式注释）
+        let entry = {
+            let mut e = entry;
+            qoder_upstream::apply_flash_free_override(
+                &mut e,
+                state
+                    .qoder_flash_free_rate
+                    .load(std::sync::atomic::Ordering::Relaxed),
+            );
+            e
+        };
+        let free_model = qoder_upstream::entry_is_free(&entry);
 
         let (allowed_set, dedicated) =
             super::api_keys::constraints_for(&state.data_dir, &key_id)
@@ -1296,7 +1356,7 @@ pub async fn qoder_aggregate_chat(
                     if allowed_set.as_ref().is_some_and(|a| !a.contains(&b.uid)) {
                         return None;
                     }
-                    state.qoder_pool.pick_by_uid(&b.uid).map(|_| b.uid)
+                    state.qoder_pool.pick_by_uid(&b.uid, free_model).map(|_| b.uid)
                 })
         } else {
             None
@@ -1314,7 +1374,7 @@ pub async fn qoder_aggregate_chat(
         let mut first_pick: Option<super::pool::PickedAccount> = sticky0.as_ref().and_then(|u| {
             state
                 .qoder_pool
-                .pick_sticky_yield(u, allowed_set.as_ref())
+                .pick_sticky_yield(u, allowed_set.as_ref(), free_model)
                 .map(|(p, ev)| {
                     if let Some(ev) = ev {
                         state.logger.log_sched_event(&ev);
@@ -1334,6 +1394,7 @@ pub async fn qoder_aggregate_chat(
                     &tried,
                     allowed_set.as_ref(),
                     dedicated.as_deref(),
+                    free_model,
                 ) {
                     Some((p, ev)) => {
                         if let Some(ev) = ev {
@@ -1357,7 +1418,7 @@ pub async fn qoder_aggregate_chat(
                             &session_ctx(&peek),
                         );
                         // 审查 P2：轮换耗尽收尾对齐 routes.rs——空完成主导 → 指纹拦截语义
-                        let (healthy_total, _) = state.qoder_pool.selectable_stats_in(None);
+                        let (healthy_total, _) = state.qoder_pool.selectable_stats_in(None, free_model);
                         let (exhaust_msg, exhaust_tag) =
                             super::routes::exhaust_message(empty_hits, tried.len(), healthy_total);
                         // issue #99 ①：影子风控收尾落原始指纹样本（非流式路径无收尾
@@ -1482,21 +1543,22 @@ pub async fn qoder_aggregate_chat(
                         match (resp, error) {
                             (Some(mut r), None) => {
                                 r["model"] = json!(model);
-                                let (pt, ct) = r
-                                    .get("usage")
-                                    .map(|u| {
-                                        (
-                                            u.get("prompt_tokens")
-                                                .and_then(|v| v.as_u64())
-                                                .unwrap_or(0),
-                                            u.get("completion_tokens")
-                                                .and_then(|v| v.as_u64())
-                                                .unwrap_or(0),
-                                        )
-                                    })
-                                    .unwrap_or((0, 0));
+                                // M1 修复（审查）：as_u64 窄口径改 wb_sse::u64_pair
+                                // 宽口径（字符串/浮点形态不再静默得 0）
+                                let (pt, ct) = r.get("usage").map(wb_sse::u64_pair).unwrap_or((0, 0));
                                 let (credits, original_credits) =
                                     extract_billing(r.get("usage"));
+                                // issue #111：免费档调度消耗按 0 落账（同流式路径注释）
+                                let (credits, original_credits) = if free_model {
+                                    (Some(0.0), Some(0.0))
+                                } else {
+                                    (credits, original_credits)
+                                };
+                                // M4：缓存读 tokens 旁路记账（成功终局，0 值不入账）
+                                state.record_usage_cached(
+                                    super::usage::UsageBucket::Qoder,
+                                    r.get("usage").map(wb_sse::cached_tokens_of).unwrap_or(0),
+                                );
                                 state.record_usage_qoder(
                                     &model, &win_uid, &key_id, true, stream, duration_ms, pt, ct,
                                     Some(ttfb_ms),

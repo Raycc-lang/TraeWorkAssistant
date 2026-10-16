@@ -81,6 +81,10 @@ pub struct ApiSharedState {
     pub wb_pool_sticky_ttl_secs: std::sync::atomic::AtomicU64,
     /// Qoder 池粘性 TTL 秒（per-pool，默认 300）
     pub qoder_pool_sticky_ttl_secs: std::sync::atomic::AtomicU64,
+    /// Qwen3.8-Flash 免费活动倍率覆盖（issue #111，默认开）：开启时该模型目录
+    /// 倍率按 0 处理——展示 0× + 取号豁免零积分过滤；上游活动结束后关闭恢复
+    /// 官方同步倍率（api_pool.json.qoder_flash_free_rate 持久化）
+    pub qoder_flash_free_rate: std::sync::atomic::AtomicBool,
     /// Trae 池参与调度开关（api_pool.json.trae_enabled，默认开）：关闭后 Trae 目录
     /// 模型不路由 Trae 池（每个资源池管理自己的开关，与 wb_enabled/qoder_enabled 同族）
     pub trae_enabled: std::sync::atomic::AtomicBool,
@@ -240,6 +244,26 @@ impl ApiSharedState {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .push((usage::UsageBucket::Custom, day));
+    }
+
+    /// 记录一次上游缓存读 tokens 测量（M4 审查修复：DayStats 新增 cached_tokens
+    /// 维度的旁路入口——record_usage 系列签名被 15+ 调用点依赖，不扩参；
+    /// 上游未下发 usage 的调用方不调用本方法，0 值不入账不标脏）
+    pub fn record_usage_cached(&self, bucket: usage::UsageBucket, cached: u64) {
+        if cached == 0 {
+            return;
+        }
+        let mut guard = self
+            .usage
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        guard.record_cached_in(bucket, cached);
+        let day = usage::today_key();
+        drop(guard);
+        self.usage_dirty
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push((bucket, day));
     }
 
     /// 记录一次 Qoder 请求用量（独立 qoder_days 桶，与 Trae/WB/Custom 分账）；
@@ -759,6 +783,7 @@ mod inflight_tests {
             trae_pool_sticky_ttl_secs: AtomicU64::new(0),
             wb_pool_sticky_ttl_secs: AtomicU64::new(0),
             qoder_pool_sticky_ttl_secs: AtomicU64::new(0),
+            qoder_flash_free_rate: std::sync::atomic::AtomicBool::new(true),
             trae_sticky: wb_sticky::StickyStore::default(),
             wb_sticky: wb_sticky::StickyStore::default(),
             pool_sticky: Mutex::new(std::collections::HashMap::new()),

@@ -3,7 +3,10 @@
 //! 三态（docs/sqllite-storage-plan.md §三）：
 //! - 正常：解析 → 写库 → `fs::rename` 到 `backup/<相对路径>`；
 //! - 损坏：JSON 解析失败 → 移 `backup/corrupt/`（对齐 read_json「坏文件回退默认」）；
-//! - 失败：IO/DB 错误 → 保留原位，下次启动重试（不置 user_version）。
+//! - 失败：IO/DB 错误 → 保留原位，下次启动重试（不置 user_version）；
+//!   「导入成功但移动失败」（杀软/句柄占用 rename 失败）→ 记 kv 待移动集合
+//!   （migration_pending_move），重跑时跳过导入仅补移动——防止残留旧 JSON
+//!   以陈旧内容整体覆盖运行期 kv（H2 审查修复）。
 //!
 //! 全部条目处理完且零失败才置 `PRAGMA user_version = 1`；明细落
 //! `data/backup/migration_manifest.json`。失败不阻断启动（返回摘要由调用方写日志）。
@@ -86,9 +89,18 @@ enum ImportStatus {
 /// 迁移入口。返回 None = 无需迁移（库已是最新）；Some = 摘要（调用方写 app_log）。
 pub fn migrate_on_startup(data_dir: &Path) -> Option<String> {
     let store = db(data_dir);
-    let current = store
-        .with_conn(|c| Ok(schema::user_version(c)))
-        .unwrap_or(0);
+    // M6 修复（审查）：user_version 读取失败不再 fail-open 按 0 处理——库异常时
+    // 盲目重跑迁移会让残留旧 JSON 覆盖运行期 kv。读失败 → 落日志跳过本轮
+    let current = match store.with_conn(|c| Ok(schema::user_version(c))) {
+        Ok(v) => v,
+        Err(e) => {
+            crate::fs_utils::app_log(
+                data_dir,
+                &format!("[迁移] user_version 读取失败，跳过本轮迁移: {e}"),
+            );
+            return None;
+        }
+    };
     if current >= schema::SCHEMA_VERSION {
         return None;
     }
@@ -98,17 +110,64 @@ pub fn migrate_on_startup(data_dir: &Path) -> Option<String> {
     let mut imported = 0usize;
     let mut corrupt = 0usize;
     let mut missing = 0usize;
+    // H2 修复（审查）：上轮「导入成功但移动失败」的文件集合（kv 持久化）。
+    // 重跑时这些文件跳过导入、仅重试移动——否则 rename 失败的残留 JSON 会以
+    // 陈旧内容整体覆盖运行期 kv（app_settings、api_pool 等用户已改的键被回滚）。
+    // 读取失败 fail-closed 跳过本轮（集合状态未知时盲目导入同样有覆盖风险）
+    let mut pending_move: std::collections::BTreeSet<String> = match load_pending_move(&store) {
+        Ok(s) => s,
+        Err(e) => {
+            crate::fs_utils::app_log(
+                data_dir,
+                &format!("[迁移] 待移动集合读取失败，跳过本轮迁移: {e}"),
+            );
+            return None;
+        }
+    };
     // 已成功导入的正牌文件集合（遗留根路径兜底仅在其正牌文件缺失时执行，
     // 防止根路径残留覆盖 data/ 正牌数据）
     let mut imported_rels: std::collections::HashSet<String> = Default::default();
 
     for (rel, key) in KV_ENTRIES {
+        // H2：上轮已导入仅剩移动未完成 → 跳过导入（防陈旧覆盖），只重试移动。
+        // 仍计入 imported_rels（导入确已发生），供根路径残留垃圾清理判定
+        if pending_move.contains(*rel) {
+            imported_rels.insert(rel.to_string());
+            if !data_dir.join(rel).exists() {
+                pending_move.remove(*rel);
+                missing += 1;
+                items.push(json!({"file": rel, "result": "missing", "scope": "pending_move"}));
+                continue;
+            }
+            match move_to_backup(data_dir, rel, false) {
+                Ok(()) => {
+                    pending_move.remove(*rel);
+                    imported += 1;
+                    items.push(json!({"file": rel, "result": "moved", "scope": "pending_move", "target": format!("kv:{key}")}));
+                }
+                Err(e) => {
+                    failed += 1;
+                    items.push(json!({"file": rel, "result": "move_failed", "detail": e.to_string()}));
+                }
+            }
+            continue;
+        }
         match import_kv(&store, data_dir, rel, key) {
             ItemResult::Imported => {
                 imported += 1;
                 imported_rels.insert(rel.to_string());
-                items.push(json!({"file": rel, "result": "imported", "target": format!("kv:{key}")}));
-                move_to_backup(data_dir, rel, false);
+                match move_to_backup(data_dir, rel, false) {
+                    Ok(()) => {
+                        items.push(json!({"file": rel, "result": "imported", "target": format!("kv:{key}")}));
+                    }
+                    Err(e) => {
+                        // H2：导入已入库但移动失败——记 pending 集合，failed++ 使版本号
+                        // 不置位；重跑只补移动，绝不重导（防运行期 kv 被陈旧内容覆盖）
+                        pending_move.insert(rel.to_string());
+                        failed += 1;
+                        items.push(json!({"file": rel, "result": "imported_but_move_failed", "detail": e.to_string(), "target": format!("kv:{key}")}));
+                    }
+                }
             }
             ItemResult::Missing => {
                 missing += 1;
@@ -116,8 +175,17 @@ pub fn migrate_on_startup(data_dir: &Path) -> Option<String> {
             }
             ItemResult::Corrupt(e) => {
                 corrupt += 1;
-                items.push(json!({"file": rel, "result": "corrupt", "detail": e}));
-                move_to_backup(data_dir, rel, true);
+                match move_to_backup(data_dir, rel, true) {
+                    Ok(()) => {
+                        items.push(json!({"file": rel, "result": "corrupt", "detail": e}));
+                    }
+                    // 损坏文件未入库、无覆盖风险：留原位，重跑再判 Corrupt 再移；
+                    // failed++ 保证版本号不置位、移动有重试兜底
+                    Err(m) => {
+                        failed += 1;
+                        items.push(json!({"file": rel, "result": "corrupt_move_failed", "detail": format!("{e}; 移动失败: {m}")}));
+                    }
+                }
             }
             ItemResult::Error(e) => {
                 failed += 1;
@@ -127,6 +195,29 @@ pub fn migrate_on_startup(data_dir: &Path) -> Option<String> {
     }
 
     for (rel, importer) in DOC_ENTRIES {
+        // H2：上轮已导入仅剩移动未完成 → 跳过导入，只重试移动（同 KV 组）
+        if pending_move.contains(*rel) {
+            imported_rels.insert(rel.to_string());
+            let path = data_dir.join(rel);
+            if !path.exists() {
+                pending_move.remove(*rel);
+                missing += 1;
+                items.push(json!({"file": rel, "result": "missing", "scope": "pending_move"}));
+                continue;
+            }
+            match move_to_backup(data_dir, rel, false) {
+                Ok(()) => {
+                    pending_move.remove(*rel);
+                    imported += 1;
+                    items.push(json!({"file": rel, "result": "moved", "scope": "pending_move"}));
+                }
+                Err(e) => {
+                    failed += 1;
+                    items.push(json!({"file": rel, "result": "move_failed", "detail": e.to_string()}));
+                }
+            }
+            continue;
+        }
         let path = data_dir.join(rel);
         if !path.exists() {
             missing += 1;
@@ -137,13 +228,29 @@ pub fn migrate_on_startup(data_dir: &Path) -> Option<String> {
             ImportStatus::Ok => {
                 imported += 1;
                 imported_rels.insert(rel.to_string());
-                items.push(json!({"file": rel, "result": "imported"}));
-                move_to_backup(data_dir, rel, false);
+                match move_to_backup(data_dir, rel, false) {
+                    Ok(()) => {
+                        items.push(json!({"file": rel, "result": "imported"}));
+                    }
+                    Err(e) => {
+                        // H2：导入成功但移动失败 → 记 pending，重跑只补移动
+                        pending_move.insert(rel.to_string());
+                        failed += 1;
+                        items.push(json!({"file": rel, "result": "imported_but_move_failed", "detail": e.to_string()}));
+                    }
+                }
             }
             ImportStatus::Corrupt(e) => {
                 corrupt += 1;
-                items.push(json!({"file": rel, "result": "corrupt", "detail": e}));
-                move_to_backup(data_dir, rel, true);
+                match move_to_backup(data_dir, rel, true) {
+                    Ok(()) => {
+                        items.push(json!({"file": rel, "result": "corrupt", "detail": e}));
+                    }
+                    Err(m) => {
+                        failed += 1;
+                        items.push(json!({"file": rel, "result": "corrupt_move_failed", "detail": format!("{e}; 移动失败: {m}")}));
+                    }
+                }
             }
             ImportStatus::Error(e) => {
                 failed += 1;
@@ -153,6 +260,26 @@ pub fn migrate_on_startup(data_dir: &Path) -> Option<String> {
     }
 
     for (name, kv_key) in LEGACY_ROOT {
+        // H2：上轮已导入仅剩移动未完成 → 跳过导入，只重试移动
+        if pending_move.contains(*name) {
+            if !data_dir.join(name).exists() {
+                pending_move.remove(*name);
+                items.push(json!({"file": name, "result": "missing", "scope": "pending_move"}));
+                continue;
+            }
+            match move_legacy_root_to_backup(data_dir, name) {
+                Ok(()) => {
+                    pending_move.remove(*name);
+                    imported += 1;
+                    items.push(json!({"file": name, "result": "moved", "scope": "pending_move"}));
+                }
+                Err(e) => {
+                    failed += 1;
+                    items.push(json!({"file": name, "result": "move_failed", "detail": e.to_string()}));
+                }
+            }
+            continue;
+        }
         let path = data_dir.join(name);
         if !path.exists() {
             continue;
@@ -160,7 +287,11 @@ pub fn migrate_on_startup(data_dir: &Path) -> Option<String> {
         // 正牌文件（data/ 下同名）已导入 → 根路径残留仅作垃圾清理
         if imported_rels.contains(&format!("data/{name}")) {
             items.push(json!({"file": name, "result": "skipped_stale", "scope": "legacy_root"}));
-            move_legacy_root_to_backup(data_dir, name);
+            if let Err(e) = move_legacy_root_to_backup(data_dir, name) {
+                // 垃圾清理失败无数据风险，计入 failed 让下轮重试
+                failed += 1;
+                items.push(json!({"file": name, "result": "stale_move_failed", "detail": e.to_string()}));
+            }
             continue;
         }
         let result = match kv_key {
@@ -178,12 +309,19 @@ pub fn migrate_on_startup(data_dir: &Path) -> Option<String> {
             ItemResult::Imported => {
                 imported += 1;
                 items.push(json!({"file": name, "result": "imported", "scope": "legacy_root"}));
-                move_legacy_root_to_backup(data_dir, name);
+                if let Err(e) = move_legacy_root_to_backup(data_dir, name) {
+                    pending_move.insert(name.to_string());
+                    failed += 1;
+                    items.push(json!({"file": name, "result": "imported_but_move_failed", "detail": e.to_string()}));
+                }
             }
             ItemResult::Corrupt(_) => {
                 corrupt += 1;
                 items.push(json!({"file": name, "result": "corrupt", "scope": "legacy_root"}));
-                move_legacy_root_to_backup(data_dir, name);
+                if let Err(e) = move_legacy_root_to_backup(data_dir, name) {
+                    failed += 1;
+                    items.push(json!({"file": name, "result": "corrupt_move_failed", "detail": e.to_string()}));
+                }
             }
             ItemResult::Missing => {}
             ItemResult::Error(e) => {
@@ -193,9 +331,17 @@ pub fn migrate_on_startup(data_dir: &Path) -> Option<String> {
         }
     }
 
-    // 全部条目处理完且零失败才置版本号（有失败保留原位，下次启动重试）。
-    // 设计取舍：单文件失败 → 整体重跑（已导入文件已移入 backup 记 missing，幂等无害；
-    // 代价是失败期间每次启动重写 manifest，属可接受日志噪音）。
+    // 待移动集合持久化（H2）：空集合同样写入，语义 = 无待移动。写失败按迁移
+    // 失败计（版本号不置位）——集合丢失会让下轮把已导入未移走的文件误判为
+    // 待导入，重新导入覆盖运行期 kv
+    if let Err(e) = save_pending_move(&store, &pending_move) {
+        failed += 1;
+        items.push(json!({"file": "<pending_move>", "result": "error", "detail": e}));
+    }
+    // 全部条目处理完且零失败才置版本号（有失败保留原位/或记入待移动集合，
+    // 下次启动重试）。设计取舍：单文件失败 → 整体重跑；「已导入但移动失败」
+    // 由 pending 集合保护、跳过重导仅补移动（H2），其余已移走文件记 missing
+    // 幂等无害；代价是失败期间每次启动重写 manifest，属可接受日志噪音。
     if failed == 0 {
         // P6 v1→v2 增量：老库 kv 中三个流水键搬入表（v0 全新导入路径键已由 DOC_ENTRIES 处理，此处空转）
         if let Err(e) = migrate_kv_flows_v1_to_v2(&store) {
@@ -219,10 +365,17 @@ pub fn migrate_on_startup(data_dir: &Path) -> Option<String> {
         }
     }
     if failed == 0 {
-        let _ = store.with_conn(|c| {
+        // M6 修复（审查）：版本号写失败不再静默——文件已移 backup，下轮空转
+        // 重试（幂等无害），但吞错会掩盖库异常
+        if let Err(e) = store.with_conn(|c| {
             schema::set_user_version(c, schema::SCHEMA_VERSION);
             Ok(())
-        });
+        }) {
+            crate::fs_utils::app_log(
+                data_dir,
+                &format!("[迁移] user_version 写入失败（下轮空转重试）: {e}"),
+            );
+        }
     }
 
     // 明细清单落 backup/
@@ -288,8 +441,29 @@ fn to_item(s: ImportStatus) -> ItemResult {
     }
 }
 
-/// 原文件移入 backup/（保留 conf/data 相对路径前缀；corrupt=true 时入 backup/corrupt/）
-fn move_to_backup(data_dir: &Path, rel: &str, corrupt: bool) {
+/// H2：待移动集合 kv 键（导入成功但 rename 失败的文件；见 migrate_on_startup）
+const MIGRATION_PENDING_MOVE: &str = "migration_pending_move";
+
+fn load_pending_move(store: &Store) -> Result<std::collections::BTreeSet<String>, String> {
+    match store.kv_get_raw_checked(MIGRATION_PENDING_MOVE)? {
+        None => Ok(Default::default()),
+        Some(raw) => serde_json::from_str(&raw).map_err(|e| format!("解析失败: {e}")),
+    }
+}
+
+fn save_pending_move(
+    store: &Store,
+    set: &std::collections::BTreeSet<String>,
+) -> Result<(), String> {
+    let text =
+        serde_json::to_string(set).map_err(|e| format!("序列化失败: {e}"))?;
+    store.kv_set_raw(MIGRATION_PENDING_MOVE, &text)
+}
+
+/// 原文件移入 backup/（保留 conf/data 相对路径前缀；corrupt=true 时入 backup/corrupt/）。
+/// H2 修复（审查）：rename 失败不再静默吞掉——上抛由调用方计入 failed 并记入
+/// 待移动集合，防止重跑重导覆盖运行期 kv
+fn move_to_backup(data_dir: &Path, rel: &str, corrupt: bool) -> std::io::Result<()> {
     let src = data_dir.join(rel);
     let file_name = Path::new(rel)
         .file_name()
@@ -300,26 +474,50 @@ fn move_to_backup(data_dir: &Path, rel: &str, corrupt: bool) {
         .join("backup")
         .join(if corrupt { "corrupt" } else { "" });
     let dst = backup_dir.join(rel);
-    let _ = std::fs::create_dir_all(dst.parent().unwrap_or(&backup_dir));
+    std::fs::create_dir_all(dst.parent().unwrap_or(&backup_dir))?;
     if dst.exists() {
-        // 同名冲突：加时间戳后缀，绝不覆盖既有备份
+        // 同名冲突：加时间戳后缀，绝不覆盖既有备份；时间戳撞名（同秒迁移两个
+        // 同名文件）时递增序号后缀（.2/.3/…）直至找到空位——Windows rename 会
+        // 静默覆盖已存在目标，仅秒级时间戳时同秒第二个文件会吞掉第一个（审查 P2）
         let stamped = format!(
             "{}_{}",
             file_name.trim_end_matches(".json"),
             chrono::Local::now().format("%Y%m%d%H%M%S")
         );
-        let _ = std::fs::rename(&src, dst.with_file_name(format!("{stamped}.json")));
-        return;
+        let mut cand = dst.with_file_name(format!("{stamped}.json"));
+        let mut seq = 2u32;
+        while cand.exists() {
+            cand = dst.with_file_name(format!("{stamped}.{seq}.json"));
+            seq += 1;
+        }
+        return std::fs::rename(&src, cand);
     }
-    let _ = std::fs::rename(&src, dst);
+    std::fs::rename(&src, dst)
 }
 
-/// 遗留根路径文件 → backup/legacy_root/
-fn move_legacy_root_to_backup(data_dir: &Path, name: &str) {
+/// 遗留根路径文件 → backup/legacy_root/（H2：rename 失败上抛；绝不覆盖：
+/// 目标已存在时加时间戳后缀，时间戳同秒撞名再递增序号（.2/.3/…）——
+/// Windows rename 会静默覆盖（审查 P2））
+fn move_legacy_root_to_backup(data_dir: &Path, name: &str) -> std::io::Result<()> {
     let src = data_dir.join(name);
     let dir = data_dir.join("data").join("backup").join("legacy_root");
-    let _ = std::fs::create_dir_all(&dir);
-    let _ = std::fs::rename(&src, dir.join(name));
+    std::fs::create_dir_all(&dir)?;
+    let dst = dir.join(name);
+    if !dst.exists() {
+        return std::fs::rename(&src, dst);
+    }
+    let stamped = format!(
+        "{}_{}",
+        name.trim_end_matches(".json"),
+        chrono::Local::now().format("%Y%m%d%H%M%S")
+    );
+    let mut cand = dir.join(format!("{stamped}.json"));
+    let mut seq = 2u32;
+    while cand.exists() {
+        cand = dir.join(format!("{stamped}.{seq}.json"));
+        seq += 1;
+    }
+    std::fs::rename(&src, cand)
 }
 
 // ── 结构化导入器（读原 struct → docs::save；解析失败 = Corrupt）──────────────

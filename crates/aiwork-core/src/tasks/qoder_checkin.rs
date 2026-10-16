@@ -13,8 +13,10 @@
 //! 双活动；失败进入 30 分钟起步的指数退避重试冷却（scheduler retry_cooldown_ms 同源，
 //! 连续失败 30→60→120 分钟封顶）。
 //!
-//! 风控合规内建（§5.2）：claim 间隔 1~3s 抖动；绝不重试轰炸；设备指纹经
-//! effective_creds 注入（§5.10 每账号稳定绑定，真实捕获优先）。
+//! 风控合规内建（§5.2）：claim 间隔 1~3s 抖动；绝不重试轰炸；claim POST 与列表
+//! 补学统一最小头形态（issue #114：claim 端点带设备指纹头族被上游风控按形态
+//! 拦截 503 RISK_DEPENDENCY_UNAVAILABLE，最小头通过——探针 + 4/4 账号到账实证）；
+//! 主列表/余额 GET 维持完整头主请求形态。
 //! 红线：全程零 token 输出（凭证不入日志/事件）。
 
 use serde_json::{json, Value};
@@ -340,9 +342,13 @@ fn recheck_claimed(
 
 /// 单个 campaign 领取。返回 (kind, message, reward)：success / already / fail。
 /// 幂等：重复调用 replayed=true 归类 already（非错误）。
+/// claim POST 与网络异常复查 GET 均用 `minimal_auth_headers(access_token)` 最小头
+/// 形态（issue #114）：claim 端点带设备指纹头族被上游风控按形态拦截（503
+/// RISK_DEPENDENCY_UNAVAILABLE），最小头通过（同 IP 同 token 同 id 探针 + 4/4
+/// 账号到账实证）。
 fn claim_one(
     agent: &ureq::Agent,
-    headers: &[(String, String)],
+    access_token: &str,
     urls: &QoderUrls,
     campaign: &Value,
 ) -> (String, String, Option<f64>) {
@@ -375,15 +381,17 @@ fn claim_one(
         qoder_common::OPEN_API_BASE,
         campaign_id
     );
+    // 最小头形态（issue #114，见函数注释）：本函数内 claim POST 与复查 GET 共用
+    let headers = minimal_auth_headers(access_token);
     jitter_sleep();
-    let (status, body, raw) = post_empty(agent, &url, headers);
+    let (status, body, raw) = post_empty(agent, &url, &headers);
     if status == 401 {
         return ("auth".into(), "登录态失效（401）".into(), None);
     }
     if status == 0 {
         // 网络不可达 ≠ 必然失败：claim 可能已到达服务端但响应丢失，
         // 复查 campaigns（GET 幂等安全），已变 CLAIMED 视为已领（M1 复查恢复）
-        if recheck_claimed(agent, headers, urls, &campaign_id) {
+        if recheck_claimed(agent, &headers, urls, &campaign_id) {
             return (
                 "already".into(),
                 "claim 网络异常，复查确认已领取".into(),
@@ -665,9 +673,15 @@ fn load_campaign_table(state: &AppState) -> Vec<(String, String)> {
 /// 最小头（只带鉴权四件套）请求头：不带设备指纹头族（Cosy-MachineId/MachineToken/
 /// Version/MachineOS/MachineHostname/MachineCode/MachineType）。
 ///
-/// 依据（2026-10-14 19:26 探针实证）：上游 campaigns 列表按请求形态分桶投放，
-/// 带派生设备头的容器形态全天看不到 CLAIMABLE 条目，同 IP 同 token 的最小头
-/// 请求可见；claim 端点两形态均可用。仅用于列表学习，不替代主请求形态。
+/// 依据（探针实证，同 IP 同 token 对照）：
+/// - 2026-10-14 19:26：campaigns 列表按请求形态分桶投放，带派生设备头的容器
+///   形态全天看不到 CLAIMABLE 条目，最小头请求可见（当时 claim 端点两形态均可用）；
+/// - 2026-10-16（issue #114）：上游风控升级为按头形态拦截 claim——完整头一律
+///   503 RISK_DEPENDENCY_UNAVAILABLE，最小头 200 CLAIMED（4/4 账号签到到账）。
+///
+/// 现列表学习、**全部 claim POST**（claim_one / blind_round）与网络异常复查
+/// GET（claim_one → recheck_claimed）统一走最小头；
+/// 主列表 / 余额 GET 维持完整头主请求形态不变。
 fn minimal_auth_headers(access_token: &str) -> Vec<(String, String)> {
     vec![
         (
@@ -785,14 +799,23 @@ enum BlindStep {
     Failed(u16),
 }
 
-fn classify_blind_step(status: u16, claimed: Option<&str>, replayed: bool) -> BlindStep {
+fn classify_blind_step(status: u16, claimed: Option<&str>, replayed: bool, kind: Option<&str>) -> BlindStep {
     if status == 401 {
         return BlindStep::Auth;
     }
     if (200..=201).contains(&status) {
         return match claimed {
-            Some("CLAIMED") if !replayed => BlindStep::FreshClaim,
-            Some("CLAIMED") => BlindStep::Replay,
+            Some("CLAIMED") => {
+                // 奖励类型防线（审查 P2）：领取响应 benefit.kind 显式非 CREDITS
+                //（如 BOGO）时不判 FreshClaim/Replay——盲发目标是每日积分活动，
+                // 非积分领取伪装成 success / 非积分回放伪装成 already 都会掩盖
+                // 「积分未领」的真话；kind 缺失不降级（宁不判负不误杀真实
+                // success，与 benefit_is_credits 缺失从严的对称取舍）
+                if kind.is_some_and(|k| !k.eq_ignore_ascii_case("CREDITS")) {
+                    return BlindStep::Failed(status);
+                }
+                if replayed { BlindStep::Replay } else { BlindStep::FreshClaim }
+            }
             // 200 但非 CLAIMED 形态（未知响应结构）不宽容——盲发语义已探针锁定
             _ => BlindStep::Failed(status),
         };
@@ -806,6 +829,7 @@ fn classify_blind_step(status: u16, claimed: Option<&str>, replayed: bool) -> Bl
 /// - 200/BLOCKED：服务端风控明确拒绝本次领取（非依赖故障、非瞬时错误），
 ///   提示到真实客户端建立设备信任
 /// - 503/RISK_DEPENDENCY_UNAVAILABLE：风控前置依赖暂不可用，调度器会自动重试
+///   （issue #114 修复后 claim 已用最小头形态，此形态下仍 503 说明上游风控再升级）
 /// - 409/CAMPAIGN_NOT_ACTIVE：候选 campaignId 过期（活动每日轮换，issue #66），
 ///   重学习机制将自动补正
 fn describe_blind_failure(code: u16, claimed: Option<&str>, raw: &str) -> String {
@@ -813,7 +837,7 @@ fn describe_blind_failure(code: u16, claimed: Option<&str>, raw: &str) -> String
         return "服务端风控拦截（status=BLOCKED，本次领取被拒绝）——请在 Qoder 客户端正常登录/使用一次建立设备信任后重试".into();
     }
     if code == 503 && raw.contains("RISK_DEPENDENCY_UNAVAILABLE") {
-        return "服务端风控依赖暂不可用（503 RISK_DEPENDENCY_UNAVAILABLE），稍后将自动重试".into();
+        return "服务端风控依赖暂不可用（503 RISK_DEPENDENCY_UNAVAILABLE），稍后将自动重试（本请求已用最小头形态，若持续出现说明上游风控再升级，请关注工具更新）".into();
     }
     // 409 CAMPAIGN_NOT_ACTIVE（issue #66 健壮性②）：明确归因为「候选 id 错」
     // 而非账号/网络错——盲发到已过期的每日活动 id 的特征形态，给准确提示
@@ -837,8 +861,10 @@ enum FallbackOutcome {
     Auth(Option<f64>),
     /// 存在失败条目（4xx/5xx/网络/未知形态）——如实报 fail，触发调度器
     /// 指数退避重试 + UI 显示真话（即使同时有成功条目：claim 幂等，重试轮次
-    /// 以列表已领判定/回放确认，不产生重复领取副作用）
-    Failed(String),
+    /// 以列表已领判定/回放确认，不产生重复领取副作用）。已累计 reward 随行
+    /// 不丢弃（真实入账不因整体 fail 而回滚，对齐 Auth 变体语义；无成功场景
+    /// 下必为 None——统一透传防未来演进丢账，审查 P3）
+    Failed(String, Option<f64>),
 }
 
 /// 盲发兜底聚合判定（纯函数，可单测）。优先级：
@@ -862,7 +888,7 @@ fn aggregate_fallback(
         if any_fresh {
             msg = format!("{}；{}", messages.join("；"), msg);
         }
-        return FallbackOutcome::Failed(msg);
+        return FallbackOutcome::Failed(msg, reward);
     }
     if any_fresh {
         return FallbackOutcome::Success(messages.join("；"), reward);
@@ -871,9 +897,9 @@ fn aggregate_fallback(
         return FallbackOutcome::AlreadyReplayed;
     }
     if !stale_parts.is_empty() {
-        return FallbackOutcome::Failed(stale_parts.join("；"));
+        return FallbackOutcome::Failed(stale_parts.join("；"), reward);
     }
-    FallbackOutcome::Failed("已知每日活动表为空，无兜底可尝试".into())
+    FallbackOutcome::Failed("已知每日活动表为空，无兜底可尝试".into(), reward)
 }
 
 /// 盲发单轮聚合中间态（纯数据，可单测）：一圈候选的归类结果，
@@ -935,13 +961,16 @@ impl BlindRound {
 /// classify_blind_step 归类；任一 401 → 置 auth 标记中断遍历（调用方据此上报
 /// `Auth`，已累计 reward 随行不丢弃，对齐 claim_one auth 语义）。409 过期 id
 /// 会从 `learned` 与 `table` 原地剔除（&mut），同轮后续账号不再重复盲发。
+/// claim POST 一律最小头形态（由 `access_token` 现场构建，issue #114：完整头
+/// 被上游风控按形态 503 拦截，最小头通过）。
 fn blind_round(
     agent: &ureq::Agent,
-    headers: &[(String, String)],
+    access_token: &str,
     candidates: &[(String, String)],
     learned: &mut Vec<(String, String)>,
     table: &mut Vec<(String, String)>,
 ) -> BlindRound {
+    let headers = minimal_auth_headers(access_token);
     let mut round = BlindRound {
         messages: Vec::new(),
         fail_parts: Vec::new(),
@@ -963,7 +992,7 @@ fn blind_round(
             qoder_common::OPEN_API_BASE
         );
         jitter_sleep();
-        let (status, body, raw) = post_empty(agent, &url, headers);
+        let (status, body, raw) = post_empty(agent, &url, &headers);
         let claimed = body
             .as_ref()
             .and_then(|b| fs_utils::dig(b, &["status", "data.status"]))
@@ -973,7 +1002,14 @@ fn blind_round(
             .and_then(|b| fs_utils::dig(b, &["replayed", "data.replayed"]))
             .and_then(Value::as_bool)
             .unwrap_or(false);
-        match classify_blind_step(status, claimed.as_deref(), replayed) {
+        // 领取响应的奖励类型（benefit.kind，与 FreshClaim 分支 amount 同路径）：
+        // 供 classify_blind_step 校验非 CREDITS 领取不误报 success/already
+        let kind = body
+            .as_ref()
+            .and_then(|b| b.get("benefit"))
+            .and_then(|x| x.get("kind"))
+            .and_then(Value::as_str);
+        match classify_blind_step(status, claimed.as_deref(), replayed, kind) {
             BlindStep::Auth => {
                 round.auth = true;
                 return round;
@@ -1028,12 +1064,15 @@ fn blind_round(
 /// 学得新 id 立即补一轮盲发——原实现只承诺「将从活动列表自动重学」却把
 /// 自愈寄望于调度器下一轮，学习产空 + 硬编码过期时即全天 409 死循环。
 /// 重试轮与首轮经 BlindRound::merge 合并后统一定级（409 归 stale 的掩码语义不变）。
+///
+/// 整条兜底链路（盲发 claim + 内部重学 GET）均最小头形态（`access_token` 现场构建，
+/// issue #114：claim 端点完整头被风控 503 拦截；重学 GET 用最小头视野为完整头
+/// 形态的超集——CLAIMABLE 条目可见，学习可见性只增不减）。
 fn known_daily_fallback(
     state: &AppState,
     agent: &ureq::Agent,
-    headers: &[(String, String)],
     urls: &QoderUrls,
-    min_token: &str,
+    access_token: &str,
     learned: &mut Vec<(String, String)>,
     table: &mut Vec<(String, String)>,
 ) -> FallbackOutcome {
@@ -1044,7 +1083,7 @@ fn known_daily_fallback(
         }
     }
     let tried: Vec<String> = candidates.iter().map(|(cid, _)| cid.clone()).collect();
-    let first = blind_round(agent, headers, &candidates, learned, table);
+    let first = blind_round(agent, access_token, &candidates, learned, table);
     // 401 中断：上报 Auth 走账号级凭证刷新自愈（已累计 reward 随行，不重学不重试）
     if first.auth {
         return FallbackOutcome::Auth(first.reward);
@@ -1055,16 +1094,17 @@ fn known_daily_fallback(
     // 当轮重学（两级）：① 重取列表（fetch_campaigns 允许空表——空表 = 学不到），
     // 宽松档学习；② 仍空则最小头补学（容器形态列表分桶投放下 CLAIMABLE 不可见，
     // 主形态重学必然扑空的兜底）。两级均仅取**未试过**的 id（409 剔除只动
-    // learned/table，tried 防重学撞旧 id）
+    // learned/table，tried 防重学撞旧 id）。
+    // 重学 GET 用最小头（同上：视野超集，CLAIMABLE 可见，学习更稳）
     let mut retry: Vec<(String, String)> = Vec::new();
-    if let Ok(campaigns) = fetch_campaigns(agent, headers, urls) {
+    if let Ok(campaigns) = fetch_campaigns(agent, &minimal_auth_headers(access_token), urls) {
         merge_learned(&mut retry, learn_daily_campaign_ids_lenient(&campaigns));
     }
     retry.retain(|(cid, _)| !tried.iter().any(|t| t == cid));
     if retry.is_empty() {
         merge_learned(
             &mut retry,
-            learn_from_min_headers(state, agent, min_token, urls, chrono::Utc::now().timestamp()),
+            learn_from_min_headers(state, agent, access_token, urls, chrono::Utc::now().timestamp()),
         );
         retry.retain(|(cid, _)| !tried.iter().any(|t| t == cid));
     }
@@ -1073,7 +1113,7 @@ fn known_daily_fallback(
     }
     // 重学结果入共享池（跨账号复用；若重试轮再 409 会被 blind_round 剔除）
     merge_learned(learned, retry.clone());
-    let second = blind_round(agent, headers, &retry, learned, table);
+    let second = blind_round(agent, access_token, &retry, learned, table);
     let merged = first.merge(second);
     if merged.auth {
         return FallbackOutcome::Auth(merged.reward);
@@ -1086,6 +1126,8 @@ fn known_daily_fallback(
 /// id 直接惠及后续账号，campaign id 全局有效与账号无关）。
 /// `table`：本轮共享的盲发候选常量表（conf 覆盖表 + 内置表），409 过期 id 剔除
 /// 跨账号生效。
+/// `shared`：网关运行态（gateway_shared()，None = CLI 独立进程/未注册），
+/// CREDITS 奖励增量回写 qoder_pool（见尾部回写注释）。
 fn process_account(
     state: &AppState,
     agent: &ureq::Agent,
@@ -1093,6 +1135,7 @@ fn process_account(
     opts: &QoderCheckinOpts,
     learned: &mut Vec<(String, String)>,
     table: &mut Vec<(String, String)>,
+    shared: Option<&std::sync::Arc<crate::api_server::ApiSharedState>>,
 ) -> Value {
     let aid = s_of(acct.get("id"));
     let name = acct
@@ -1109,8 +1152,10 @@ fn process_account(
     if creds.access_token.is_empty() {
         let mut ev = json!({ "user_id": aid, "name": base_ev["name"], "status": "fail",
                        "message": format!("无可用凭证（{note}）") });
-        if note == "auth_dead" {
-            // 凭证为空且刷新令牌已被永久拒绝：同样属终态，单列免全天重试
+        // 审查 M11：no_credential（store 无凭证）与 auth_dead 同属终态——重试
+        // 不会凭空产生凭证，单列免全天无效重试；refresh_failed/refresh_busy 为
+        // 暂态不标记（调度器冷却后自动重试）
+        if note == "auth_dead" || note == "no_credential" {
             ev["fail_kind"] = json!(PERMANENT_AUTH_TAG);
         }
         return ev;
@@ -1148,8 +1193,9 @@ fn process_account(
     // 体现为余额增长，不能凭「余额未动」判未到账——仅全 CREDITS 时才启用降级；
     // 盲发兜底候选口径强制 CREDITS，天然保持 true）
     let mut all_credits = true;
-    // 最小头补学的鉴权令牌（2026-10-14 固化：容器形态列表看不到 CLAIMABLE，
-    // 最小头形态可见；凭证就绪后捕获一次，学习路径共用；401 刷新后同步更新）
+    // 最小头形态请求的令牌（PR #106 移植 + issue #114 扩展：列表补学与全部
+    // claim POST 均经 minimal_auth_headers 用此令牌走最小头——claim 端点带设备
+    // 指纹头族被上游风控 503 拦截，最小头通过；401 刷新成功后随新令牌更新）
     let mut min_token = creds.access_token.clone();
 
     let (mut kind, mut message, mut reward) = match list_campaigns(agent, &headers, &urls) {
@@ -1187,15 +1233,7 @@ fn process_account(
                 if daily_credits_claimed_in_list(&campaigns, now) {
                     ("already".into(), "每日奖励已领取".into(), None)
                 } else {
-                    match known_daily_fallback(
-                        state,
-                        agent,
-                        &headers,
-                        &urls,
-                        &min_token,
-                        learned,
-                        table,
-                    ) {
+                    match known_daily_fallback(state, agent, &urls, &min_token, learned, table) {
                         FallbackOutcome::Success(m, r) => ("success".into(), m, r),
                         FallbackOutcome::AlreadyReplayed => {
                             ("already".into(), "每日奖励已领取（盲发回放确认）".into(), None)
@@ -1203,7 +1241,7 @@ fn process_account(
                         FallbackOutcome::Auth(r) => {
                             ("auth".into(), "登录态失效（401）".into(), r)
                         }
-                        FallbackOutcome::Failed(m) => ("fail".into(), m, None),
+                        FallbackOutcome::Failed(m, r) => ("fail".into(), m, r),
                     }
                 }
             } else {
@@ -1219,7 +1257,7 @@ fn process_account(
                         c,
                         &["name", "title", "campaignName", "campaign_name"],
                     ));
-                    let (k, m, r) = claim_one(agent, &headers, &urls, c);
+                    let (k, m, r) = claim_one(agent, &min_token, &urls, c);
                     if k == "auth" {
                         kind = "auth".into();
                         auth_msg = m;
@@ -1276,8 +1314,9 @@ fn process_account(
             Some(new) => {
                 qoder_common::sync_pool_expiry(state, &aid, &new);
                 headers = qoder_common::build_auth_headers(&new);
-                // 移植修正（PR #106 原实现重试路径误用旧令牌）：刷新成功后
-                // min_token 同步更新为当前有效令牌，最小头补学才不会 401 失败
+                // 最小头令牌（列表补学 + claim POST）随刷新同步更新（PR #106 /
+                // issue #114：重试路径的补学与 claim 均须用新令牌，旧令牌已被
+                // 一次性轮换作废，用旧令牌补学必 401）
                 min_token = new.access_token.clone();
                 let retry = match list_campaigns(agent, &headers, &urls) {
                     Ok(campaigns) => {
@@ -1309,13 +1348,7 @@ fn process_account(
                                 ("already".into(), "每日奖励已领取".into(), None)
                             } else {
                                 match known_daily_fallback(
-                                    state,
-                                    agent,
-                                    &headers,
-                                    &urls,
-                                    &min_token,
-                                    learned,
-                                    table,
+                                    state, agent, &urls, &min_token, learned, table,
                                 ) {
                                     FallbackOutcome::Success(m, r) => ("success".into(), m, r),
                                     FallbackOutcome::AlreadyReplayed => (
@@ -1326,7 +1359,7 @@ fn process_account(
                                     FallbackOutcome::Auth(r) => {
                                         ("auth".into(), "登录态失效（401）".into(), r)
                                     }
-                                    FallbackOutcome::Failed(m) => ("fail".into(), m, None),
+                                    FallbackOutcome::Failed(m, r) => ("fail".into(), m, r),
                                 }
                             }
                         } else {
@@ -1343,7 +1376,7 @@ fn process_account(
                                     c,
                                     &["name", "title", "campaignName", "campaign_name"],
                                 ));
-                                let (k, m, r) = claim_one(agent, &headers, &urls, c);
+                                let (k, m, r) = claim_one(agent, &min_token, &urls, c);
                                 // 与首次路径同口径：非 CREDITS 成功 → 不凭余额判未到账
                                 if k == "success" && !benefit_is_credits(c) {
                                     all_credits = false;
@@ -1405,20 +1438,47 @@ fn process_account(
     //   会被误判未到账）
     // - 本轮含非 CREDITS 活动（all_credits=false）→ 不判负防误杀（余额无法归因
     //   非 CREDITS 奖励是否到账）
-    // - 回读前 jitter_sleep 留出上游入账最终一致窗口（兼风控抖动）；回读失败
-    //  （None）不判负——余额端点故障不应推翻已成功的领取
+    // - 审查 M12：原「单次 jitter_sleep + 单次回读」遇上游入账延迟超出单次窗口
+    //   （1~3s）会误判未到账 → 降级 fail 触发整轮重签；改最多 3 次回读，到账
+    //  （post > pre）即提前采信，3 轮成功回读均未增长才降级
+    // - 回读失败（None）不判负——余额端点故障不应推翻已成功的领取
     if kind == "success" && pre_balance.is_some() {
-        jitter_sleep();
-        if let Some(post) = super::qoder_credits::fetch_usage_balance(agent, &headers) {
-            if let Some(pre) = pre_balance {
-                if reward.is_none() && post > pre {
-                    reward = Some(post - pre);
-                }
-                if all_credits && post <= pre {
-                    kind = "fail".into();
-                    message = format!("{message}；但余额未增长（未到账），保留自动重试");
-                    reward = None;
-                }
+        let mut flat_reads: u32 = 0; // 成功回读且未增长的次数
+        let mut arrived = false;
+        for _attempt in 0..3 {
+            jitter_sleep();
+            let Some(post) = super::qoder_credits::fetch_usage_balance(agent, &headers) else {
+                continue; // 回读失败：本轮作废重试；3 轮全失败则 flat_reads=0 不判负
+            };
+            let Some(pre) = pre_balance else { break; };
+            if reward.is_none() && post > pre {
+                reward = Some(post - pre);
+            }
+            if post > pre {
+                arrived = true;
+                break;
+            }
+            flat_reads += 1;
+            if !all_credits {
+                break; // 余额无法归因非 CREDITS 奖励：不判负，无需重读（原口径）
+            }
+        }
+        if all_credits && !arrived && flat_reads > 0 {
+            kind = "fail".into();
+            message = format!("{message}；但余额未增长（未到账），保留自动重试");
+            reward = None;
+        }
+    }
+    // 签到奖励运行期回写（对齐 qoder_credits::run_snapshot_task 的 issue #102 口径）：
+    // CREDITS 奖励是真实入账，拨进网关 qoder_pool 防止「签到充值成功后账号仍被零积分
+    // 过滤持续排除到下次快照」（默认 every_hours 2h / daily 档最长约 13.5h）。
+    // 仅回写 credits 增量 + fetched_at，expire 以快照为准不动；未到账降级已置
+    // reward=None 天然不回写；非 CREDITS 活动（BOGO 等）金额不进余额无法归因，
+    // 不回写；差值兜底采信（reward 从余额差值派生）同样覆盖
+    if all_credits {
+        if let (Some(shared), Some(r)) = (shared, reward) {
+            if r > 0.0 {
+                shared.qoder_pool.apply_credits_delta(&aid, r);
             }
         }
     }
@@ -1461,14 +1521,24 @@ fn process_account(
     if let Some(camps) = campaigns_detail.filter(|c| !c.is_empty()) {
         ev["campaigns"] = Value::Array(camps);
     }
-    if kind == "success" && note == "refreshed" {
-        ev["message"] = json!(format!("{}（凭证已续期）", ev["message"].as_str().unwrap_or("")));
+    // 审查 Low：refreshed_unsaved（续期成功但持久化失败）同样是「已续期」，
+    // 不标注会让用户误以为凭证已安全保存；尾缀如实区分两种形态
+    if kind == "success" && (note == "refreshed" || note == "refreshed_unsaved") {
+        let suffix = if note == "refreshed_unsaved" {
+            "凭证已续期，但保存失败，下次仍会重复刷新"
+        } else {
+            "凭证已续期"
+        };
+        ev["message"] = json!(format!("{}（{suffix}）", ev["message"].as_str().unwrap_or("")));
     }
     ev
 }
 
 /// 签到整轮：逐账号串行处理，事件经 emit 回调逐条输出（NDJSON 管线复用）。
 /// 返回 done 事件（ok/already/failed 计数），供启动补签/调度静默路径直接消费。
+/// 网关运行态共享句柄（docker 适配：main 版取 Mutex<Option<ApiServerRuntime>> 句柄
+/// 参数并四调用点接线；server 单体网关常驻注册全局共享状态，直取 gateway_shared()，
+/// CLI 独立任务模式未注册自然为 None——与 run_snapshot_task 先例同款）。
 pub fn run_checkin_round(state: &AppState, opts: &QoderCheckinOpts, emit: &mut dyn FnMut(&Value)) -> Value {
     // 跨进程互斥（审查 P1）：schtasks CLI（--task-run qoder-checkin）与应用内调度器
     // 默认同为 10:15 触发，双进程对同账号并发 ensure_fresh 会以同一 refresh_token
@@ -1517,13 +1587,21 @@ pub fn run_checkin_round(state: &AppState, opts: &QoderCheckinOpts, emit: &mut d
     let mut campaign_table = load_campaign_table(state);
     // 多账号签到间隔（任务配置页可改，默认 3s，0=关闭）：防上游频控，账号间串行等待
     let gap_secs = crate::models::effective_checkin_gap(state.settings().qoder_checkin_gap_secs);
+    let shared = crate::api_server::runtime::gateway_shared();
     for (i, acct) in accounts.iter().enumerate() {
         if i > 0 && gap_secs > 0 {
             std::thread::sleep(std::time::Duration::from_secs(gap_secs));
         }
         // 单账号失败不中断整轮（对齐 wb try/except 语义）
-        let mut ev =
-            process_account(state, &agent, acct, opts, &mut learned_ids, &mut campaign_table);
+        let mut ev = process_account(
+            state,
+            &agent,
+            acct,
+            opts,
+            &mut learned_ids,
+            &mut campaign_table,
+            shared.as_ref(),
+        );
         ev["index"] = json!(i + 1);
         emit(&ev);
         events.push(ev);
@@ -1701,27 +1779,61 @@ mod tests {
     }
 
     /// 盲发单步归类：非明确成功/回放形态一律 Failed（宁 fail 不假 already）；
-    /// 401 单列走 auth 自愈
+    /// 401 单列走 auth 自愈；显式非 CREDITS 领取不误报 success/already
     #[test]
     fn blind_step_classification() {
         use BlindStep::*;
-        // 200+CLAIMED+!replayed → 真实新领取
-        assert!(matches!(classify_blind_step(200, Some("CLAIMED"), false), FreshClaim));
-        assert!(matches!(classify_blind_step(201, Some("CLAIMED"), false), FreshClaim));
+        // 200+CLAIMED+!replayed → 真实新领取（kind 缺失不降级：宁不判负不误杀真实 success）
+        assert!(matches!(classify_blind_step(200, Some("CLAIMED"), false, None), FreshClaim));
+        assert!(matches!(classify_blind_step(201, Some("CLAIMED"), false, None), FreshClaim));
         // 幂等回放
-        assert!(matches!(classify_blind_step(200, Some("CLAIMED"), true), Replay));
+        assert!(matches!(classify_blind_step(200, Some("CLAIMED"), true, None), Replay));
         // 200 但非 CLAIMED 形态（未知响应结构）→ Failed（不再宽容吞掉）
-        assert!(matches!(classify_blind_step(200, None, false), Failed(200)));
+        assert!(matches!(classify_blind_step(200, None, false, None), Failed(200)));
         assert!(matches!(
-            classify_blind_step(200, Some("PENDING"), false),
+            classify_blind_step(200, Some("PENDING"), false, None),
             Failed(200)
         ));
         // 4xx/5xx/网络 status=0 → Failed
-        assert!(matches!(classify_blind_step(400, None, false), Failed(400)));
-        assert!(matches!(classify_blind_step(500, None, false), Failed(500)));
-        assert!(matches!(classify_blind_step(0, None, false), Failed(0)));
+        assert!(matches!(classify_blind_step(400, None, false, None), Failed(400)));
+        assert!(matches!(classify_blind_step(500, None, false, None), Failed(500)));
+        assert!(matches!(classify_blind_step(0, None, false, None), Failed(0)));
         // 401 → Auth
-        assert!(matches!(classify_blind_step(401, None, false), Auth));
+        assert!(matches!(classify_blind_step(401, None, false, None), Auth));
+
+        // ── 奖励类型防线（审查 P2）：benefit.kind 非 CREDITS 的领取不误报 ──
+        // ① CREDITS 正向（含大小写宽容）→ FreshClaim / Replay 不受影响
+        assert!(matches!(
+            classify_blind_step(200, Some("CLAIMED"), false, Some("CREDITS")),
+            FreshClaim
+        ));
+        assert!(matches!(
+            classify_blind_step(200, Some("CLAIMED"), false, Some("credits")),
+            FreshClaim
+        ));
+        // ② 显式非 CREDITS（如 BOGO）的领取 → 降级 Failed（不误报 success）
+        assert!(matches!(
+            classify_blind_step(200, Some("CLAIMED"), false, Some("BOGO")),
+            Failed(200)
+        ));
+        // ③ 显式非 CREDITS 的回放 → 降级 Failed（不误报 already）
+        assert!(matches!(
+            classify_blind_step(200, Some("CLAIMED"), true, Some("BOGO")),
+            Failed(200)
+        ));
+        // ④ CREDITS 回放 → Replay 保持
+        assert!(matches!(
+            classify_blind_step(200, Some("CLAIMED"), true, Some("CREDITS")),
+            Replay
+        ));
+        // ⑤ kind 缺失 → 不降级（宁不判负不误杀真实 success）
+        assert!(matches!(classify_blind_step(200, Some("CLAIMED"), false, None), FreshClaim));
+        assert!(matches!(classify_blind_step(200, Some("CLAIMED"), true, None), Replay));
+        // ⑥ 401 Auth 优先，不受 kind 遮蔽
+        assert!(matches!(
+            classify_blind_step(401, Some("CLAIMED"), false, Some("BOGO")),
+            Auth
+        ));
     }
 
     /// 盲发失败消息构造：BLOCKED/风控依赖不可用给可操作提示（不倾倒原始
@@ -1762,6 +1874,31 @@ mod tests {
             describe_blind_failure(409, None, r#"{"message":"conflict"}"#),
             r#"（HTTP 409）{"message":"conflict"}"#
         );
+    }
+
+    /// issue #114 回归防线：最小头只含鉴权四件套，绝不携带设备指纹头族——
+    /// claim 端点带指纹头被上游风控按形态拦截（503 RISK_DEPENDENCY_UNAVAILABLE），
+    /// 全部 claim 路径（claim_one / blind_round）都经本函数构建请求头
+    #[test]
+    fn minimal_auth_headers_excludes_device_fingerprint_family() {
+        let h = minimal_auth_headers("tok");
+        let keys: Vec<String> = h.iter().map(|(k, _)| k.to_ascii_lowercase()).collect();
+        assert_eq!(keys.len(), 4, "最小头应恰为鉴权四件套：{keys:?}");
+        for k in ["authorization", "cosy-clienttype", "user-agent", "content-type"] {
+            assert!(keys.iter().any(|x| x == k), "最小头缺 {k}：{keys:?}");
+        }
+        for k in [
+            "cosy-machineid",
+            "cosy-machinetoken",
+            "cosy-version",
+            "cosy-machineos",
+            "cosy-machinehostname",
+            "cosy-machinecode",
+            "cosy-machinetype",
+        ] {
+            assert!(!keys.iter().any(|x| x == k), "最小头不得携带设备指纹头 {k}");
+        }
+        assert_eq!(h[0].1, "Bearer tok");
     }
 
     /// 重学习（issue #66 健壮性①）：不要求 claimStatus（CLAIMED/CLAIMABLE 均学），
@@ -1979,7 +2116,7 @@ mod tests {
         let merged = stale_only().merge(stale_only());
         assert!(matches!(
             merged.aggregate(),
-            FallbackOutcome::Failed(m) if m.matches("stale").count() == 2
+            FallbackOutcome::Failed(m, None) if m.matches("stale").count() == 2
         ));
     }
 
@@ -1998,24 +2135,25 @@ mod tests {
             aggregate_fallback(false, true, &[], &[], &["stale".to_string()], None),
             FallbackOutcome::AlreadyReplayed
         ));
-        // 仅 stale → 如实 Failed（触发重试，重试轮次重学 id）
+        // 仅 stale → 如实 Failed（触发重试，重试轮次重学 id）；reward 无成功来源 → None
         assert!(matches!(
             aggregate_fallback(false, false, &[], &[], &["stale".to_string()], None),
-            FallbackOutcome::Failed(m) if m.contains("stale")
+            FallbackOutcome::Failed(m, None) if m.contains("stale")
         ));
-        // 真实失败掩码一切（含新鲜成功：宁 fail 不假 success）
+        // 真实失败掩码一切（含新鲜成功：宁 fail 不假 success）——但已领到的
+        // reward 随行不丢弃（真实入账不因整体 fail 而回滚，对齐 Auth 语义）
         assert!(matches!(
             aggregate_fallback(true, false, &fresh, &["real fail".to_string()], &["stale".to_string()], Some(100.0)),
-            FallbackOutcome::Failed(m) if m.contains("real fail") && m.contains("盲发直领")
+            FallbackOutcome::Failed(m, Some(100.0)) if m.contains("real fail") && m.contains("盲发直领")
         ));
         assert!(matches!(
             aggregate_fallback(false, true, &[], &["real fail".to_string()], &[], None),
-            FallbackOutcome::Failed(m) if m.contains("real fail")
+            FallbackOutcome::Failed(m, None) if m.contains("real fail")
         ));
-        // 全空（表空/全被白名单拦下）→ Failed 兜底
+        // 全空（表空/全被白名单拦下）→ Failed 兜底；空表 reward 必为 None（透传等价）
         assert!(matches!(
             aggregate_fallback(false, false, &[], &[], &[], None),
-            FallbackOutcome::Failed(m) if m.contains("表为空")
+            FallbackOutcome::Failed(m, None) if m.contains("表为空")
         ));
     }
 
@@ -2148,6 +2286,19 @@ mod tests {
                 "[C 盲发claim {cid}] HTTP {st3} body={}",
                 body3.as_ref().map(|b| b.to_string()).unwrap_or_else(|| {
                     raw3.chars().take(300).collect()
+                })
+            );
+            // D 组（issue #114 探针口径）：最小头盲发 claim 对照——上游风控按请求
+            // 头形态拦截 claim（2026-10-16 实证：完整头 503 RISK_DEPENDENCY_
+            // UNAVAILABLE，最小头 200 CLAIMED 4/4 账号到账）。C/D 两组同 IP 同
+            // token 同 id 对照，风控再变时直接锁定拦截面
+            std::thread::sleep(std::time::Duration::from_millis(1500));
+            let (st4, body4, raw4) =
+                post_empty(&agent, &c_url, &minimal_auth_headers(&creds.access_token));
+            println!(
+                "[D 最小头claim {cid}] HTTP {st4} body={}",
+                body4.as_ref().map(|b| b.to_string()).unwrap_or_else(|| {
+                    raw4.chars().take(300).collect()
                 })
             );
         }
