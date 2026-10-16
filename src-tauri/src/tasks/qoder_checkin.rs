@@ -13,8 +13,10 @@
 //! 双活动；失败进入 30 分钟起步的指数退避重试冷却（scheduler retry_cooldown_ms 同源，
 //! 连续失败 30→60→120 分钟封顶）。
 //!
-//! 风控合规内建（§5.2）：claim 间隔 1~3s 抖动；绝不重试轰炸；设备指纹经
-//! effective_creds 注入（§5.10 每账号稳定绑定，真实捕获优先）。
+//! 风控合规内建（§5.2）：claim 间隔 1~3s 抖动；绝不重试轰炸；claim POST 与列表
+//! 补学统一最小头形态（issue #114：claim 端点带设备指纹头族被上游风控按形态
+//! 拦截 503 RISK_DEPENDENCY_UNAVAILABLE，最小头通过——探针 + 4/4 账号到账实证）；
+//! 主列表/余额 GET 维持完整头主请求形态。
 //! 红线：全程零 token 输出（凭证不入日志/事件）。
 
 use serde_json::{json, Value};
@@ -365,9 +367,13 @@ fn recheck_claimed(
 
 /// 单个 campaign 领取。返回 (kind, message, reward)：success / already / fail。
 /// 幂等：重复调用 replayed=true 归类 already（非错误）。
+/// claim POST 与网络异常复查 GET 均用 `minimal_auth_headers(access_token)` 最小头
+/// 形态（issue #114）：claim 端点带设备指纹头族被上游风控按形态拦截（503
+/// RISK_DEPENDENCY_UNAVAILABLE），最小头通过（同 IP 同 token 同 id 探针 + 4/4
+/// 账号到账实证）。
 fn claim_one(
     agent: &ureq::Agent,
-    headers: &[(String, String)],
+    access_token: &str,
     urls: &QoderUrls,
     campaign: &Value,
 ) -> (String, String, Option<f64>) {
@@ -400,15 +406,17 @@ fn claim_one(
         qoder_common::OPEN_API_BASE,
         campaign_id
     );
+    // 最小头形态（issue #114，见函数注释）：本函数内 claim POST 与复查 GET 共用
+    let headers = minimal_auth_headers(access_token);
     jitter_sleep();
-    let (status, body, raw) = post_empty(agent, &url, headers);
+    let (status, body, raw) = post_empty(agent, &url, &headers);
     if status == 401 {
         return ("auth".into(), "登录态失效（401）".into(), None);
     }
     if status == 0 {
         // 网络不可达 ≠ 必然失败：claim 可能已到达服务端但响应丢失，
         // 复查 campaigns（GET 幂等安全），已变 CLAIMED 视为已领（M1 复查恢复）
-        if recheck_claimed(agent, headers, urls, &campaign_id) {
+        if recheck_claimed(agent, &headers, urls, &campaign_id) {
             return (
                 "already".into(),
                 "claim 网络异常，复查确认已领取".into(),
@@ -690,9 +698,15 @@ fn load_campaign_table(state: &AppState) -> Vec<(String, String)> {
 /// 最小头（只带鉴权四件套）请求头：不带设备指纹头族（Cosy-MachineId/MachineToken/
 /// Version/MachineOS/MachineHostname/MachineCode/MachineType）。
 ///
-/// 依据（2026-10-14 19:26 探针实证）：上游 campaigns 列表按请求形态分桶投放，
-/// 带派生设备头的容器形态全天看不到 CLAIMABLE 条目，同 IP 同 token 的最小头
-/// 请求可见；claim 端点两形态均可用。仅用于列表学习，不替代主请求形态。
+/// 依据（探针实证，同 IP 同 token 对照）：
+/// - 2026-10-14 19:26：campaigns 列表按请求形态分桶投放，带派生设备头的容器
+///   形态全天看不到 CLAIMABLE 条目，最小头请求可见（当时 claim 端点两形态均可用）；
+/// - 2026-10-16（issue #114）：上游风控升级为按头形态拦截 claim——完整头一律
+///   503 RISK_DEPENDENCY_UNAVAILABLE，最小头 200 CLAIMED（4/4 账号签到到账）。
+///
+/// 现列表学习、**全部 claim POST**（claim_one / blind_round）与网络异常复查
+/// GET（claim_one → recheck_claimed）统一走最小头；
+/// 主列表 / 余额 GET 维持完整头主请求形态不变。
 fn minimal_auth_headers(access_token: &str) -> Vec<(String, String)> {
     vec![
         ("Authorization".to_string(), format!("Bearer {access_token}")),
@@ -839,6 +853,7 @@ fn classify_blind_step(status: u16, claimed: Option<&str>, replayed: bool, kind:
 /// - 200/BLOCKED：服务端风控明确拒绝本次领取（非依赖故障、非瞬时错误），
 ///   提示到真实客户端建立设备信任
 /// - 503/RISK_DEPENDENCY_UNAVAILABLE：风控前置依赖暂不可用，调度器会自动重试
+///   （issue #114 修复后 claim 已用最小头形态，此形态下仍 503 说明上游风控再升级）
 /// - 409/CAMPAIGN_NOT_ACTIVE：候选 campaignId 过期（活动批次轮换，issue #66），
 ///   重学习机制（主列表 + 最小头补学）将自动补正
 fn describe_blind_failure(code: u16, claimed: Option<&str>, raw: &str) -> String {
@@ -846,7 +861,7 @@ fn describe_blind_failure(code: u16, claimed: Option<&str>, raw: &str) -> String
         return "服务端风控拦截（status=BLOCKED，本次领取被拒绝）——请在 Qoder 客户端正常登录/使用一次建立设备信任后重试".into();
     }
     if code == 503 && raw.contains("RISK_DEPENDENCY_UNAVAILABLE") {
-        return "服务端风控依赖暂不可用（503 RISK_DEPENDENCY_UNAVAILABLE），稍后将自动重试".into();
+        return "服务端风控依赖暂不可用（503 RISK_DEPENDENCY_UNAVAILABLE），稍后将自动重试（本请求已用最小头形态，若持续出现说明上游风控再升级，请关注工具更新）".into();
     }
     // 409 CAMPAIGN_NOT_ACTIVE（issue #66 健壮性②）：明确归因为「候选 id 错」
     // 而非账号/网络错——盲发到已过期的每日活动 id 的特征形态，给准确提示
@@ -993,13 +1008,16 @@ impl BlindRound {
 /// `Auth`，已累计 reward 随行不丢弃，对齐 claim_one auth 语义）。409 过期 id
 /// 会从 `learned` 与 `table` 原地剔除（&mut），同轮后续账号不再重复盲发同一 409
 ///（table 是整轮共享的候选池，剔除跨账号生效）。
+/// claim POST 一律最小头形态（由 `access_token` 现场构建，issue #114：完整头
+/// 被上游风控按形态 503 拦截，最小头通过）。
 fn blind_round(
     agent: &ureq::Agent,
-    headers: &[(String, String)],
+    access_token: &str,
     candidates: &[(String, String)],
     learned: &mut Vec<(String, String)>,
     table: &mut Vec<(String, String)>,
 ) -> BlindRound {
+    let headers = minimal_auth_headers(access_token);
     let mut round = BlindRound {
         messages: Vec::new(),
         fail_parts: Vec::new(),
@@ -1022,7 +1040,7 @@ fn blind_round(
             qoder_common::OPEN_API_BASE
         );
         jitter_sleep();
-        let (status, body, raw) = post_empty(agent, &url, headers);
+        let (status, body, raw) = post_empty(agent, &url, &headers);
         let claimed = body
             .as_ref()
             .and_then(|b| fs_utils::dig(b, &["status", "data.status"]))
@@ -1102,9 +1120,13 @@ fn blind_round(
 /// 重学，学得新 id 立即补一轮盲发——原实现只承诺「将从活动列表自动重学」却把
 /// 自愈寄望于调度器下一轮，学习产空 + 硬编码过期时即全天 409 死循环。
 /// 重试轮与首轮经 BlindRound::merge 合并后统一定级（409 归 stale 的掩码语义不变）。
+///
+/// 整条兜底链路（盲发 claim + 内部重学 GET）均最小头形态（`access_token` 现场构建，
+/// issue #114：claim 端点完整头被风控 503 拦截；重学 GET 用最小头视野为完整头
+/// 形态的超集——CLAIMABLE 条目可见，学习可见性只增不减）。
 fn known_daily_fallback(
     agent: &ureq::Agent,
-    headers: &[(String, String)],
+    access_token: &str,
     urls: &QoderUrls,
     learned: &mut Vec<(String, String)>,
     table: &mut Vec<(String, String)>,
@@ -1116,7 +1138,7 @@ fn known_daily_fallback(
         }
     }
     let tried: Vec<String> = candidates.iter().map(|(cid, _)| cid.clone()).collect();
-    let first = blind_round(agent, headers, &candidates, learned, table);
+    let first = blind_round(agent, access_token, &candidates, learned, table);
     // 401 中断：上报 Auth 走账号级凭证刷新自愈（已累计 reward/明细随行，不重学不重试）
     if first.auth {
         return FallbackOutcome::Auth(first.reward, first.detail);
@@ -1125,9 +1147,10 @@ fn known_daily_fallback(
         return first.aggregate();
     }
     // 当轮重学：重取列表（fetch_campaigns 允许空表——空表 = 学不到 = 放弃重试），
-    // 宽松档学习，仅取**未试过**的 id（409 剔除只动 learned/table，tried 防重学撞旧 id）
+    // 宽松档学习，仅取**未试过**的 id（409 剔除只动 learned/table，tried 防重学撞旧 id）。
+    // 重学 GET 用最小头（同上：视野超集，CLAIMABLE 可见，学习更稳）
     let mut retry: Vec<(String, String)> = Vec::new();
-    if let Ok(campaigns) = fetch_campaigns(agent, headers, urls) {
+    if let Ok(campaigns) = fetch_campaigns(agent, &minimal_auth_headers(access_token), urls) {
         merge_learned(&mut retry, learn_daily_campaign_ids_lenient(&campaigns));
     }
     retry.retain(|(cid, _)| !tried.iter().any(|t| t == cid));
@@ -1136,7 +1159,7 @@ fn known_daily_fallback(
     }
     // 重学结果入共享池（跨账号复用；若重试轮再 409 会被 blind_round 剔除）
     merge_learned(learned, retry.clone());
-    let second = blind_round(agent, headers, &retry, learned, table);
+    let second = blind_round(agent, access_token, &retry, learned, table);
     let merged = first.merge(second);
     if merged.auth {
         return FallbackOutcome::Auth(merged.reward, merged.detail);
@@ -1150,54 +1173,46 @@ fn known_daily_fallback(
 /// 一次（learn_from_min_headers），拿到新 id 立即重试盲发——同轮自愈，不等
 /// 调度器下一轮（旧实现 409 后只能等 30 分钟起步的退避重试，且主列表视野对
 /// 容器形态不可见 CLAIMABLE 时永远收敛不了）。
-/// 注意：过期候选虽已在首轮盲发中从 learned/table 剔除，但宽松档重学不校验
-/// 时间窗、可能把同一批过期 id 学回——故补学结果须过滤「本轮已判 409 过期」
-/// 的 id（pre-post 差集）再入共享池，否则重试轮会再次盲发同一过期 id 白吃
-/// 一次 409（审查修复；重试判据同步收紧为「过滤后确有新 id」）。
+/// 注意：宽松档补学不校验时间窗，可能学回本轮已被 409 剔除的过期 id——合并前
+/// 按首轮候选全集快照（learned ∪ table）过滤，重试候选只含未试过的新 id
+///（过期候选虽已在首轮盲发中从 learned/table 剔除，直接入池会让重试轮再次
+/// 盲发同一过期 id 白吃一次 409；重试判据同步收紧为「过滤后确有新 id」）。
+///
+/// 全链路最小头形态（issue #114）：`access_token` 为唯一请求身份入参，盲发
+/// claim 与两路补学 GET 均经 `minimal_auth_headers` 构建，不带设备指纹头族。
 fn fallback_with_relearn(
     state: &AppState,
     agent: &ureq::Agent,
-    headers: &[(String, String)],
-    urls: &QoderUrls,
     access_token: &str,
+    urls: &QoderUrls,
     learned: &mut Vec<(String, String)>,
     table: &mut Vec<(String, String)>,
 ) -> FallbackOutcome {
-    // 首轮候选 id 全集快照：409 过期 id 会被 blind_round 从 learned/table 原地
-    // 剔除，pre-post 差集即「本轮已判过期」名单
-    let pre_ids: std::collections::HashSet<String> = learned
-        .iter()
-        .chain(table.iter())
-        .map(|(id, _)| id.clone())
-        .collect();
-    let outcome = known_daily_fallback(agent, headers, urls, learned, table);
-    if let FallbackOutcome::Failed(m, ..) = &outcome {
+    // 快照本轮已盲发过的候选全集：409 剔除只动 learned/table，本快照不受影响
+    let mut attempted: Vec<String> = learned.iter().map(|(c, _)| c.clone()).collect();
+    for (cid, _) in table.iter() {
+        if !attempted.iter().any(|c| c == cid) {
+            attempted.push(cid.clone());
+        }
+    }
+    let outcome = known_daily_fallback(agent, access_token, urls, learned, table);
+    if let FallbackOutcome::Failed(m, _, _) = &outcome {
         if m.contains(CAMPAIGN_NOT_ACTIVE_TAG) {
-            let stale: std::collections::HashSet<String> = pre_ids
-                .into_iter()
-                .filter(|id| {
-                    !learned.iter().any(|(e, _)| e == id)
-                        && !table.iter().any(|(e, _)| e == id)
-                })
-                .collect();
-            let found = learn_from_min_headers(
+            let before = learned.len();
+            let found: Vec<(String, String)> = learn_from_min_headers(
                 state,
                 agent,
                 access_token,
                 urls,
                 chrono::Utc::now().timestamp(),
-            );
-            // 只留「新学得且非本轮已判过期」的 id（merge_learned 仅去重不滤过期，
-            // 直接入池会让重试轮再次盲发同一 409 id）
-            let fresh: Vec<(String, String)> = found
-                .into_iter()
-                .filter(|(id, _)| {
-                    !stale.contains(id) && !learned.iter().any(|(e, _)| e == id)
-                })
-                .collect();
-            if !fresh.is_empty() {
-                merge_learned(learned, fresh);
-                return known_daily_fallback(agent, headers, urls, learned, table);
+            )
+            .into_iter()
+            .filter(|(cid, _)| !attempted.iter().any(|c| c == cid))
+            .collect();
+            merge_learned(learned, found);
+            // 过滤后 merge 仍增长 = 确有未试过的新 id 才值得重试盲发
+            if learned.len() > before {
+                return known_daily_fallback(agent, access_token, urls, learned, table);
             }
         }
     }
@@ -1209,6 +1224,8 @@ fn fallback_with_relearn(
 /// id 直接惠及后续账号，campaign id 全局有效与账号无关）。
 /// `table`：本轮共享的盲发候选常量表（conf 覆盖表 + 内置表，PR #106 移植），
 /// 409 过期 id 剔除跨账号生效。
+/// `shared`：GUI 进程内网关运行态（None = CLI 独立进程），CREDITS 奖励增量回写
+/// qoder_pool（见尾部回写注释）。
 fn process_account(
     state: &AppState,
     agent: &ureq::Agent,
@@ -1216,7 +1233,7 @@ fn process_account(
     opts: &QoderCheckinOpts,
     learned: &mut Vec<(String, String)>,
     table: &mut Vec<(String, String)>,
-    runtime: Option<&std::sync::Mutex<Option<crate::commands::api_server::ApiServerRuntime>>>,
+    shared: Option<&std::sync::Arc<crate::api_server::ApiSharedState>>,
 ) -> Value {
     let aid = s_of(acct.get("id"));
     let name = acct
@@ -1274,8 +1291,9 @@ fn process_account(
     // 体现为余额增长，不能凭「余额未动」判未到账——仅全 CREDITS 时才启用降级；
     // 盲发兜底候选口径强制 CREDITS，天然保持 true）
     let mut all_credits = true;
-    // 最小头补学的鉴权头（PR #106 移植：容器形态列表看不到 CLAIMABLE，最小头
-    // 形态可见；凭证就绪后构建一次，学习路径共用；401 刷新成功后随新令牌更新）
+    // 最小头形态请求的令牌（PR #106 移植 + issue #114 扩展：列表补学与全部
+    // claim POST 均经 minimal_auth_headers 用此令牌走最小头——claim 端点带设备
+    // 指纹头族被上游风控 503 拦截，最小头通过；401 刷新成功后随新令牌更新）
     let mut min_token = creds.access_token.clone();
 
     let (mut kind, mut message, mut reward) = match list_campaigns(agent, &headers, &urls) {
@@ -1317,15 +1335,7 @@ fn process_account(
                 if daily_credits_claimed_in_list(&campaigns, now, &allowed_ids) {
                     ("already".into(), "每日奖励已领取".into(), None)
                 } else {
-                    match fallback_with_relearn(
-                        state,
-                        agent,
-                        &headers,
-                        &urls,
-                        &min_token,
-                        learned,
-                        table,
-                    ) {
+                    match fallback_with_relearn(state, agent, &min_token, &urls, learned, table) {
                         FallbackOutcome::Success(m, r, detail) => {
                             // 兜底直领同样计入逐活动明细（F-80-余 档期日历数据源，
                             // 审查 major 修复：缺失会导致日历主场景无 chips/dots）
@@ -1360,7 +1370,7 @@ fn process_account(
                         c,
                         &["name", "title", "campaignName", "campaign_name"],
                     ));
-                    let (k, m, r) = claim_one(agent, &headers, &urls, c);
+                    let (k, m, r) = claim_one(agent, &min_token, &urls, c);
                     if k == "auth" {
                         kind = "auth".into();
                         auth_msg = m;
@@ -1417,8 +1427,9 @@ fn process_account(
             Some(new) => {
                 qoder_common::sync_pool_expiry(state, &aid, &new);
                 headers = qoder_common::build_auth_headers(&new);
-                // 最小头学习令牌随刷新同步更新（PR #106：重试路径的补学须用新令牌，
-                // 旧令牌已被一次性轮换作废，用旧令牌补学必 401）
+                // 最小头令牌（列表补学 + claim POST）随刷新同步更新（PR #106 /
+                // issue #114：重试路径的补学与 claim 均须用新令牌，旧令牌已被
+                // 一次性轮换作废，用旧令牌补学必 401）
                 min_token = new.access_token.clone();
                 let retry = match list_campaigns(agent, &headers, &urls) {
                     Ok(campaigns) => {
@@ -1452,13 +1463,7 @@ fn process_account(
                                 ("already".into(), "每日奖励已领取".into(), None)
                             } else {
                                 match fallback_with_relearn(
-                                    state,
-                                    agent,
-                                    &headers,
-                                    &urls,
-                                    &min_token,
-                                    learned,
-                                    table,
+                                    state, agent, &min_token, &urls, learned, table,
                                 ) {
                                     FallbackOutcome::Success(m, r, detail) => {
                                         // 兜底明细并入 campaigns_detail（保留 401 前已收
@@ -1516,7 +1521,7 @@ fn process_account(
                                     c,
                                     &["name", "title", "campaignName", "campaign_name"],
                                 ));
-                                let (k, m, r) = claim_one(agent, &headers, &urls, c);
+                                let (k, m, r) = claim_one(agent, &min_token, &urls, c);
                                 // 401 重发后仍收到 auth：令牌再次失效，盲打剩余活动注定
                                 // 失败——中断遍历（审查 P2，与首次路径同构）。
                                 // kind 直接赋值不经 merge_claim_kind（同首次路径：already
@@ -1625,19 +1630,18 @@ fn process_account(
             reward = None;
         }
     }
-    // 签到充值即时拨新运行池（issue #102 补缺）：到账校验通过（或未启用校验的
-    // 成功路径）后，把 reward 按「旧值+reward」回写进 qoder_pool 内存池——否则
-    // 充值/领取到账的账号仍按旧快照被零积分过滤排除，直到下次积分快照
-    //（every_hours 档最长 2h，daily 档近一天；期间若它是池内唯一账号，网关
-    // has_selectable=false 整体不可用）。到期键不动（签到奖励不改变订阅/包到期）。
-    // 网关未运行/CLI 传 None 跳过（对齐快照任务 runtime 口径）
-    if kind == "success" {
-        if let Some(r) = reward.filter(|r| *r > 0.0) {
-            if let Some(shared) = runtime.and_then(|rt| {
-                let g = rt.lock().unwrap_or_else(|e| e.into_inner());
-                g.as_ref().map(|rt| rt.shared.clone())
-            }) {
-                shared.qoder_pool.add_credits(&aid, r);
+    // 签到奖励运行期回写（issue #102 补缺，对齐 qoder_credits::run_snapshot_task 口径）：
+    // CREDITS 奖励是真实入账，拨进网关 qoder_pool 防止「签到充值成功后账号仍被零积分
+    // 过滤持续排除到下次快照」（默认 every_hours 2h / daily 档最长约 13.5h；期间若它是
+    // 池内唯一账号，网关 has_selectable=false 整体不可用）。仅回写 credits 增量 +
+    // fetched_at，expire 以快照为准不动（签到奖励不改变订阅/包到期）；未到账降级已置
+    // reward=None 天然不回写；非 CREDITS 活动（BOGO 等）金额不进余额无法归因，
+    // 不回写；差值兜底采信（reward 从余额差值派生）同样覆盖。网关未运行/CLI 传
+    // None 跳过（shared 为 None）
+    if all_credits {
+        if let (Some(shared), Some(r)) = (shared, reward) {
+            if r > 0.0 {
+                shared.qoder_pool.apply_credits_delta(&aid, r);
             }
         }
     }
@@ -1703,8 +1707,9 @@ fn process_account(
 
 /// 签到整轮：逐账号串行处理，事件经 emit 回调逐条输出（NDJSON 管线复用）。
 /// 返回 done 事件（ok/already/failed 计数），供启动补签/调度静默路径直接消费。
-/// `runtime`：GUI 进程内的网关运行态句柄（调度器/UI/启动补签传入）——签到充值
-/// 到账后即时拨新 qoder_pool 余额（issue #102 补缺）；CLI 独立进程传 None 跳过
+/// `runtime`：GUI 进程内网关运行态句柄（调度器/启动补签/GUI 手签传入，对齐
+/// qoder_credits::run_snapshot_task）——CREDITS 奖励增量回写 qoder_pool；
+/// CLI 独立进程传 None 跳过
 pub fn run_checkin_round(
     state: &AppState,
     opts: &QoderCheckinOpts,
@@ -1779,12 +1784,25 @@ pub fn run_checkin_round(
     let mut campaign_table = load_campaign_table(state);
     // 多账号签到间隔（任务配置页可改，默认 3s，0=关闭）：防上游频控，账号间串行等待
     let gap_secs = crate::models::effective_checkin_gap(state.settings().qoder_checkin_gap_secs);
+    // 网关运行态共享句柄（对齐 run_snapshot_task 提取模式）：网关未启动时为 None
+    let shared = runtime.and_then(|r| {
+        let g = r.lock().unwrap_or_else(|e| e.into_inner());
+        g.as_ref().map(|rt| rt.shared.clone())
+    });
     for (i, acct) in accounts.iter().enumerate() {
         if i > 0 && gap_secs > 0 {
             std::thread::sleep(std::time::Duration::from_secs(gap_secs));
         }
         // 单账号失败不中断整轮（对齐 wb try/except 语义）
-        let mut ev = process_account(state, &agent, acct, opts, &mut learned_ids, &mut campaign_table, runtime);
+        let mut ev = process_account(
+            state,
+            &agent,
+            acct,
+            opts,
+            &mut learned_ids,
+            &mut campaign_table,
+            shared.as_ref(),
+        );
         ev["index"] = json!(i + 1);
         emit(&ev);
         events.push(ev);
@@ -2081,6 +2099,31 @@ mod tests {
             describe_blind_failure(409, None, r#"{"message":"conflict"}"#),
             r#"（HTTP 409）活动 ID 疑似过期（每日轮换），请抓包/探针更新 KNOWN_DAILY_CAMPAIGNS；{"message":"conflict"}"#
         );
+    }
+
+    /// issue #114 回归防线：最小头只含鉴权四件套，绝不携带设备指纹头族——
+    /// claim 端点带指纹头被上游风控按形态拦截（503 RISK_DEPENDENCY_UNAVAILABLE），
+    /// 全部 claim 路径（claim_one / blind_round）都经本函数构建请求头
+    #[test]
+    fn minimal_auth_headers_excludes_device_fingerprint_family() {
+        let h = minimal_auth_headers("tok");
+        let keys: Vec<String> = h.iter().map(|(k, _)| k.to_ascii_lowercase()).collect();
+        assert_eq!(keys.len(), 4, "最小头应恰为鉴权四件套：{keys:?}");
+        for k in ["authorization", "cosy-clienttype", "user-agent", "content-type"] {
+            assert!(keys.iter().any(|x| x == k), "最小头缺 {k}：{keys:?}");
+        }
+        for k in [
+            "cosy-machineid",
+            "cosy-machinetoken",
+            "cosy-version",
+            "cosy-machineos",
+            "cosy-machinehostname",
+            "cosy-machinecode",
+            "cosy-machinetype",
+        ] {
+            assert!(!keys.iter().any(|x| x == k), "最小头不得携带设备指纹头 {k}");
+        }
+        assert_eq!(h[0].1, "Bearer tok");
     }
 
     /// 重学习（issue #66 健壮性①）：不要求 claimStatus（CLAIMED/CLAIMABLE 均学），
@@ -2478,6 +2521,19 @@ mod tests {
                 "[C 盲发claim {cid}] HTTP {st3} body={}",
                 body3.as_ref().map(|b| b.to_string()).unwrap_or_else(|| {
                     raw3.chars().take(300).collect()
+                })
+            );
+            // D 组（issue #114 探针口径）：最小头盲发 claim 对照——上游风控按请求
+            // 头形态拦截 claim（2026-10-16 实证：完整头 503 RISK_DEPENDENCY_
+            // UNAVAILABLE，最小头 200 CLAIMED 4/4 账号到账）。C/D 两组同 IP 同
+            // token 同 id 对照，风控再变时直接锁定拦截面
+            std::thread::sleep(std::time::Duration::from_millis(1500));
+            let (st4, body4, raw4) =
+                post_empty(&agent, &c_url, &minimal_auth_headers(&creds.access_token));
+            println!(
+                "[D 最小头claim {cid}] HTTP {st4} body={}",
+                body4.as_ref().map(|b| b.to_string()).unwrap_or_else(|| {
+                    raw4.chars().take(300).collect()
                 })
             );
         }

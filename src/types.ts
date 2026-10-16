@@ -283,7 +283,7 @@ export interface TraeWorkMigrationReport {
   finished_at_ms: number;
   /** 迁移明细条目（settings 键退役/承接 + 快照池搬迁摘要，用户可读文案） */
   notes: string[];
-  /** settings 步（旧安装路径设置处置）的结构化结果；旧版报告无此字段为 null/undefined */
+  /** settings 步处置结果（结构化字段，新版报告才有；null/缺失 = 无 trae_path 存量） */
   settings_note?: string | null;
   /** 整组迁入 profiles_trae 的组数 */
   moved_groups: number;
@@ -401,7 +401,7 @@ export interface Settings {
   qoder_credits_sync_mode: string;
   /** Qoder 积分数据同步间隔小时数（every_hours 模式生效，默认 2，1..24） */
   qoder_credits_sync_hours: string;
-  /** Qoder Token 定时续期开关（默认开：qoder-refresh 每 N 小时兜底刷新全部账号凭证） */
+  /** Qoder Token 定时续期开关（默认开：qoder-refresh 每 6 小时兜底刷新全部账号凭证） */
   qoder_token_renew_enabled: boolean;
   /** Qoder Token 续期间隔小时数（1~24，默认 6；客户端 token 惰性窗 7h，间隔 ≤7h 保证过期前续上） */
   qoder_token_renew_interval_hours: number;
@@ -518,6 +518,18 @@ export interface CheckinTrendPoint {
   ok: number;
   already: number;
   failed: number;
+}
+
+/** 设备冲突账号（issue #110 签到前预警）：与同组其他账号共用同一 device_id */
+export interface DeviceConflictAccount {
+  user_id: string;
+  name: string;
+}
+
+/** 设备冲突组：同一 device_id 绑定 ≥2 个账号，服务端每日仅先签账号可领积分 */
+export interface DeviceConflictGroup {
+  device_id: string;
+  accounts: DeviceConflictAccount[];
 }
 
 export interface CreditRecord {
@@ -734,6 +746,8 @@ export interface ApiPoolFile {
   qoder_hedge_threshold_ms?: number;
   /** Qoder 会话粘性开关（F-80-余 v2）：同会话 TTL 内绑定同一 Qoder 账号（默认关） */
   qoder_sticky_enabled?: boolean;
+  /** Qwen3.8-Flash 免费活动倍率覆盖（issue #111，默认开）：目录倍率按 0 处理 + 取号豁免零积分过滤 */
+  qoder_flash_free_rate?: boolean;
   /** Qoder 池账号并发上限（per-pool 三参数之一，默认 1；0 = 不限） */
   qoder_account_concurrency_limit?: number;
   /** Qoder 池粘性 TTL 秒（per-pool 三参数之一，默认 300） */

@@ -940,12 +940,9 @@ fn stream_convert_anthropic_src(
                     usage = Some(json!(ev.usage.clone().unwrap_or(json!({}))));
                 }
                 "done" | "turn_completion" => {
-                    // 与 stream_convert_src / stream_convert_text_src 同款护栏
-                    //（审查修复补齐）：上游偶发双完成事件（done + turn_completion），
-                    // finish_stream! 非幂等（工具块会整批重发 content_block_start/
-                    // input_json_delta/content_block_stop），重复完成事件会向客户端
-                    // 拼接第二份收尾帧（message_delta/message_stop），对 Claude Code
-                    // 等严格 Anthropic 客户端构成协议违规
+                    // 上游偶发双完成（sibling 两转换器同款守卫）：二次完成会重发全部
+                    // tool_use 块 + message_delta/message_stop，对 Claude Code 等严格
+                    // 客户端属协议违规——首帧后静默忽略后续完成事件
                     if saw_done {
                         continue;
                     }

@@ -276,7 +276,7 @@ impl UsageFile {
         b.get(day)
     }
 
-    /// 记录一次请求（无 TTFT 的简写，仅测试用；生产路径一律走 record_ttfb/record_in）
+    /// 记录一次请求（无 TTFT 的简写，仅测试用；生产路径一律走 record_in_ttfb_on）
     #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     pub fn record(
@@ -297,7 +297,9 @@ impl UsageFile {
         );
     }
 
-    /// 记录一次请求（带 TTFT，F-76）：流式路径已知首字耗时时使用
+    /// 记录一次请求（带 TTFT，F-76）：流式路径已知首字耗时时使用。
+    /// 仅测试链路可达（生产路径入口取定 day 直走 record_in_ttfb_on，见 G3）
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     pub fn record_ttfb(
         &mut self,
@@ -319,7 +321,8 @@ impl UsageFile {
         );
     }
 
-    /// 按桶记录一次请求（custom_route 自定义池路径使用）
+    /// 按桶记录一次请求（custom_route 自定义池路径使用；仅测试链路可达，同上）
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     pub fn record_in(
         &mut self,
@@ -339,7 +342,8 @@ impl UsageFile {
         );
     }
 
-    /// 按桶记录一次请求（带 TTFT，F-76）
+    /// 按桶记录一次请求（带 TTFT，F-76；仅测试链路可达，同上）
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     pub fn record_in_ttfb(
         &mut self,

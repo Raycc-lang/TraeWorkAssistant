@@ -304,6 +304,8 @@ pub async fn do_start(
         qoder_pool_sticky_ttl_secs: std::sync::atomic::AtomicU64::new(
             pool_file.qoder_pool_sticky_ttl_secs,
         ),
+        // Qwen3.8-Flash 免费活动倍率覆盖（issue #111，api_pool.json，serde default 兼容旧文件）
+        qoder_flash_free_rate: std::sync::atomic::AtomicBool::new(pool_file.qoder_flash_free_rate),
         wb_sticky: crate::api_server::wb_sticky::StickyStore::load(&state.data_dir),
         // Trae 池会话粘性存储（per-pool 批次新增）："t:" 命名空间与 wb/qoder 互不串绑
         trae_sticky: crate::api_server::wb_sticky::StickyStore::load_ns(&state.data_dir, "t:"),
@@ -433,9 +435,9 @@ pub async fn do_start(
     // 积分快照时后台刷新一次——reserve 过滤对陈旧快照 fail-open，刷新拨新后
     // 自动恢复生效。三池口径：
     //   Trae 池：refresh_remaining_credits_impl 逐账号刷新，经 push_credits 回写拨新；
-    //   WB 池：wb_credits_snapshot_task 快照后按 ok=true 账号经 update_credits 拨新
-    //     （只更新余额+时间戳，不触碰运行期健康状态；此前 WB 池无运行期拨新
-    //     路径，陈旧快照会一直 fail-open）；
+    //   WB 池：wb_credits_snapshot_task 快照后经 write_back_pool_balances 内部
+    //     runtime 句柄 update_credits_snapshot 三键拨新（issue #109 同类：
+    //     credits/expire/fetched_at，ok=true 账号，失败账号保留旧值）；
     //   Qoder 池（issue #102）：run_snapshot_task 快照后按 ok 行经
     //     update_credits_snapshot 三键拨新（credits/expire_at/fetched_at）——
     //     selectable 零积分与到期过滤均无新鲜度自愈，装配时 Some(0.0)/已过期的
@@ -473,33 +475,28 @@ pub async fn do_start(
                 }
             }
             if wb_stale {
-                match crate::commands::workbuddy::wb_credits_snapshot_task(&st2) {
+                // 拨新在 wb_credits_snapshot_task 内部经 runtime 完成（ok 行三键拨新，
+                // 对齐下方 Qoder 池口径）
+                match crate::commands::workbuddy::wb_credits_snapshot_task(&st2, Some(rt_state.inner()))
+                {
                     Ok(parsed) => {
-                        // 仅 ok=true 账号拨新，失败账号保留旧值防误清
-                        //（对齐 write_back_pool_balances 的到期回写口径）
-                        let mut m: std::collections::HashMap<String, f64> =
-                            std::collections::HashMap::new();
-                        if let Some(accounts) = parsed.get("accounts").and_then(|v| v.as_array()) {
-                            for acc in accounts {
-                                let ok = acc
-                                    .get("ok")
-                                    .and_then(serde_json::Value::as_bool)
-                                    .unwrap_or(true);
-                                if !ok {
-                                    continue;
-                                }
-                                if let (Some(uid), Some(bal)) = (
-                                    acc.get("user_id").and_then(|v| v.as_str()),
-                                    acc.get("balance").and_then(|v| v.as_f64()),
-                                ) {
-                                    m.insert(uid.to_string(), bal);
-                                }
-                            }
-                        }
-                        shared.wb_pool.update_credits(&m);
+                        // 计 ok=true 且 balance 可解析（实际拨新）账号，对齐
+                        // write_back_pool_balances 的 snapshot 收集口径（Trae(ok_count)/Qoder(ok 行)）
+                        let n = parsed
+                            .get("accounts")
+                            .and_then(|v| v.as_array())
+                            .map(|a| {
+                                a.iter()
+                                    .filter(|x| {
+                                        x.get("ok").and_then(|v| v.as_bool()).unwrap_or(true)
+                                            && x.get("balance").and_then(|v| v.as_f64()).is_some()
+                                    })
+                                    .count()
+                            })
+                            .unwrap_or(0);
                         fs_utils::app_log(
                             &st2.data_dir,
-                            &format!("API服务启动-积分保鲜: WB池拨新完成 accounts={}", m.len()),
+                            &format!("API服务启动-积分保鲜: WB池拨新完成 accounts={}", n),
                         );
                     }
                     Err(e) => fs_utils::app_log(
@@ -894,7 +891,7 @@ pub fn reload_pools_if_running(
 /// 网关运行中回写 Trae 池积分快照（issue #67）：refresh_remaining_credits 刷新后
 /// 调用，让 expire_first 等策略基于最新积分选号。此前刷新只写库不回写池，秃号
 /// 内存中 credits>0 永远 selectable、粘性/策略持续命中同一账号。服务未运行时
-/// no-op；仅回写 Trae 池（WB 池积分随 sync_from_wb 走另一数据链，不适用）。
+/// no-op；仅回写 Trae 池（WB 池经 write_back_pool_balances 独立链路运行期拨新）。
 pub fn push_credits_if_running(
     state: &AppState,
     runtime: &Mutex<Option<ApiServerRuntime>>,
@@ -903,16 +900,30 @@ pub fn push_credits_if_running(
     let Some(rt) = guard.as_ref() else { return };
     let credits_file: RemainingCreditsFile =
         crate::store::docs::remaining_credits_load(&crate::store::db(&state.data_dir));
-    // 池积分语义与 apply_pool_snapshot 一致：优先 general 表，回退旧总积分表
-    let pool_credits: std::collections::HashMap<String, f64> = credits_file
+    // 三键拨新（issue #109）：此前只拨余额两键，credits_expire_at 钉死在装配时刻——
+    // 网关启动后新登录/新刷新的账号池内 expire=None，被 expire_first
+    // 「有过期时间者优先」恒压（调度持续命中带旧到期信息的老账号，新会话同样命中）；
+    // 充值续期后的新到期也进不了池，旧值已过期的账号甚至被 selectable 整体排除。
+    // 积分与到期均对齐 apply_pool_snapshot 装配口径：优先 general 表，到期用
+    // merge_pool_expire_times（general 优先、混合口径兜底），池状态与重启后一致
+    let expire_times = merge_pool_expire_times(&credits_file);
+    let pool_snapshot: std::collections::HashMap<String, (f64, Option<i64>)> = credits_file
         .credits
         .iter()
-        .map(|(uid, c)| (uid.clone(), credits_file.general.get(uid).copied().unwrap_or(*c)))
+        .map(|(uid, c)| {
+            (
+                uid.clone(),
+                (
+                    credits_file.general.get(uid).copied().unwrap_or(*c),
+                    expire_times.get(uid).copied(),
+                ),
+            )
+        })
         .collect();
-    rt.shared.pool.update_credits(&pool_credits);
+    rt.shared.pool.update_credits_snapshot(&pool_snapshot);
     fs_utils::app_log(
         &state.data_dir,
-        &format!("API服务池积分回写(运行期): n={}", pool_credits.len()),
+        &format!("API服务池积分回写(运行期): n={}", pool_snapshot.len()),
     );
 }
 
@@ -950,6 +961,8 @@ fn merge_pool_set(
     qoder_enabled: Option<bool>,
     qoder_hedge_threshold_ms: Option<u64>,
     qoder_sticky_enabled: Option<bool>,
+    // Qwen3.8-Flash 免费活动倍率覆盖开关（issue #111）；None = 保留原值
+    qoder_flash_free_rate: Option<bool>,
     // Qoder 池入池白名单（qd- 前缀账号 id）；None = 保留原值，
     // Some(list) = 覆盖（Qoder 页账号池勾选保存；空数组 = fail-open 全量入池）
     qoder_uids: Option<Vec<String>>,
@@ -1014,6 +1027,7 @@ fn merge_pool_set(
         qoder_hedge_threshold_ms: qoder_hedge_threshold_ms
             .unwrap_or(existing.qoder_hedge_threshold_ms),
         qoder_sticky_enabled: qoder_sticky_enabled.unwrap_or(existing.qoder_sticky_enabled),
+        qoder_flash_free_rate: qoder_flash_free_rate.unwrap_or(existing.qoder_flash_free_rate),
         qoder_enabled_uids: qoder_uids.unwrap_or_else(|| existing.qoder_enabled_uids.clone()),
         qoder_group_ids: qoder_group_ids.unwrap_or_else(|| existing.qoder_group_ids.clone()),
         qoder_strategy: qoder_strategy.unwrap_or_else(|| existing.qoder_strategy.clone()),
@@ -1066,6 +1080,8 @@ pub fn pool_set(
     qoder_hedge_threshold_ms: Option<u64>,
     // Qoder 会话粘性开关（F-80-余 v2）；None = 保留原值
     qoder_sticky_enabled: Option<bool>,
+    // Qwen3.8-Flash 免费活动倍率覆盖开关（issue #111，默认开）；None = 保留原值
+    qoder_flash_free_rate: Option<bool>,
     // Qoder 池入池白名单（qd- 前缀账号 id）；None = 保留原值
     qoder_uids: Option<Vec<String>>,
     // Qoder 池分组筛选；None = 保留原值
@@ -1113,6 +1129,7 @@ pub fn pool_set(
         qoder_enabled,
         qoder_hedge_threshold_ms,
         qoder_sticky_enabled,
+        qoder_flash_free_rate,
         qoder_uids,
         qoder_group_ids,
         qoder_strategy,
@@ -1217,6 +1234,11 @@ pub fn pool_set(
         );
         rt.shared.qoder_sticky_enabled.store(
             pool_file.qoder_sticky_enabled,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        // Qwen3.8-Flash 免费活动倍率覆盖热应用（issue #111）
+        rt.shared.qoder_flash_free_rate.store(
+            pool_file.qoder_flash_free_rate,
             std::sync::atomic::Ordering::Relaxed,
         );
     }
@@ -1575,24 +1597,35 @@ pub fn api_unified_models(
     runtime: State<'_, Mutex<Option<ApiServerRuntime>>>,
     available_only: Option<bool>,
 ) -> Vec<crate::api_server::unified_catalog::UnifiedModel> {
-    let (wb_enabled, qoder_enabled, trae_ok, buddy_ok, qoder_ok) = match safe_lock(&runtime).as_ref() {
-        Some(rt) => {
-            let s = &rt.shared;
-            (
-                s.wb_enabled
-                    .load(std::sync::atomic::Ordering::Relaxed),
-                s.qoder_enabled
-                    .load(std::sync::atomic::Ordering::Relaxed),
-                // Trae 开关（默认开）参与可用性：关闭时 Trae 源徽章置灰
-                s.trae_enabled.load(std::sync::atomic::Ordering::Relaxed)
-                    && s.pool.has_selectable(),
-                s.wb_pool.has_selectable(),
-                s.qoder_pool.has_selectable(),
-            )
-        }
+    let (wb_enabled, qoder_enabled, trae_ok, buddy_ok, qoder_ok, qoder_flash_free) =
+        match safe_lock(&runtime).as_ref() {
+            Some(rt) => {
+                let s = &rt.shared;
+                (
+                    s.wb_enabled
+                        .load(std::sync::atomic::Ordering::Relaxed),
+                    s.qoder_enabled
+                        .load(std::sync::atomic::Ordering::Relaxed),
+                    // Trae 开关（默认开）参与可用性：关闭时 Trae 源徽章置灰
+                    s.trae_enabled.load(std::sync::atomic::Ordering::Relaxed)
+                        && s.pool.has_selectable(),
+                    s.wb_pool.has_selectable(),
+                    s.qoder_pool.has_selectable(),
+                    // Qwen3.8-Flash 免费活动覆盖（issue #111），与取号/排序同口径
+                    s.qoder_flash_free_rate
+                        .load(std::sync::atomic::Ordering::Relaxed),
+                )
+            }
         None => {
             let pf: ApiPoolFile = crate::store::db(&state.data_dir).kv_get("api_pool");
-            (pf.wb_enabled, pf.qoder_enabled, pf.trae_enabled, true, true)
+            (
+                pf.wb_enabled,
+                pf.qoder_enabled,
+                pf.trae_enabled,
+                true,
+                true,
+                pf.qoder_flash_free_rate,
+            )
         }
     };
     let data_dir = state.data_dir.clone();
@@ -1602,6 +1635,7 @@ pub fn api_unified_models(
         trae_ok,
         buddy_ok,
         Some((qoder_enabled, qoder_ok)),
+        qoder_flash_free,
     );
     if available_only.unwrap_or(false) {
         list.retain(|m| m.sources.iter().any(|s| s.enabled));
@@ -1936,6 +1970,7 @@ mod pool_merge_tests {
             qoder_enabled: true,
             qoder_hedge_threshold_ms: 4000,
             qoder_sticky_enabled: true,
+            qoder_flash_free_rate: true,
             qoder_account_concurrency_limit: 3,
             qoder_pool_sticky_ttl_secs: 900,
             qoder_sticky_ttl_secs: 3600,
@@ -1956,7 +1991,7 @@ mod pool_merge_tests {
             vec!["u2".into()],
             None, None, None, None, None, None, None, None, None, None, None, None,
             None, None, None, None, None, None, None, None, None, None,
-            None, None, None, None, None, None,
+            None, None, None, None, None, None, None,
         );
         assert_eq!(m.enabled_uids, vec!["u2".to_string()]);
         assert_eq!(m.strategy, "weighted");
@@ -2002,7 +2037,7 @@ mod pool_merge_tests {
             vec!["1001".into(), "wb-abc".into(), "1002".into(), "wb-def".into()],
             None, None, None, None, None, None, None, None, None, None, None, None,
             None, None, None, None, None, None, None, None, None, None,
-            None, None, None, None, None, None,
+            None, None, None, None, None, None, None,
         );
         // Trae 白名单剥离 wb- 条目
         assert_eq!(m.enabled_uids, vec!["1001".to_string(), "1002".to_string()]);
@@ -2110,6 +2145,7 @@ mod pool_merge_tests {
             None,
             None,
             None,
+            None,
         );
         assert_eq!(m.wb_enabled_uids, vec!["wb-new".to_string()]);
         assert_eq!(m.enabled_uids, vec!["u1".to_string()]);
@@ -2198,6 +2234,7 @@ mod pool_merge_tests {
             None,
             None,
             None,
+            None,
         );
         assert_eq!(m.strategy, "p2c");
         assert_eq!(m.wb_strategy, "");
@@ -2232,6 +2269,7 @@ mod pool_merge_tests {
             None, None, Some(vec!["g2".into()]), None, None, None, None,
             None, None, None, None, None, None, None, None, None, None, None,
             None, None, None, None, None, None, None, None, None, None,
+            None,
         );
         assert_eq!(m.enabled_uids.len(), 2);
         assert_eq!(m.group_ids, vec!["g2".to_string()]);
@@ -2249,7 +2287,7 @@ mod pool_merge_tests {
             vec!["u1".into()],
             None, None, None, None, None, None, None, None, None, None, None, None,
             None, None, None, None, None, None, None, None, None, None,
-            None, None, None, None, None, None,
+            None, None, None, None, None, None, None,
         );
         assert_eq!(m.strategy, "");
         assert_eq!(m.wb_strategy, "");

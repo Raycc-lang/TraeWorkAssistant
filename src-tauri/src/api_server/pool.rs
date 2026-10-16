@@ -419,28 +419,14 @@ impl ApiPool {
         }
     }
 
-    /// 运行期积分回写（issue #67）：仅更新池内条目的 credits 快照，
-    /// 不触碰冷却/inflight/禁用等运行态（与 sync_from_accounts 全量重建互补——
-    /// 后者会重置 hard_until/last_used 等运行状态）。未提及的账号保持原值。
-    /// 修复「秃号内存中 credits>0 永远 selectable、策略持续命中同一账号」。
-    /// 回写同时拨新快照时间戳（issue #91 缓存保鲜）：新数据即新鲜，
-    /// reserve 过滤自动恢复生效
-    pub fn update_credits(&self, credits: &HashMap<String, f64>) {
-        let mut entries = safe_lock(&self.entries);
-        let now = now_ts();
-        for (uid, c) in credits {
-            if let Some(e) = entries.get_mut(uid) {
-                e.credits = Some(*c);
-                e.credits_fetched_at = Some(now);
-            }
-        }
-    }
-
-    /// Qoder 池运行期三键拨新（issue #102 运行期保鲜）：credits + credits_expire_at +
-    /// credits_fetched_at 一并回写。与 update_credits（Trae/WB 只拨余额+时间戳）不同，
-    /// Qoder 的 selectable 到期过滤与 smart 排序键①「先到期先消耗」依赖
-    /// credits_expire_at——旧值钉死会让充值/续期后的账号持续被排除直到网关重启。
-    /// 未提及的账号保持原值，不触碰冷却/inflight/禁用等运行态（对齐 update_credits 纪律）
+    /// 池运行期三键拨新（issue #67 运行期回写 + issue #102 Qoder / issue #109
+    /// Trae/WB 运行期保鲜）：credits + credits_expire_at + credits_fetched_at 一并回写。
+    /// selectable 到期过滤与 expire_first/smart「先到期先消耗」排序依赖
+    /// credits_expire_at——旧值钉死会让充值/续期后的账号持续被排除、新登录账号
+    /// expire=None 被「有过期时间者优先」恒压，直到网关重启；快照时间戳同步拨新
+    /// （issue #91 缓存保鲜），reserve 过滤自动恢复生效。
+    /// 未提及的账号保持原值，不触碰冷却/inflight/禁用等运行态（与 sync_from_accounts
+    /// 全量重建互补——后者会重置 hard_until/last_used 等运行状态）
     pub fn update_credits_snapshot(&self, snapshot: &HashMap<String, (f64, Option<i64>)>) {
         let mut entries = safe_lock(&self.entries);
         let now = now_ts();
@@ -453,21 +439,22 @@ impl ApiPool {
         }
     }
 
-    /// Qoder 签到充值即时拨新（issue #102 补缺）：到账奖励按「旧值+delta」回写
-    /// 余额并刷新 fetched_at——不拨新则充值/领取到账的账号仍按旧快照被零积分
-    /// 过滤排除，直到下次积分快照（every_hours 档最长 2h，daily 档近一天）。
+    /// Qoder 签到奖励运行期增量回写（issue #102 补缺）：credits += delta 并拨新
+    /// fetched_at——不拨新则充值/领取到账的账号仍按旧快照被零积分过滤排除，直到
+    /// 下次积分快照（every_hours 2h / daily 档最长约 13.5h 的排除窗口）。
     /// 与 update_credits_snapshot 不同：**不动 credits_expire_at**（签到奖励不改变
-    /// 订阅/包到期，覆写会丢真值）。credits 为 None（从未拉取）的账号本就不被
-    /// 零积分过滤，无需回写；不触碰冷却/inflight/禁用等运行态（对齐 update_credits
-    /// 纪律）。网关未运行时由调用方跳过（None 句柄）。
-    pub fn add_credits(&self, uid: &str, delta: f64) {
+    /// 订阅/包到期，覆写会丢真值）。credits 为 None 按 0.0 基数兜底，结果钳制非负；
+    /// 不触碰冷却/inflight/禁用等运行态（对齐 update_credits 纪律）；池内不存在
+    /// 的账号静默跳过（与两回写方法同口径）。网关未运行时由调用方跳过（None 句柄）。
+    pub fn apply_credits_delta(&self, uid: &str, delta: f64) {
+        if delta == 0.0 {
+            return;
+        }
         let mut entries = safe_lock(&self.entries);
-        let now = now_ts();
         if let Some(e) = entries.get_mut(uid) {
-            if let Some(c) = e.credits {
-                e.credits = Some(c + delta);
-                e.credits_fetched_at = Some(now);
-            }
+            let base = e.credits.unwrap_or(0.0).max(0.0);
+            e.credits = Some((base + delta).max(0.0));
+            e.credits_fetched_at = Some(now_ts());
         }
     }
 
@@ -565,13 +552,15 @@ impl ApiPool {
         }
     }
 
-    /// 指定 uid 取号（T2.4 会话粘性）：账号 healthy 时返回其凭证，否则 None
-    pub fn pick_by_uid(&self, uid: &str) -> Option<PickedAccount> {
+    /// 指定 uid 取号（T2.4 会话粘性）：账号 healthy 时返回其凭证，否则 None。
+    /// `skip_credit_filters`：跳过积分维度过滤（issue #111 免费模型豁免，
+    /// 仅 Qoder 免费模型取号路径传 true），见 [`selectable`]
+    pub fn pick_by_uid(&self, uid: &str, skip_credit_filters: bool) -> Option<PickedAccount> {
         let entries = safe_lock(&self.entries);
         let now = now_ts();
         let tried = HashSet::new();
         let reserve = self.reserve_credits();
-        entries.get(uid).filter(|e| selectable(e, &tried, now, reserve)).map(|e| PickedAccount {
+        entries.get(uid).filter(|e| selectable(e, &tried, now, reserve, skip_credit_filters)).map(|e| PickedAccount {
             uid: e.uid.clone(),
             jwt: e.jwt.clone(),
             device_id: e.device_id.clone(),
@@ -596,7 +585,8 @@ impl ApiPool {
         allowed: Option<&HashSet<String>>,
         dedicated: Option<&str>,
     ) -> Option<PickedAccount> {
-        self.pick_excluding_constrained_ev(tried, allowed, dedicated)
+        // 积分维度过滤无豁免（false）：免费模型豁免仅 Qoder 走 ev 版本
+        self.pick_excluding_constrained_ev(tried, allowed, dedicated, false)
             .map(|(p, _)| p)
     }
 
@@ -609,11 +599,12 @@ impl ApiPool {
         tried: &HashSet<String>,
         allowed: Option<&HashSet<String>>,
         dedicated: Option<&str>,
+        skip_credit_filters: bool,
     ) -> Option<(PickedAccount, Option<String>)> {
         // 专一模式：绑定账号 healthy 且未试错过 → 直接锁定（专一绑定不让位）
         if let Some(uid) = dedicated {
             if !tried.contains(uid) {
-                if let Some(p) = self.pick_by_uid(uid) {
+                if let Some(p) = self.pick_by_uid(uid, skip_credit_filters) {
                     let mut entries = safe_lock(&self.entries);
                     if let Some(e) = entries.get_mut(uid) {
                         e.last_used = now_ts();
@@ -628,7 +619,7 @@ impl ApiPool {
         let reserve = self.reserve_credits();
         let all_cands: Vec<&PoolEntry> = entries
             .values()
-            .filter(|e| selectable(e, tried, now, reserve))
+            .filter(|e| selectable(e, tried, now, reserve, skip_credit_filters))
             .filter(|e| allowed.map_or(true, |a| a.contains(&e.uid)))
             .collect();
         // F-77 busy 过滤 + 全 busy 降级
@@ -719,8 +710,9 @@ impl ApiPool {
         &self,
         sticky_uid: &str,
         allowed: Option<&HashSet<String>>,
+        skip_credit_filters: bool,
     ) -> Option<(PickedAccount, Option<String>)> {
-        let sticky = self.pick_by_uid(sticky_uid)?;
+        let sticky = self.pick_by_uid(sticky_uid, skip_credit_filters)?;
         let limit = self.concurrency_limit();
         let inflight = self.inflight_snapshot();
         let sticky_inflight = inflight.get(sticky_uid).copied().unwrap_or(0);
@@ -739,7 +731,7 @@ impl ApiPool {
             let tried = HashSet::new();
             entries
                 .values()
-                .filter(|e| e.uid != sticky_uid && selectable(e, &tried, now, reserve))
+                .filter(|e| e.uid != sticky_uid && selectable(e, &tried, now, reserve, skip_credit_filters))
                 .filter(|e| allowed.map_or(true, |a| a.contains(&e.uid)))
                 .fold((false, false), |(any, idle), e| {
                     (any || true, idle || inflight_of(e, &inflight) < limit)
@@ -764,7 +756,7 @@ impl ApiPool {
         let tried = HashSet::new();
         let idle: Vec<&PoolEntry> = entries
             .values()
-            .filter(|e| e.uid != sticky_uid && selectable(e, &tried, now, reserve))
+            .filter(|e| e.uid != sticky_uid && selectable(e, &tried, now, reserve, skip_credit_filters))
             .filter(|e| allowed.map_or(true, |a| a.contains(&e.uid)))
             .filter(|e| inflight_of(e, &inflight) < limit)
             .collect();
@@ -969,7 +961,8 @@ impl ApiPool {
         let now = now_ts();
         let tried = HashSet::new();
         let reserve = self.reserve_credits();
-        entries.values().any(|e| selectable(e, &tried, now, reserve))
+        // healthz/徽章口径恒不豁免（池通用可用性，免费模型豁免是请求级特例）
+        entries.values().any(|e| selectable(e, &tried, now, reserve, false))
     }
 
     /// 同 [has_selectable]，附加 Key 级 uid 白名单过滤（issue #25 资源池绑定）：
@@ -977,14 +970,22 @@ impl ApiPool {
     /// 对此 Key 不健康，走全局 fallback 开关回退另一池，而非取号阶段才失败。
     /// `allowed`：uid 白名单（None = 不限；`Some(空集)` = 过滤全部，即该池对此
     /// Key 不健康——issue #30 混合白名单的有意传参，语义同 pick_excluding_constrained）
-    pub fn has_selectable_in(&self, allowed: Option<&HashSet<String>>) -> bool {
-        self.selectable_stats_in(allowed).1 > 0
+    pub fn has_selectable_in(
+        &self,
+        allowed: Option<&HashSet<String>>,
+        skip_credit_filters: bool,
+    ) -> bool {
+        self.selectable_stats_in(allowed, skip_credit_filters).1 > 0
     }
 
     /// 可选账号统计（诊断用，issue #29）：返回 (池内可选总数, 白名单内可选数)。
     /// `allowed` 语义同 has_selectable_in（None = 不限）；供 NoHealthy 错误
     /// 消息携带「池健康数 / 白名单命中数」，帮助用户自查 Key 约束配置
-    pub fn selectable_stats_in(&self, allowed: Option<&HashSet<String>>) -> (usize, usize) {
+    pub fn selectable_stats_in(
+        &self,
+        allowed: Option<&HashSet<String>>,
+        skip_credit_filters: bool,
+    ) -> (usize, usize) {
         let entries = safe_lock(&self.entries);
         let now = now_ts();
         let tried = HashSet::new();
@@ -992,7 +993,7 @@ impl ApiPool {
         let mut total = 0usize;
         let mut in_allowed = 0usize;
         for e in entries.values() {
-            if selectable(e, &tried, now, reserve) {
+            if selectable(e, &tried, now, reserve, skip_credit_filters) {
                 total += 1;
                 if allowed.map_or(true, |a| a.contains(&e.uid)) {
                     in_allowed += 1;
@@ -1127,24 +1128,36 @@ pub struct QoderSyncAccount {
 
 /// 候选过滤：healthy + 未 tried + 积分未过期 + 非零积分 + 非 hard_credit 冷却
 /// `reserve`：账号保留剩余积分阈值（issue #91，≥ 0；0 = 仅过滤零积分）
-fn selectable(e: &PoolEntry, tried: &HashSet<String>, now: i64, reserve: f64) -> bool {
+/// `skip_credit_filters`：跳过积分维度过滤（issue #111 免费模型豁免）——
+/// 倍率 0 的模型零消耗，零积分/保留阈值/积分过期过滤对该类请求整体失义；
+/// 仅 Qoder 免费模型取号路径传 true，其余调用点一律 false（既有口径）；
+/// healthy/冷却/禁用/专一约束等账号级状态过滤不受影响
+fn selectable(
+    e: &PoolEntry,
+    tried: &HashSet<String>,
+    now: i64,
+    reserve: f64,
+    skip_credit_filters: bool,
+) -> bool {
     if tried.contains(&e.uid) || !e.healthy(now) {
         return false;
     }
-    // 跳过积分已过期的（expire_time=0 视为无过期时间，不跳过）
-    if let Some(exp) = e.credits_expire_at {
-        if exp > 0 && exp < now {
-            return false;
+    if !skip_credit_filters {
+        // 跳过积分已过期的（expire_time=0 视为无过期时间，不跳过）
+        if let Some(exp) = e.credits_expire_at {
+            if exp > 0 && exp < now {
+                return false;
+            }
         }
-    }
-    // 跳过零通用积分账号（通用积分耗尽，llm_utils_chat 无法使用）；
-    // 账号保留剩余积分（issue #91）：剩余 ≤ 阈值同样不调度——但仅当积分
-    // 快照新鲜。陈旧快照 fail-open（缓存问题）：陈旧「高积分」照样会调度
-    // 秃号，fail-closed 只会额外误杀；保鲜由启动刷新与 update_credits 拨新
-    // （reserve=0 时等价原零积分过滤）
-    if let Some(c) = e.credits {
-        if c <= 0.0 || (c <= reserve && e.reserve_filter_active(now)) {
-            return false;
+        // 跳过零通用积分账号（通用积分耗尽，llm_utils_chat 无法使用）；
+        // 账号保留剩余积分（issue #91）：剩余 ≤ 阈值同样不调度——但仅当积分
+        // 快照新鲜。陈旧快照 fail-open（缓存问题）：陈旧「高积分」照样会调度
+        // 秃号，fail-closed 只会额外误杀；保鲜由启动刷新与 update_credits_snapshot 拨新
+        // （reserve=0 时等价原零积分过滤）
+        if let Some(c) = e.credits {
+            if c <= 0.0 || (c <= reserve && e.reserve_filter_active(now)) {
+                return false;
+            }
         }
     }
     true
@@ -1427,20 +1440,20 @@ mod tests {
         ]);
         // 无白名单：与 has_selectable 等价
         assert!(pool.has_selectable());
-        assert!(pool.has_selectable_in(None));
+        assert!(pool.has_selectable_in(None, false));
         // 白名单命中任一健康账号即可
         let ok: HashSet<String> = ["uid_b".to_string()].into_iter().collect();
-        assert!(pool.has_selectable_in(Some(&ok)));
+        assert!(pool.has_selectable_in(Some(&ok), false));
         // 白名单全在池外 → 视为不健康（dispatch 层据此触发 fallback）
         let miss: HashSet<String> = ["uid_x".to_string()].into_iter().collect();
-        assert!(!pool.has_selectable_in(Some(&miss)));
+        assert!(!pool.has_selectable_in(Some(&miss), false));
         // 空白名单 = 过滤所有账号：调用方须先过滤空集（与 pick_excluding_constrained 同语义）
         let empty: HashSet<String> = HashSet::new();
-        assert!(!pool.has_selectable_in(Some(&empty)));
+        assert!(!pool.has_selectable_in(Some(&empty), false));
         // 过期账号即使命中白名单也不可选
         let expired = build_pool(&[("uid_a", 100.0, 1_000)]);
         let ok_a: HashSet<String> = ["uid_a".to_string()].into_iter().collect();
-        assert!(!expired.has_selectable_in(Some(&ok_a)));
+        assert!(!expired.has_selectable_in(Some(&ok_a), false));
     }
 
     #[test]
@@ -1452,13 +1465,13 @@ mod tests {
             ("uid_c", 0.0, 4_000_001_000), // 零积分 → 不可选
         ]);
         // 无白名单：(可选总数, 同值)
-        assert_eq!(pool.selectable_stats_in(None), (2, 2));
+        assert_eq!(pool.selectable_stats_in(None, false), (2, 2));
         // 白名单命中 uid_b：总数不变，命中=1
         let ok: HashSet<String> = ["uid_b".to_string()].into_iter().collect();
-        assert_eq!(pool.selectable_stats_in(Some(&ok)), (2, 1));
+        assert_eq!(pool.selectable_stats_in(Some(&ok), false), (2, 1));
         // 白名单全在池外：命中=0
         let miss: HashSet<String> = ["uid_x".to_string()].into_iter().collect();
-        assert_eq!(pool.selectable_stats_in(Some(&miss)), (2, 0));
+        assert_eq!(pool.selectable_stats_in(Some(&miss), false), (2, 0));
     }
 
     #[test]
@@ -1469,13 +1482,13 @@ mod tests {
             ("uid_ok", 100.0, 4_000_001_000),
         ]);
         // 阈值 0（默认）：零积分过滤语义，两账号均可选
-        assert_eq!(pool.selectable_stats_in(None), (2, 2));
+        assert_eq!(pool.selectable_stats_in(None, false), (2, 2));
         pool.set_reserve_credits(50.0);
         // 低余额账号被过滤，仅剩 uid_ok；取号跳过 uid_low
-        assert_eq!(pool.selectable_stats_in(None), (1, 1));
+        assert_eq!(pool.selectable_stats_in(None, false), (1, 1));
         let picked = pool.pick_excluding_constrained(&HashSet::new(), None, None).unwrap();
         assert_eq!(picked.uid, "uid_ok");
-        assert!(pool.pick_by_uid("uid_low").is_none());
+        assert!(pool.pick_by_uid("uid_low", false).is_none());
         // 智能调度数据源同步感知：积分总和不计保留阈值以下账号
         assert_eq!(pool.stats().1, 100.0);
         // 诊断输出 low_credits 原因（NoHealthy 排查）
@@ -1483,7 +1496,7 @@ mod tests {
         assert!(low.reason.starts_with("low_credits"));
         // 阈值归零恢复可选
         pool.set_reserve_credits(0.0);
-        assert_eq!(pool.selectable_stats_in(None), (2, 2));
+        assert_eq!(pool.selectable_stats_in(None, false), (2, 2));
     }
 
     #[test]
@@ -1498,14 +1511,59 @@ mod tests {
         assert!(pool2.has_selectable());
     }
 
+    // ==================== issue #111：免费模型积分过滤豁免 ====================
+
+    #[test]
+    fn free_model_gate_admits_zero_credit() {
+        // 零积分账号：标准口径排除；免费模型豁免口径（skip_credit_filters=true）
+        // 可选——轮换取号 / 粘性命中两条路径均放行
+        let pool = build_pool(&[("uid_zero", 0.0, 4_000_001_000)]);
+        assert!(!pool.has_selectable());
+        assert!(pool.has_selectable_in(None, true));
+        assert!(
+            pool.pick_excluding_constrained_ev(&HashSet::new(), None, None, true)
+                .is_some()
+        );
+        assert!(pool.pick_by_uid("uid_zero", true).is_some());
+        assert!(pool.pick_by_uid("uid_zero", false).is_none());
+    }
+
+    #[test]
+    fn free_model_gate_ignores_reserve_threshold() {
+        // 账号保留剩余积分（issue #91）对免费模型同样失义：余额 ≤ 阈值仍可选
+        let pool = build_pool(&[("uid_low", 5.0, 4_000_001_000)]);
+        pool.set_reserve_credits(10.0);
+        assert!(!pool.has_selectable());
+        assert!(pool.has_selectable_in(None, true));
+    }
+
+    #[test]
+    fn free_model_gate_ignores_expired_credits() {
+        // 积分已过期属积分维度过滤，豁免口径下放行（过期账号常伴随零余额）
+        let pool = build_pool(&[("uid_expired", 50.0, 1_000_000_000)]);
+        assert!(!pool.has_selectable());
+        assert!(pool.has_selectable_in(None, true));
+    }
+
+    #[test]
+    fn free_model_gate_keeps_account_state_filters() {
+        // 账号级状态过滤不豁免：禁用 / hard_credit 冷却的零积分账号仍排除
+        let pool = build_pool(&[("uid_dead", 0.0, 4_000_001_000)]);
+        pool.note_error("uid_dead", ErrKind::Forbidden);
+        assert!(!pool.has_selectable_in(None, true));
+        let pool2 = build_pool(&[("uid_cool", 0.0, 4_000_001_000)]);
+        pool2.note_error("uid_cool", ErrKind::HardCredit);
+        assert!(!pool2.has_selectable_in(None, true));
+    }
+
     #[test]
     fn reserve_credits_stale_snapshot_fail_open() {
         // issue #91 缓存问题：reserve 过滤仅对新鲜积分快照生效。
-        // 陈旧快照 fail-open（不误杀），保鲜靠启动刷新与 update_credits 拨新
+        // 陈旧快照 fail-open（不误杀），保鲜靠启动刷新与 update_credits_snapshot 拨新
         let pool = build_pool(&[("uid_low", 30.0, 4_000_001_000)]);
         pool.set_reserve_credits(50.0);
         // 新鲜快照：低余额被过滤
-        assert_eq!(pool.selectable_stats_in(None), (0, 0));
+        assert_eq!(pool.selectable_stats_in(None, false), (0, 0));
         assert!(pool.has_stale_credits() == false, "build_pool 拨新后不应判陈旧");
 
         // 快照陈旧（>24h）：fail-open 恢复可选；stats 口径同步（计入 total）
@@ -1517,7 +1575,7 @@ mod tests {
             }
         }
         assert!(pool.has_stale_credits());
-        assert_eq!(pool.selectable_stats_in(None), (1, 1));
+        assert_eq!(pool.selectable_stats_in(None, false), (1, 1));
         assert!(pool.has_selectable());
         assert_eq!(pool.stats().1, 30.0);
         // 诊断标注陈旧 fail-open（NoHealthy 排查）
@@ -1535,12 +1593,55 @@ mod tests {
                 e.credits_fetched_at = None;
             }
         }
-        assert_eq!(pool.selectable_stats_in(None), (1, 1));
+        assert_eq!(pool.selectable_stats_in(None, false), (1, 1));
 
-        // update_credits 拨新时间戳：过滤自动恢复
-        pool.update_credits(&[("uid_low".to_string(), 30.0)].into_iter().collect());
+        // update_credits_snapshot 拨新时间戳（expire 保持原值）：过滤自动恢复
+        pool.update_credits_snapshot(
+            &[("uid_low".to_string(), (30.0, Some(4_000_001_000)))]
+                .into_iter()
+                .collect(),
+        );
         assert!(!pool.has_stale_credits());
-        assert_eq!(pool.selectable_stats_in(None), (0, 0));
+        assert_eq!(pool.selectable_stats_in(None, false), (0, 0));
+    }
+
+    /// issue #109 运行期保鲜（Trae 池）：网关启动后新登录/新刷新的账号池内
+    /// expire=None，被 expire_first「有过期时间者优先」恒压——调度持续命中带旧
+    /// 到期信息的老账号（新会话同样命中）；三键拨新带上下拉新 expire 后选号纠正
+    #[test]
+    fn credits_snapshot_push_fixes_expire_first_ordering() {
+        // uid_a 无到期信息（expire=0 等价 None），uid_b 有到期信息 → 恒选 uid_b
+        let pool = build_pool(&[("uid_a", 100.0, 0), ("uid_b", 50.0, 4_000_000_000)]);
+        let picked = pool
+            .pick_excluding_constrained(&HashSet::new(), None, None)
+            .unwrap();
+        assert_eq!(picked.uid, "uid_b");
+        // 运行期三键拨新：uid_a 带上最早到期时间（早于 uid_b）→ 选号纠正为 uid_a；
+        // 未提及的 uid_b 保持原值
+        let mut m = HashMap::new();
+        m.insert("uid_a".to_string(), (100.0, Some(3_900_000_000)));
+        pool.update_credits_snapshot(&m);
+        let picked = pool
+            .pick_excluding_constrained(&HashSet::new(), None, None)
+            .unwrap();
+        assert_eq!(picked.uid, "uid_a");
+    }
+
+    /// issue #109 充值/续期场景：池内旧 expire 已过期被 selectable 整体排除，
+    /// 三键拨新带回新到期时间后恢复可选
+    #[test]
+    fn credits_snapshot_push_revives_recharged_account() {
+        // uid_a 旧到期时间已过 → 不可选
+        let pool = build_pool(&[("uid_a", 100.0, 1), ("uid_b", 50.0, 4_000_000_000)]);
+        let uid_a: HashSet<String> = ["uid_a".to_string()].into_iter().collect();
+        assert!(!pool.has_selectable_in(Some(&uid_a), false));
+        assert!(pool.pick_by_uid("uid_a", false).is_none());
+        // 运行期拨新（续期后新到期）→ 恢复可选且可被粘性取号
+        let mut m = HashMap::new();
+        m.insert("uid_a".to_string(), (100.0, Some(4_000_000_000)));
+        pool.update_credits_snapshot(&m);
+        assert!(pool.has_selectable_in(Some(&uid_a), false));
+        assert!(pool.pick_by_uid("uid_a", false).is_some());
     }
 
     #[test]
@@ -2019,7 +2120,7 @@ mod tests {
         assert_eq!(picked.uid, "qd-1");
         assert_eq!(picked.machine_id, "mid");
         // needs_relogin → disabled，不参与取号（Forbidden 态）
-        assert!(pool.pick_by_uid("qd-dead").is_none());
+        assert!(pool.pick_by_uid("qd-dead", false).is_none());
         assert_eq!(pool.status_list().iter().find(|s| s.uid == "qd-dead").unwrap().state, "Forbidden");
         // 全量重建：再次同步仅含 qd-dead（enabled）→ qd-1 消失
         pool.sync_from_qoder(
@@ -2231,7 +2332,7 @@ mod tests {
         let pool = build_pool(&[("uid_a", 10.0, 0), ("uid_b", 10.0, 0)]);
         pool.set_concurrency_limit(1);
         pool.inflight_handle("uid_a").fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        assert!(pool.pick_by_uid("uid_a").is_some());
+        assert!(pool.pick_by_uid("uid_a", false).is_some());
     }
 
     #[test]
@@ -2282,7 +2383,7 @@ mod tests {
         // 粘性账号 busy（inflight≥limit=1）且存在空闲候选 → 让位改选空闲账号
         let pool = build_pool(&[("uid_sticky", 10.0, 0), ("uid_idle", 10.0, 0)]);
         pool.inflight_handle("uid_sticky").fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let (p, ev) = pool.pick_sticky_yield("uid_sticky", None).unwrap();
+        let (p, ev) = pool.pick_sticky_yield("uid_sticky", None, false).unwrap();
         assert_eq!(p.uid, "uid_idle", "busy 粘性账号应让位给空闲账号");
         let ev = ev.unwrap();
         assert!(
@@ -2297,7 +2398,7 @@ mod tests {
         let pool = build_pool(&[("uid_sticky", 10.0, 0), ("uid_b", 10.0, 0)]);
         pool.inflight_handle("uid_sticky").fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         pool.inflight_handle("uid_b").fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let (p, ev) = pool.pick_sticky_yield("uid_sticky", None).unwrap();
+        let (p, ev) = pool.pick_sticky_yield("uid_sticky", None, false).unwrap();
         assert_eq!(p.uid, "uid_sticky", "全 busy 时应保持粘性");
         assert!(ev.unwrap().starts_with("sticky_fallback"));
     }
@@ -2306,7 +2407,7 @@ mod tests {
     fn sticky_kept_when_idle() {
         // 粘性账号空闲 → 正常锁定，无调度事件
         let pool = build_pool(&[("uid_sticky", 10.0, 0), ("uid_b", 10.0, 0)]);
-        let (p, ev) = pool.pick_sticky_yield("uid_sticky", None).unwrap();
+        let (p, ev) = pool.pick_sticky_yield("uid_sticky", None, false).unwrap();
         assert_eq!(p.uid, "uid_sticky");
         assert!(ev.is_none());
     }
@@ -2318,7 +2419,7 @@ mod tests {
         pool.inflight_handle("uid_sticky").fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let mut allowed = HashSet::new();
         allowed.insert("uid_sticky".to_string());
-        let (p, ev) = pool.pick_sticky_yield("uid_sticky", Some(&allowed)).unwrap();
+        let (p, ev) = pool.pick_sticky_yield("uid_sticky", Some(&allowed), false).unwrap();
         assert_eq!(p.uid, "uid_sticky", "无白名单内其他候选时保持粘性");
         assert!(ev.is_none());
     }
@@ -2329,7 +2430,7 @@ mod tests {
         let pool = build_pool(&[("uid_sticky", 10.0, 0), ("uid_b", 10.0, 0)]);
         pool.set_concurrency_limit(0);
         pool.inflight_handle("uid_sticky").fetch_add(5, std::sync::atomic::Ordering::Relaxed);
-        let (p, ev) = pool.pick_sticky_yield("uid_sticky", None).unwrap();
+        let (p, ev) = pool.pick_sticky_yield("uid_sticky", None, false).unwrap();
         assert_eq!(p.uid, "uid_sticky");
         assert!(ev.is_none());
     }
@@ -2340,7 +2441,7 @@ mod tests {
         let pool = build_pool(&[("uid_a", 10.0, 0), ("uid_b", 10.0, 0)]);
         pool.inflight_handle("uid_a").fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let (p, ev) =
-            pool.pick_excluding_constrained_ev(&HashSet::new(), None, None).unwrap();
+            pool.pick_excluding_constrained_ev(&HashSet::new(), None, None, false).unwrap();
         assert_eq!(p.uid, "uid_b");
         assert!(ev.unwrap().starts_with("busy_yield"));
     }
@@ -2352,7 +2453,7 @@ mod tests {
         pool.inflight_handle("uid_a").fetch_add(2, std::sync::atomic::Ordering::Relaxed);
         pool.inflight_handle("uid_b").fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let (p, ev) =
-            pool.pick_excluding_constrained_ev(&HashSet::new(), None, None).unwrap();
+            pool.pick_excluding_constrained_ev(&HashSet::new(), None, None, false).unwrap();
         assert_eq!(p.uid, "uid_b", "全 busy 时应取 inflight 最小者");
         assert!(ev.unwrap().starts_with("busy_fallback"));
     }
@@ -2364,7 +2465,7 @@ mod tests {
         pool.set_concurrency_limit(0);
         pool.inflight_handle("uid_a").fetch_add(3, std::sync::atomic::Ordering::Relaxed);
         let (_, ev) =
-            pool.pick_excluding_constrained_ev(&HashSet::new(), None, None).unwrap();
+            pool.pick_excluding_constrained_ev(&HashSet::new(), None, None, false).unwrap();
         assert!(ev.is_none());
     }
 }

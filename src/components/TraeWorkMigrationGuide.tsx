@@ -23,9 +23,8 @@ export default function TraeWorkMigrationGuide() {
   const dismiss = useAppStore((s) => s.dismissTraeworkGuide);
   if (!report) return null;
 
-  // settings 步明细：优先消费结构化字段 settings_note（后端 v3.7.12+ 迁移时单列，
-  // 不再依赖文案子串契约）；旧版报告无该字段时回退 notes 子串匹配（仅兼容存量
-  // 已落报告，新报告恒走结构化字段）
+  // settings 步明细：优先消费结构化 settings_note（后端新版报告直传）；
+  // 旧版报告（升级前已落 kv）无该字段时回退子串匹配，不误显「已跳过」
   const settingsNote =
     report.settings_note ?? report.notes.find((n) => n.includes('trae_path'));
   const finishedAt = new Date(report.finished_at_ms).toLocaleString();

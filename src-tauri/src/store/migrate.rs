@@ -947,11 +947,11 @@ pub struct TraeWorkMigrationReport {
     pub finished_at_ms: i64,
     /// 迁移明细条目（settings 步 note + 快照池步摘要，用户可读文案）
     pub notes: Vec<String>,
-    /// settings 步（旧安装路径设置处置）的结构化结果（审查修复：前端此前用
-    /// notes 子串匹配 'trae_path' 识别该步，跨层文案契约脆弱，后端改文案即
-    /// 静默误显「已跳过」）。None = settings 步无事发生（未发现旧安装路径设置）。
+    /// settings 步处置结果的结构化字段（前端「迁移安装路径设置」步直接消费，
+    /// 不再对 notes 做子串匹配——后端改 note 文案不会误显「已跳过」；
+    /// None = 无 trae_path 存量或迁移未跑该步）。
     /// #[serde(default)]：修复前落的旧报告无此字段，反序列化按 None 兼容
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub settings_note: Option<String>,
     /// 整组迁入 profiles_trae 的组数
     pub moved_groups: usize,
@@ -1039,7 +1039,7 @@ fn migrate_traework_merge_inner(store: &Store, data_dir: &Path) -> Option<String
             &TraeWorkMigrationReport {
                 finished_at_ms: chrono::Utc::now().timestamp_millis(),
                 notes: notes.clone(),
-                settings_note,
+                settings_note: settings_note.clone(),
                 moved_groups,
                 legacy_groups,
             },
@@ -1114,17 +1114,16 @@ fn migrate_traework_settings(store: &Store) -> Result<Option<String>, String> {
             let cn = obj.get("trae_cn_path").and_then(|v| v.as_str()).unwrap_or("");
             if cn.trim().is_empty() && Path::new(p).is_file() {
                 // 承接守卫：trae_path 是退役 Trae Work 的专属键，其值可能指向未卸载的
-                // 旧客户端（TRAE SOLO CN.exe / TRAE SOLO.exe / 旧形态 Trae.exe——旧
-                // TraeWork 档案 exe_names 三者皆收录，与本迁移运行检测名单同源）——
-                // 承接会让「打开 Trae」静默拉起旧 exe，且 app_locate 一级命中压制
-                // 自动探测。按文件名判旧形态拒绝承接（原仅拒 solo，Trae.exe 旧形态
-                // 会被误承接——审查修复），留空走 env.rs 自动探测
+                // 旧客户端（TRAE SOLO CN.exe / 旧版 ...\Programs\Trae\Trae.exe）——承接会让
+                // 「打开 Trae」静默拉起旧 exe，且 app_locate 一级命中压制自动探测。按文件名
+                // 拒绝旧客户端名单（solo 形态 + 旧版 Trae.exe），留空走 env.rs 自动探测
+                // （默认路径/注册表/进程）
                 let fname = Path::new(p)
                     .file_name()
                     .map(|n| n.to_string_lossy().to_lowercase())
                     .unwrap_or_default();
                 if fname.contains("solo") || fname == "trae.exe" {
-                    note = "trae_path 指向已退役的旧版客户端（非合并版 Trae CN），已丢弃（不承接，走自动探测）".to_string();
+                    note = "trae_path 指向已退役的旧 Trae 客户端，已丢弃（不承接，走自动探测）".to_string();
                 } else {
                     obj.insert("trae_cn_path".into(), json!(p));
                     note = "trae_path 已承接为 trae_cn_path（原键删除）".to_string();
