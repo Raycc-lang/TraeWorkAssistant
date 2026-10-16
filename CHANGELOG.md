@@ -20,9 +20,13 @@
 - **审查修复批（①②③④）**：记账宽口径 `u64_pair`（字符串/浮点形态不再静默得 0）+ toolexec 失败终局保留真实消耗；SSE 双完成/第三守卫（终态幂等）；kv 迁移原子化（tmp+rename）+ no-clobber；断连 usage 补记 + cached_tokens 旁路记账；healthz 三池逐池判定；签到奖励运行期回写 `apply_credits_delta`；qoder_credits 混合账户到期口径。
 - **签到链（issue #110/#114）**：设备当日已签错误转译（归 Already 并排除出重试轮）+ 签到前设备冲突预警（`checkin_device_conflicts` 命令 + 前端提示）；claim 请求统一最小头形态（风控按形态拦截）。
 
+### 发布前审查修复
+
+- **版本升级引入 UTF-8 BOM（审查发现）**：`package.json`、`crates/aiwork-core/Cargo.toml`、`crates/aiwork-server/Cargo.toml` 三文件被写入 UTF-8 BOM（`EF BB BF`，字节级定界 7d66e6c 无 / e8e343f 起）。vite PostCSS 配置加载按原始字节 `JSON.parse`，BOM 致 `vitest`/`vite build` 全量失败；toml 解析器容忍 BOM 故 cargo 侧未暴露（更隐蔽）。已剥除；1.4.14 曾发生同类问题（530ec1e），版本升级写入链路需加 BOM 校验。无运行时语义变化，纯构建/测试链修复。
+
 ### 验证
 
-- `cargo test --workspace` 701+12 通过（7 忽略）· `tsc` 0 错误 · `vitest` 61 通过。
+- `cargo test --workspace` 701+12 通过（7 忽略）· `tsc` 0 错误 · `vitest` 61 通过（BOM 剥除后实测）。
 
 ---
 
