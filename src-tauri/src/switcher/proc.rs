@@ -28,9 +28,27 @@ fn name_matches(prof: &AppProfile, name: &str) -> bool {
     prof.proc_names.iter().any(|n| base.eq_ignore_ascii_case(n))
 }
 
+/// 审查修复（M5/W5，2026-10-16 双客户端并存实测）：共用映像名 "CodeBuddy" 的
+/// 归属仲裁（ImageArk 布尔等式 is_self = marker.exists() == owner_is_self）。
+/// 返回 false = 本档案在当前安装布局下无权操作该映像（并存布局杀国际会误杀
+/// 国内实例、老单布局杀国内会误杀国际实例），调用方必须跳过该进程。
+/// 仅歧义映像名受仲裁；白名单内其余无歧义名（"CodeBuddy CN" 等）直通。
+/// 四消费点统一接入：list_procs / running_exe_of / pid_alive_matching / kill_all。
+fn ark_allows(prof: &AppProfile, name: &str) -> bool {
+    let Some(ark) = &prof.image_ark else {
+        return true;
+    };
+    let base = strip_exe_suffix(name);
+    if !ark.ambiguous.iter().any(|a| base.eq_ignore_ascii_case(a)) {
+        return true;
+    }
+    ark.marker.exists() == ark.owner_is_self
+}
+
 /// 剥离映像名尾部的 ".exe"（大小写不敏感；无后缀原样返回）。
 /// 用 get 防多字节字符下标越界（非字符边界时 get 返回 None → 原样返回）。
-#[cfg(windows)]
+/// 跨平台（2026-10-18 合并修复）：ark_allows 无平台门控且引用本函数，
+/// strip 门控会导致 macOS 编译失败——纯字符串操作，两平台通用
 fn strip_exe_suffix(name: &str) -> &str {
     if name.len() > 4 {
         if let Some(base) = name.get(..name.len() - 4) {
@@ -68,10 +86,14 @@ fn mac_main_matches(prof: &AppProfile, p: &sysinfo::Process) -> bool {
 fn proc_matches(prof: &AppProfile, p: &sysinfo::Process) -> bool {
     #[cfg(windows)]
     {
-        name_matches(prof, &p.name().to_string_lossy())
+        // M5/W5：白名单命中后仍须经 ark 归属仲裁（歧义映像名双客户端并存防误杀）
+        let name = p.name().to_string_lossy();
+        name_matches(prof, &name) && ark_allows(prof, &name)
     }
     #[cfg(target_os = "macos")]
     {
+        // mac 按 bundle 路径段匹配天然消歧（CodeBuddy.app vs CodeBuddy CN.app），
+        // 无需 ark 仲裁
         mac_main_matches(prof, p)
     }
 }
@@ -82,6 +104,7 @@ pub fn list_procs(prof: &AppProfile) -> Vec<(u32, Option<std::path::PathBuf>)> {
     let sys = snapshot();
     sys.processes()
         .iter()
+        // proc_matches 平台分派 + ark 仲裁（mac bundle 段 / Windows 映像名+ark）
         .filter(|(_, p)| proc_matches(prof, p))
         .map(|(pid, p)| (pid.as_u32(), p.exe().map(|e| e.to_path_buf())))
         .collect()
@@ -114,7 +137,9 @@ pub fn running_exe_of(prof: &AppProfile) -> Option<std::path::PathBuf> {
             .iter()
             .filter(|(_, p)| {
                 let name = p.name().to_string_lossy();
-                prof.proc_patterns.iter().any(|pat| super::glob_match_ci(pat, &name))
+                // M5/W5：glob 命中后仍须经映像归属仲裁（"CodeBuddy.exe" glob 在老单
+                // 布局下会命中国内同名映像，国际档案不得取其 exe）
+                prof.proc_patterns.iter().any(|pat| super::glob_match_ci(pat, &name)) && ark_allows(prof, &name)
             })
             .find_map(|(_, p)| p.exe().map(|e| e.to_path_buf()))
     }
@@ -469,9 +494,15 @@ pub fn start_app_pid(sess: &mut Session, sink: &dyn ProgressSink) -> Result<u32,
         // 分离启动（对齐 PS Start-Process，不等待）；启动失败 throw → 顶层 catch fatal。
         // 记录 spawn 主进程 PID：Electron 主进程关闭时其子进程（GPU/renderer 等）随之退出，
         // 关闭阶段按此 PID 精确命中本次实例。
-        let child = cmd.spawn().map_err(|e| {
-            super::thrown(sink, &format!("启动 {} 失败: {e}", sess.prof.app_name))
-        })?;
+        // 静默子进程 stdio：客户端（Electron）自身的弃用警告/RequestStore 日志
+        // 不再混入应用控制台（客户端有自己的日志文件，排障不受影响）
+        let child = cmd
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .map_err(|e| {
+                super::thrown(sink, &format!("启动 {} 失败: {e}", sess.prof.app_name))
+            })?;
         Ok(child.id())
     }
 }
@@ -515,6 +546,7 @@ pub fn post_wm_close(pid: u32) {
 fn kill_all(prof: &AppProfile) {
     let sys = snapshot();
     for (_, p) in sys.processes() {
+        // proc_matches 平台分派 + ark 仲裁（与 list_procs 同源）
         if proc_matches(prof, p) {
             let _ = p.kill();
         }
@@ -531,6 +563,40 @@ mod tests {
     }
 
     #[cfg(windows)]
+    #[test]
+    fn image_ark_归属仲裁双向() {
+        let _lock = crate::switcher::test_io_lock();
+        let dir = std::env::temp_dir().join(format!("sw-ark-test-{}", std::process::id()));
+        let marker = dir.join("CodeBuddy.exe");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // 覆盖为测试专用 marker（档案默认 marker 指向本机真实安装路径，
+        // 存在性随环境变化，测试必须确定性）
+        let mk = |owner_is_self: bool| profile::ImageArk {
+            marker: marker.clone(),
+            owner_is_self,
+            ambiguous: &["CodeBuddy"],
+        };
+        let mut intl = prof(TargetApp::CodeBuddyAI);
+        intl.image_ark = Some(mk(true));
+        let mut cn = prof(TargetApp::CodeBuddy);
+        cn.image_ark = Some(mk(false));
+        // 无仲裁档案（image_ark=None）恒允许
+        assert!(ark_allows(&prof(TargetApp::Doubao), "Doubao.exe"));
+        // 布局一：国际 exe 在盘（并存布局）——歧义映像 "CodeBuddy" 归国际版
+        std::fs::write(&marker, b"").unwrap();
+        assert!(ark_allows(&intl, "CodeBuddy.exe"));
+        assert!(ark_allows(&intl, "codebuddy.EXE"));
+        assert!(!ark_allows(&cn, "CodeBuddy"));
+        // 无歧义名（国内 CN 映像）不受仲裁直通——并存时国内端仍可正常关闭
+        assert!(ark_allows(&cn, "CodeBuddy CN.exe"));
+        // 布局二：国际 exe 不在盘（老单布局）——歧义映像 "CodeBuddy" 归国内
+        std::fs::remove_file(&marker).unwrap();
+        assert!(!ark_allows(&intl, "CodeBuddy.exe"));
+        assert!(ark_allows(&cn, "CodeBuddy"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn name_matches_兼容sysinfo带exe后缀() {
         // 实测根因回归：sysinfo ImageName 带 .exe 后缀，白名单不带——必须能命中

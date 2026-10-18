@@ -436,29 +436,50 @@ pub(crate) fn ide_exe_candidates(state: &AppState) -> Vec<PathBuf> {
     out
 }
 
-/// IDE 数据目录（M0 实测修正：Windows=`%APPDATA%\QoderCN`，与 switcher Qoder 档案
-/// data_dir 同源）。macOS 实装（2026-10-05 合并审查 + 本机实测证实）：
-/// `~/Library/Application Support/QoderCN`——IDE 编译产物 main.js 的 userData 解析
-/// 函数 PP() 按 `join(getAppDataPath(), product.nameShort="QoderCN")` 取值（与
-/// Windows 同名不同根），经 platform 基根收口（与 profile.rs roaming_dir("QoderCN")
-/// 同源）；目录尚未出现在本机仅因 IDE 未启动过，不影响切换灰度（mac_supported=false）
-pub(crate) fn ide_data_dir() -> Option<PathBuf> {
-    #[cfg(windows)]
-    {
-        std::env::var("APPDATA")
-            .ok()
-            .map(|d| PathBuf::from(d).join("QoderCN"))
-    }
+/// IDE 数据目录候选（issue #119：部分用户机器无 QoderCN 目录，os error 3）：
+/// ① `QoderCN` —— CN IDE（0.4.3 拆分后的 IDE 本体，M0 实测）；
+/// ② `Qoder` —— 国际版 IDE（Electron userData 同名惯例）。
+/// 与 switcher Qoder 档案 data_dir（profile.rs 恒 QoderCN）独立：档案快照布局
+/// 绑 icube 白名单，暂不随候选扩展。
+/// macOS 实装（2026-10-05 合并审查 + 本机实测证实）：`~/Library/Application
+/// Support/<候选名>`——IDE 编译产物 main.js 的 userData 解析函数 PP() 按
+/// `join(getAppDataPath(), product.nameShort)` 取值（与 Windows 同名不同根），
+/// 经 platform 基根收口（与 profile.rs roaming_dir("QoderCN") 同源）
+pub(crate) fn ide_data_dir_candidates() -> Vec<PathBuf> {
     #[cfg(target_os = "macos")]
     {
-        Some(crate::platform::app_support_root_lossy().join("QoderCN"))
+        let root = crate::platform::app_support_root_lossy();
+        ["QoderCN", "Qoder"]
+            .iter()
+            .map(|n| root.join(n))
+            .collect()
     }
-    #[cfg(not(any(windows, target_os = "macos")))]
+    #[cfg(not(target_os = "macos"))]
     {
         std::env::var("APPDATA")
             .ok()
-            .map(|d| PathBuf::from(d).join("QoderCN"))
+            .map(|d| {
+                ["QoderCN", "Qoder"]
+                    .iter()
+                    .map(|n| PathBuf::from(&d).join(n))
+                    .collect()
+            })
+            .unwrap_or_default()
     }
+}
+
+/// IDE 数据目录：首个存在的候选；均不存在时回退首个候选（QoderCN），维持既有
+/// 调用方（状态看板路径展示、环境重置清理目标、fail-open 守卫）默认语义不变。
+/// 注意：回退值可能并不存在——需要区分「目录不存在」的调用方（qoder_ide_scan）
+/// 应对返回值 `filter(|d| d.is_dir())` 后以 ok_or_else 报错，并用
+/// [`ide_data_dir_candidates`] 在报错中列出全部已探测路径
+pub(crate) fn ide_data_dir() -> Option<PathBuf> {
+    let cands = ide_data_dir_candidates();
+    cands
+        .iter()
+        .find(|d| d.is_dir())
+        .or_else(|| cands.first())
+        .cloned()
 }
 
 /// Work exe 候选：settings.qoderwork_path 人工指定优先，否则按平台默认安装布局。

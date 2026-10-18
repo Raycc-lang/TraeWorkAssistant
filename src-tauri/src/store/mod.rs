@@ -255,16 +255,14 @@ impl Store {
         }
     }
 
-    /// 单行删除（与 row_upsert 配对；仅移除目标 pk 行，不动其余行）
+    /// 单行删除（白名单表，与 row_upsert 配对；buddy-ai 迁移/账号移除路径用，
+    /// 仅移除目标 pk 行，不动其余行）
     pub fn row_delete(&self, table: &str, pk: &str) -> Result<(), String> {
         if !schema::ROW_TABLES.contains(&table) {
             return Err(format!("非法表名: {table}"));
         }
         self.with_conn(|c| {
-            c.execute(
-                &format!("DELETE FROM [{table}] WHERE pk = ?1"),
-                rusqlite::params![pk],
-            )?;
+            c.execute(&format!("DELETE FROM [{table}] WHERE pk = ?1"), rusqlite::params![pk])?;
             Ok(())
         })
     }

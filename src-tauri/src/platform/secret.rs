@@ -169,6 +169,7 @@ mod tests {
             qoder_pool_lock: std::sync::Arc::new(std::sync::Mutex::new(())),
             wb_pool_lock: std::sync::Arc::new(std::sync::Mutex::new(())),
             doubao_pool_lock: std::sync::Arc::new(std::sync::Mutex::new(())),
+            buddy_ai_pool_lock: std::sync::Arc::new(std::sync::Mutex::new(())),
             group_defs_lock: std::sync::Arc::new(std::sync::Mutex::new(())),
         };
         // 首次：无文件 → None
@@ -204,6 +205,7 @@ mod tests {
             qoder_pool_lock: std::sync::Arc::new(std::sync::Mutex::new(())),
             wb_pool_lock: std::sync::Arc::new(std::sync::Mutex::new(())),
             doubao_pool_lock: std::sync::Arc::new(std::sync::Mutex::new(())),
+            buddy_ai_pool_lock: std::sync::Arc::new(std::sync::Mutex::new(())),
             group_defs_lock: std::sync::Arc::new(std::sync::Mutex::new(())),
         };
         let pwd: Vec<u8> = (0..32u8).collect();
