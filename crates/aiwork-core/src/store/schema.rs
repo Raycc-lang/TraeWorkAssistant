@@ -25,6 +25,9 @@ pub const ROW_TABLES: &[&str] = &[
     "doubao_accounts",
     "wb_accounts",
     "wb_tokens",
+    // Buddy 国际版（buddy-ai）独立池：账号池 / token store 双表独立，杜绝混居
+    "buddy_ai_accounts",
+    "buddy_ai_tokens",
     // F-80 Qoder 三端支持（M1）：账号池 / token store（含 PAT）/ 签到结果（90 天滚动）/ 积分快照（365 天裁剪）
     "qoder_accounts",
     "qoder_tokens",
@@ -81,6 +84,18 @@ const DDL: &[&str] = &[
         updated_at TEXT NOT NULL DEFAULT (datetime('now','localtime'))
     )",
     "CREATE TABLE IF NOT EXISTS wb_tokens (
+        pk         TEXT PRIMARY KEY,
+        data       TEXT NOT NULL,
+        updated_at TEXT NOT NULL DEFAULT (datetime('now','localtime'))
+    )",
+    // Buddy 国际版（buddy-ai）独立池（移植 main f5f2cd3..61cc245）：与 wb 池表结构
+    // 同构、零共享——账号池 + token store 双表独立，杜绝混居
+    "CREATE TABLE IF NOT EXISTS buddy_ai_accounts (
+        pk         TEXT PRIMARY KEY,
+        data       TEXT NOT NULL,
+        updated_at TEXT NOT NULL DEFAULT (datetime('now','localtime'))
+    )",
+    "CREATE TABLE IF NOT EXISTS buddy_ai_tokens (
         pk         TEXT PRIMARY KEY,
         data       TEXT NOT NULL,
         updated_at TEXT NOT NULL DEFAULT (datetime('now','localtime'))
@@ -246,8 +261,29 @@ const DDL: &[&str] = &[
         explicit   INTEGER NOT NULL DEFAULT 0,
         updated_at TEXT NOT NULL DEFAULT (datetime('now','localtime'))
     )",
+    // buddy-ai 每日活跃打卡结果（P2 对齐国内 wb_checkin_results：日期趋势/日历/结果列表数据源）
+    "CREATE TABLE IF NOT EXISTS buddy_ai_checkin_results (
+        id      INTEGER PRIMARY KEY AUTOINCREMENT,
+        date    TEXT NOT NULL DEFAULT '',
+        time    TEXT NOT NULL DEFAULT '',
+        user_id TEXT NOT NULL DEFAULT '',
+        name    TEXT NOT NULL DEFAULT '',
+        status  TEXT NOT NULL DEFAULT '',
+        message TEXT NOT NULL DEFAULT '',
+        reward  REAL
+    )",
+    // P8：buddy-ai 每日积分快照（同日覆盖 + 365 天裁剪；镜像 wb_credits_history，
+    // 积分看板趋势曲线数据源——打卡回写与手动同步双挂点保证有数据的天不缺格）
+    "CREATE TABLE IF NOT EXISTS buddy_ai_credits_history (
+        date          TEXT PRIMARY KEY,
+        ts            INTEGER NOT NULL DEFAULT 0,
+        total_balance REAL NOT NULL DEFAULT 0,
+        accounts      TEXT NOT NULL DEFAULT '[]',
+        earned        REAL
+    )",
     "CREATE INDEX IF NOT EXISTS idx_credits_history_date ON credits_history(date)",
     "CREATE INDEX IF NOT EXISTS idx_wb_checkin_results_date ON wb_checkin_results(date)",
+    "CREATE INDEX IF NOT EXISTS idx_buddy_ai_checkin_results_date ON buddy_ai_checkin_results(date)",
     "CREATE INDEX IF NOT EXISTS idx_checkin_results_day ON checkin_results(day)",
 ];
 

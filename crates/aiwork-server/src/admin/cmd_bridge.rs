@@ -320,6 +320,17 @@ pub fn dispatch(admin: &AdminState, name: &str, args: Value) -> Result<Value, St
             let qoder_group_ids = opt_arg(&args, "qoder_group_ids")?;
             let qoder_strategy = opt_arg(&args, "qoder_strategy")?;
             let trae_enabled = opt_arg(&args, "trae_enabled")?;
+            let buddy_ai_enabled = opt_arg(&args, "buddy_ai_enabled")?;
+            let buddy_ai_sticky_enabled = opt_arg(&args, "buddy_ai_sticky_enabled")?;
+            let buddy_ai_pool_sticky_ttl_secs =
+                opt_arg(&args, "buddy_ai_pool_sticky_ttl_secs")?;
+            let buddy_ai_account_concurrency_limit =
+                opt_arg(&args, "buddy_ai_account_concurrency_limit")?;
+            let buddy_ai_sticky_ttl_secs = opt_arg(&args, "buddy_ai_sticky_ttl_secs")?;
+            let buddy_ai_hedge_threshold_ms = opt_arg(&args, "buddy_ai_hedge_threshold_ms")?;
+            let buddy_ai_group_ids = opt_arg(&args, "buddy_ai_group_ids")?;
+            let buddy_ai_tag_ids = opt_arg(&args, "buddy_ai_tag_ids")?;
+            let buddy_ai_strategy = opt_arg(&args, "buddy_ai_strategy")?;
             let trae_tag_ids = opt_arg(&args, "trae_tag_ids")?;
             let wb_tag_ids = opt_arg(&args, "wb_tag_ids")?;
             let qoder_tag_ids = opt_arg(&args, "qoder_tag_ids")?;
@@ -355,6 +366,15 @@ pub fn dispatch(admin: &AdminState, name: &str, args: Value) -> Result<Value, St
                 qoder_group_ids,
                 qoder_strategy,
                 trae_enabled,
+                buddy_ai_enabled,
+                buddy_ai_sticky_enabled,
+                buddy_ai_pool_sticky_ttl_secs,
+                buddy_ai_account_concurrency_limit,
+                buddy_ai_sticky_ttl_secs,
+                buddy_ai_hedge_threshold_ms,
+                buddy_ai_group_ids,
+                buddy_ai_tag_ids,
+                buddy_ai_strategy,
                 trae_tag_ids,
                 wb_tag_ids,
                 qoder_tag_ids,
@@ -364,6 +384,7 @@ pub fn dispatch(admin: &AdminState, name: &str, args: Value) -> Result<Value, St
         "pool_status" => to_json(api_server_cmd::pool_status()),
         "wb_pool_status" => to_json(api_server_cmd::wb_pool_status()),
         "qoder_pool_status" => to_json(api_server_cmd::qoder_pool_status()),
+        "buddy_ai_pool_status" => to_json(api_server_cmd::buddy_ai_pool_status()),
         "api_logs_list" => to_json(api_server_cmd::api_logs_list(state)),
         "api_logs_detail" => {
             let date = arg(&args, "date")?;
@@ -386,6 +407,7 @@ pub fn dispatch(admin: &AdminState, name: &str, args: Value) -> Result<Value, St
             block_on_async(api_server_cmd::api_qoder_catalog_sync(state)).and_then(to_json)
         }
         "api_wb_catalog_list" => to_json(api_server_cmd::api_wb_catalog_list(state)),
+        "api_buddy_ai_catalog_list" => to_json(api_server_cmd::api_buddy_ai_catalog_list(state)),
         "api_usage_stats" => {
             let days = opt_arg(&args, "days")?;
             to_json(api_server_cmd::api_usage_stats(state, days))
@@ -401,6 +423,10 @@ pub fn dispatch(admin: &AdminState, name: &str, args: Value) -> Result<Value, St
         "api_qoder_usage_stats" => {
             let days = opt_arg(&args, "days")?;
             to_json(api_server_cmd::api_qoder_usage_stats(state, days))
+        }
+        "api_buddy_ai_usage_stats" => {
+            let days = opt_arg(&args, "days")?;
+            to_json(api_server_cmd::api_buddy_ai_usage_stats(state, days))
         }
         "api_keys_list" => to_json(api_server_cmd::api_keys_list(state)),
         "api_keys_save" => {
@@ -614,6 +640,96 @@ pub fn dispatch(admin: &AdminState, name: &str, args: Value) -> Result<Value, St
             workbuddy::workbuddy_activity_info(state, user_id, refresh).and_then(to_json)
         }
 
+        // ==================== buddy-ai（国际版独立池，§3.1 失败域隔离） ====================
+        // 桌面专属命令不移植：buddy_ai_local_scan / buddy_ai_env_reset /
+        // buddy_ai_open_data_dir / buddy_ai_token_stats——均依赖本机客户端文件
+        // 系统/进程（%USERPROFILE% 数据目录、explorer），Web 版本地数据源整体下线
+        "buddy_ai_oauth_login" => {
+            // 扫码全流程在后台线程执行，事件经 "buddy-ai-oauth-progress"/"buddy-ai-oauth-done" 广播
+            let events = admin.events.clone();
+            let emit: workbuddy::WbOauthEmitter =
+                Arc::new(move |name: &str, payload: serde_json::Value| {
+                    let _ = events.send((name.to_string(), payload));
+                });
+            workbuddy::buddy_ai_oauth_login(state, emit).and_then(to_json)
+        }
+        "buddy_ai_account_import_creds" => {
+            let name = opt_arg(&args, "name")?;
+            let access_token = arg(&args, "access_token")?;
+            let refresh_token = opt_arg(&args, "refresh_token")?;
+            let domain = opt_arg(&args, "domain")?;
+            workbuddy::buddy_ai_account_import_creds(state, name, access_token, refresh_token, domain)
+                .and_then(to_json)
+        }
+        "buddy_ai_accounts_list" => workbuddy::buddy_ai_accounts_list(state).and_then(to_json),
+        "buddy_ai_account_remove" => {
+            let user_id = arg(&args, "user_id")?;
+            workbuddy::buddy_ai_account_remove(state, user_id).and_then(to_json)
+        }
+        "buddy_ai_refresh_token" => {
+            let user_id = arg(&args, "user_id")?;
+            workbuddy::buddy_ai_refresh_token(state, user_id).and_then(to_json)
+        }
+        "buddy_ai_checkin_start" => {
+            // 打卡轮次互斥 + 工作线程模式，立即返回；进度经 "buddy-ai-checkin-progress" NDJSON 广播
+            let events = admin.events.clone();
+            let emit: workbuddy::BuddyAiCheckinEmitter =
+                Arc::new(move |name: &str, payload: serde_json::Value| {
+                    let _ = events.send((name.to_string(), payload));
+                });
+            workbuddy::buddy_ai_checkin_start(state, emit).and_then(to_json)
+        }
+        "buddy_ai_checkin_results" => {
+            let days = opt_arg(&args, "days")?;
+            workbuddy::buddy_ai_checkin_results(state, days).and_then(to_json)
+        }
+        "buddy_ai_account_save" => {
+            let user_id = arg(&args, "user_id")?;
+            let name = opt_arg(&args, "name")?;
+            let note = opt_arg(&args, "note")?;
+            let group_id = opt_arg(&args, "group_id")?;
+            workbuddy::buddy_ai_account_save(state, user_id, name, note, group_id).and_then(to_json)
+        }
+        "buddy_ai_account_toggle" => {
+            let user_id = arg(&args, "user_id")?;
+            let disabled = arg(&args, "disabled")?;
+            workbuddy::buddy_ai_account_toggle(state, user_id, disabled).and_then(to_json)
+        }
+        "buddy_ai_credits_fetch" => workbuddy::buddy_ai_credits_fetch(state).and_then(to_json),
+        "buddy_ai_credits_history" => {
+            let days = opt_arg(&args, "days")?;
+            workbuddy::buddy_ai_credits_history(state, days).and_then(to_json)
+        }
+        "buddy_ai_accounts_export" => {
+            let include_credentials = opt_arg(&args, "include_credentials")?;
+            workbuddy::buddy_ai_accounts_export(state, include_credentials).and_then(to_json)
+        }
+        "buddy_ai_accounts_import" => {
+            let pool_json = arg(&args, "pool_json")?;
+            workbuddy::buddy_ai_accounts_import(state, pool_json).and_then(to_json)
+        }
+        "buddy_ai_request_usage" => {
+            let user_id = arg(&args, "user_id")?;
+            let days = opt_arg(&args, "days")?;
+            let page = opt_arg(&args, "page")?;
+            let page_size = opt_arg(&args, "page_size")?;
+            workbuddy::buddy_ai_request_usage(state, user_id, days, page, page_size).and_then(to_json)
+        }
+        "buddy_ai_usage_official_all" => {
+            workbuddy::buddy_ai_usage_official_all(state).and_then(to_json)
+        }
+        "buddy_ai_sessions_query" => {
+            let start = arg(&args, "start")?;
+            let end = arg(&args, "end")?;
+            let model = opt_arg(&args, "model")?;
+            let user_id = opt_arg(&args, "user_id")?;
+            let page = opt_arg(&args, "page")?;
+            let page_size = opt_arg(&args, "page_size")?;
+            workbuddy::buddy_ai_sessions_query(state, start, end, model, user_id, page, page_size)
+                .and_then(to_json)
+        }
+        "buddy_ai_catalog_sync" => workbuddy::buddy_ai_catalog_sync(state).and_then(to_json),
+
         // ==================== qoder（Qoder 全域） ====================
         "qoder_settings_get" => to_json(qoder::qoder_settings_get(state)),
         "qoder_settings_set" => {
@@ -793,6 +909,7 @@ mod tests {
             jwt_refresh_lock: Arc::new(std::sync::Mutex::new(())),
             qoder_pool_lock: Arc::new(std::sync::Mutex::new(())),
             wb_pool_lock: Arc::new(std::sync::Mutex::new(())),
+            buddy_ai_pool_lock: Arc::new(std::sync::Mutex::new(())),
             group_defs_lock: Arc::new(std::sync::Mutex::new(())),
             events: std::sync::Arc::new(std::sync::Mutex::new(None)),
         });

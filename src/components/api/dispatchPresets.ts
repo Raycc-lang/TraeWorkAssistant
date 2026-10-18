@@ -6,11 +6,11 @@
  * Trae 池生效值，同 Buddy 语义）。
  * 注意：Qoder 池与 Trae / Buddy 同等地位参与池间策略调度（默认优先级序位于
  * 尾部，可在「固定优先级」中上移，smart 重排同样覆盖 Qoder）；池内策略已纳入
- * 匹配（qoder_strategy 可配）。
+ * 匹配（qoder_strategy / buddy_ai_strategy 可配）。
  */
 import type { ApiPoolFile, DispatchPolicy } from '../../types';
 
-/** 最佳组合预设：inter = 池间策略；trae / buddy / qoder = 各池池内策略（预设均为显式策略） */
+/** 最佳组合预设：inter = 池间策略；trae / buddy / qoder / buddyAi = 各池池内策略（预设均为显式策略） */
 export interface DispatchPreset {
   key: string;
   name: string;
@@ -19,6 +19,7 @@ export interface DispatchPreset {
   trae: string;
   buddy: string;
   qoder: string;
+  buddyAi: string;
   recommended?: boolean;
 }
 
@@ -31,6 +32,7 @@ export const DISPATCH_PRESETS: DispatchPreset[] = [
     trae: 'weighted',
     buddy: 'weighted',
     qoder: 'weighted',
+    buddyAi: 'weighted',
     recommended: true,
   },
   {
@@ -41,6 +43,7 @@ export const DISPATCH_PRESETS: DispatchPreset[] = [
     trae: 'expire_first',
     buddy: 'expire_first',
     qoder: 'expire_first',
+    buddyAi: 'expire_first',
   },
   {
     key: 'even',
@@ -50,6 +53,7 @@ export const DISPATCH_PRESETS: DispatchPreset[] = [
     trae: 'credit_first',
     buddy: 'credit_first',
     qoder: 'credit_first',
+    buddyAi: 'credit_first',
   },
   {
     key: 'fast',
@@ -59,6 +63,7 @@ export const DISPATCH_PRESETS: DispatchPreset[] = [
     trae: 'p2c',
     buddy: 'p2c',
     qoder: 'p2c',
+    buddyAi: 'p2c',
   },
   {
     key: 'fixed',
@@ -68,19 +73,26 @@ export const DISPATCH_PRESETS: DispatchPreset[] = [
     trae: 'expire_first',
     buddy: 'expire_first',
     qoder: 'expire_first',
+    buddyAi: 'expire_first',
   },
 ];
 
 /** 当前配置命中的预设；无命中（自定义组合）或数据未就绪时返回 undefined */
 export function matchPreset(
-  pool: Pick<ApiPoolFile, 'strategy' | 'wb_strategy' | 'qoder_strategy'> | null,
+  pool: Pick<ApiPoolFile, 'strategy' | 'wb_strategy' | 'qoder_strategy' | 'buddy_ai_strategy'> | null,
   policy: Pick<DispatchPolicy, 'strategy'> | null,
 ): DispatchPreset | undefined {
   if (!pool || !policy) return undefined;
   const trae = pool.strategy || 'expire_first';
   const buddy = pool.wb_strategy || trae;
   const qoder = pool.qoder_strategy || trae;
+  const buddyAi = pool.buddy_ai_strategy || trae;
   return DISPATCH_PRESETS.find(
-    (p) => policy.strategy === p.inter && trae === p.trae && buddy === p.buddy && qoder === p.qoder,
+    (p) =>
+      policy.strategy === p.inter &&
+      trae === p.trae &&
+      buddy === p.buddy &&
+      qoder === p.qoder &&
+      buddyAi === p.buddyAi,
   );
 }

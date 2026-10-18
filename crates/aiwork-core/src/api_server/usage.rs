@@ -231,18 +231,20 @@ impl DayStats {
 
 /// 用量分桶（资源池维度分账）：Trae = Trae 模型请求；Wb = WB 上游请求；
 /// Custom = 自定义模型（custom_models.json 命中直达）请求；
-/// Qoder = Qoder 上游请求（p3-3 移植，独立 qoder_days 桶）
+/// Qoder = Qoder 上游请求（p3-3 移植，独立 qoder_days 桶）；
+/// BuddyAi = Buddy 国际版（buddy-ai 独立池）请求（移植 main f5f2cd3..61cc245，§3.1 记账分区，与国内混计禁止）
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum UsageBucket {
     Trae,
     Wb,
     Custom,
     Qoder,
+    BuddyAi,
 }
 
 /// 用量数据根结构：日期 → 单日统计。
 /// 按资源池分桶：days = Trae 模型请求；wb_days = WB 上游请求；custom_days = 自定义模型请求；
-/// qoder_days = Qoder 上游请求（p3-3 移植）
+/// qoder_days = Qoder 上游请求（p3-3 移植）；buddy_ai_days = buddy-ai 国际池请求
 /// （serde default，旧文件无对应桶时视为空——历史混入数据无法追溯分离，从启用时点起分账）。
 #[derive(Serialize, Deserialize, Clone, Default, Debug)]
 pub struct UsageFile {
@@ -254,6 +256,8 @@ pub struct UsageFile {
     pub custom_days: HashMap<String, DayStats>,
     #[serde(default)]
     pub qoder_days: HashMap<String, DayStats>,
+    #[serde(default)]
+    pub buddy_ai_days: HashMap<String, DayStats>,
 }
 
 impl UsageFile {
@@ -263,6 +267,7 @@ impl UsageFile {
             UsageBucket::Wb => &mut self.wb_days,
             UsageBucket::Custom => &mut self.custom_days,
             UsageBucket::Qoder => &mut self.qoder_days,
+            UsageBucket::BuddyAi => &mut self.buddy_ai_days,
         }
     }
 
@@ -273,6 +278,7 @@ impl UsageFile {
             UsageBucket::Wb => &self.wb_days,
             UsageBucket::Custom => &self.custom_days,
             UsageBucket::Qoder => &self.qoder_days,
+            UsageBucket::BuddyAi => &self.buddy_ai_days,
         };
         b.get(day)
     }
@@ -414,6 +420,7 @@ impl UsageFile {
             &mut self.wb_days,
             &mut self.custom_days,
             &mut self.qoder_days,
+            &mut self.buddy_ai_days,
         ] {
             bucket.retain(|d, _| d.as_str() >= cutoff_str.as_str());
         }
@@ -429,6 +436,7 @@ impl UsageFile {
             UsageBucket::Wb => &self.wb_days,
             UsageBucket::Custom => &self.custom_days,
             UsageBucket::Qoder => &self.qoder_days,
+            UsageBucket::BuddyAi => &self.buddy_ai_days,
         };
         // 窗口含今日：days=7 → 今日与此前 6 个日历天（字符串比较口径对齐 trim）
         let cutoff = (chrono::Local::now().date_naive()
@@ -503,6 +511,7 @@ pub fn save_day(data_dir: &Path, bucket: UsageBucket, day: &str, stats: &DayStat
         UsageBucket::Wb => "wb",
         UsageBucket::Custom => "custom",
         UsageBucket::Qoder => "qoder",
+        UsageBucket::BuddyAi => "buddy-ai",
     };
     crate::store::docs::api_usage_upsert_day(&crate::store::db(data_dir), b, day, &text).is_ok()
 }

@@ -126,4 +126,5 @@ export const DEFAULT_APP_ICONS: Record<AppKey, string> = {
   trae: 'Sparkles',
   buddy: 'Bot',
   qoder: 'Boxes',
+  'buddy-ai': 'Globe',
 };

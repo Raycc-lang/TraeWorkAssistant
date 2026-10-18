@@ -384,6 +384,7 @@ mod tests {
             jwt_refresh_lock: Arc::new(std::sync::Mutex::new(())),
             qoder_pool_lock: Arc::new(std::sync::Mutex::new(())),
             wb_pool_lock: Arc::new(std::sync::Mutex::new(())),
+            buddy_ai_pool_lock: Arc::new(std::sync::Mutex::new(())),
             group_defs_lock: Arc::new(std::sync::Mutex::new(())),
             events: std::sync::Arc::new(std::sync::Mutex::new(None)),
         };

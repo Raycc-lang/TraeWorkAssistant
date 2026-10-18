@@ -1,6 +1,6 @@
 //! aiwork-server：Web 版单进程入口（T4 骨架 + T5/T6/T7/T8 接线）
-//! 启动序：数据目录（AIWORK_DATA_DIR）→ SQLite 迁移 → vault 启动序 → 网关共享状态装配
-//! → 管理面（/api/login + /api/cmd 桥 + SSE）→ 调度线程（6 任务）
+//! 启动序：数据目录（AIWORK_DATA_DIR）→ SQLite 迁移 → vault 启动序 → WB 国际账号迁移
+//! → 网关共享状态装配 → 管理面（/api/login + /api/cmd 桥 + SSE）→ 调度线程（19 任务）
 //! → 单端口 axum（/v1/* 网关 + /api/* 管理面 + /health + 静态托管）→ SIGTERM 优雅退出
 //!
 //! 环境变量：
@@ -54,6 +54,22 @@ async fn main() {
     vault::cleanup_temp_accounts(&state);
     vault::migrate_on_startup(&state);
 
+    // Buddy 国际版混居账号迁移（移植 main，幂等 kv 标记闸门）：须在 build_shared 前——
+    // 迁移读加密 token 需 vault 先初始化；网关内存池装配不能包含将被迁走的 WB 侧账号
+    match aiwork_core::commands::workbuddy::migrate_wb_global_accounts(&state) {
+        Ok((moved, stay)) if moved > 0 => {
+            let msg = format!("Buddy 国际版迁移完成: {moved} 个国际账号已从 WB 池迁出（{stay} 个留守）");
+            println!("{msg}");
+            fs_utils::app_log(&state.data_dir, &msg);
+        }
+        Ok(_) => {}
+        Err(e) => {
+            let msg = format!("Buddy 国际版账号迁移失败（下次启动重试）: {e}");
+            eprintln!("{msg}");
+            fs_utils::app_log(&state.data_dir, &msg);
+        }
+    }
+
     // 网关共享状态装配（vault 解密 → 双池装配 → 诊断日志）
     let shared: Arc<ApiSharedState> = build_shared(&state);
 
@@ -63,8 +79,8 @@ async fn main() {
     // 常驻任务：WB 健康探针 + 持久化 flusher（2s 周期）
     spawn_shared_tasks(shared.clone());
 
-    // 调度线程（T8）：6 任务集（trae-jwt-renew 05:30 / trae-checkin 09:00 / wb-checkin 09:10
-    // / wb-renew 10:30 / wb-credits-snapshot 23:30 / trae-credits-snapshot 23:40），启动 90s 后首跑
+    // 调度线程（T8）：19 任务集（Trae 5 + WB 5 + Qoder 5 + Buddy 国际版 4，内置时刻
+    // 见 scheduler::TASKS；HH:MM 任务可经 task_times 覆盖），启动 90s 后首跑
     aiwork_core::scheduler::start(state.clone());
 
     // 管理面（T5/T6/T7）：token 加载/生成 + 命令桥 + SSE 事件流 + cookie 鉴权

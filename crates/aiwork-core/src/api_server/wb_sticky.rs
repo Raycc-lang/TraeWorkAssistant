@@ -7,10 +7,9 @@
 //!   实证设计；Buddy 上游代理流量缓存恒不命中 §5.5 #10，价值在会话一致性）。
 //!
 //! 线程安全：单 Mutex 内完成 resolve+bind（写锁 re-check，防 TOCTOU）。
-//! 持久化：`sticky_bindings` 表（TTL 内的绑定，原子写 + 1s 节流）。
-//! 审查 #2：WB 与 Qoder 两个 StickyStore 实例共用同一张表，按键命名空间隔离——
-//! WB 线键无前缀（存量兼容），Qoder 线键带 `q:` 前缀（QODER_NS）；load 只取
-//! 本线键、save 先读表保留他线绑定再覆写本线，互不串载/互删。
+//! 持久化（P6 SQLite 化）：`sticky_bindings` 表；多池共用时按键命名空间
+//! 范围替换（save_ns + load_ns 过滤，见 NAMESPACES/owns_key），互不覆盖；
+//! 旧根路径 JSON 文件仅作启动加载兼容。
 
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -28,6 +27,9 @@ pub const FINGERPRINT_WINDOW_SECS: i64 = 60;
 pub const QODER_NS: &str = "q:";
 /// Trae 线命名空间前缀（per-pool 会话粘性批次新增：与 q:/无前缀三线隔离）
 pub const TRAE_NS: &str = "t:";
+/// Buddy 国际版（buddy-ai）线命名空间前缀（§4.2：与 q:/t:/无前缀四线隔离，
+/// Intl 池显式会话粘性）
+pub const BUDDY_AI_NS: &str = "g:";
 /// 落盘节流间隔：距上次成功保存不足该时长则跳过本次写盘
 const SAVE_THROTTLE_MS: u64 = 1000;
 
@@ -118,6 +120,22 @@ pub fn fingerprint_messages(body: &serde_json::Value) -> String {
     digest.iter().take(3).map(|b| format!("{:02x}", b)).collect()
 }
 
+/// 多池共用 sticky_bindings 表的键命名空间登记（F-80-余 v2）。
+/// 归属判定见 [owns_key]：ns 非空 = key 以该前缀开头；ns=""（WB/遗留键）=
+/// key 不以任何已登记命名空间开头。**新增池命名空间时必须在此登记**，
+/// load 过滤与 save 范围删除随之生效（审查 P1：两个 store 整表替换会互删
+/// 对方运行期新增的绑定，范围化后各写各的键集）。
+const NAMESPACES: &[&str] = &[QODER_NS, TRAE_NS, BUDDY_AI_NS];
+
+/// 该 store 是否拥有持久化键 key（load_ns 过滤与 save 范围删除共用同一判定）
+fn owns_key(ns: &str, key: &str) -> bool {
+    if ns.is_empty() {
+        !NAMESPACES.iter().any(|p| key.starts_with(p))
+    } else {
+        key.starts_with(ns)
+    }
+}
+
 impl StickyStore {
     // 预留 API（持久化运维/前端扩展用；当前主要消费 resolve/bind/save/load）
     #[allow(dead_code)]
@@ -133,17 +151,6 @@ impl StickyStore {
     /// 存储键 = 命名空间前缀 + 会话键（resolve/bind 统一入口；内存键与落库同格式）
     fn store_key(&self, ck: &str) -> String {
         format!("{}{}", self.ns, ck)
-    }
-
-    /// 键是否归属本命名空间（load 过滤 / save 合并时区分他线绑定）。
-    /// **新增池命名空间时必须同步扩展 WB 线的排除列表**（load 过滤与 save
-    /// 范围删除随之生效，防两个 store 整表替换互删对方运行期新增的绑定）
-    fn owns_key(&self, k: &str) -> bool {
-        if self.ns.is_empty() {
-            !k.starts_with(QODER_NS) && !k.starts_with(TRAE_NS)
-        } else {
-            k.starts_with(&self.ns)
-        }
     }
 
     /// 设置显式模式 TTL 秒（F-76②，pool_set 热应用；≤0 回退默认值）
@@ -264,33 +271,22 @@ impl StickyStore {
         self.evict_expired(now_secs);
         let file = {
             let map = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-            // 审查 #2：WB/Qoder 共用 sticky_bindings 表——先读现有表保留他线
-            // 绑定，再覆写本线条目，避免整表覆写互删。节流（1s）+ 绑定为软状态
-            // （丢失仅个别会话重新取号），两实例并发 save 的窄窗口竞态可接受。
-            let mut bindings: Vec<serde_json::Value> = Vec::new();
-            let existing = crate::store::docs::sticky_bindings_load(&crate::store::db(data_dir));
-            if let Some(list) = existing.get("bindings").and_then(|b| b.as_array()) {
-                bindings.extend(
-                    list.iter()
-                        .filter(|item| {
-                            item.get("key")
-                                .and_then(|v| v.as_str())
-                                .is_some_and(|k| !self.owns_key(k))
-                        })
-                        .cloned(),
-                );
-            }
-            bindings.extend(map.iter().map(|(k, b)| serde_json::json!({
-                "key": k, "uid": b.uid, "conv_id": b.conv_id,
-                "last_seen": b.last_seen, "explicit": b.explicit,
-            })));
             serde_json::json!({
                 "version": 1,
                 "saved_at": now_ts(),
-                "bindings": bindings,
+                "bindings": map.iter().map(|(k, b)| serde_json::json!({
+                    "key": k, "uid": b.uid, "conv_id": b.conv_id,
+                    "last_seen": b.last_seen, "explicit": b.explicit,
+                })).collect::<Vec<_>>(),
             })
         };
-        if crate::store::docs::sticky_bindings_save(&crate::store::db(data_dir), &file).is_ok() {
+        if crate::store::docs::sticky_bindings_save_ns(
+            &crate::store::db(data_dir),
+            &file,
+            &self.ns,
+            &NAMESPACES.iter().copied().filter(|p| *p != self.ns).collect::<Vec<_>>(),
+        )
+        .is_ok() {
             let mut last = self.last_save.lock().unwrap_or_else(|e| e.into_inner());
             *last = Some(std::time::Instant::now());
         }
@@ -303,23 +299,17 @@ impl StickyStore {
         Self::load_ns(data_dir, "")
     }
 
-    /// 按命名空间加载（审查 #2）：只取本线前缀的绑定——WB 线（ns=""）跳过
-    /// `q:` 键，Qoder 线只取 `q:` 键；他线绑定留表，互不串载。
-    /// 内存键保留命名空间前缀（与落库/resolve·bind 生成的存储键同格式）。
+    /// 同 load，附键命名空间（F-80-余 v2：Qoder 池传 "q:"，与 WB 绑定同表隔离）。
+    /// 仅加载归属本命名空间的键（owns_key）——多池并存时各自内存 map 只含
+    /// 自己的键，配合 save_ns 范围替换互不覆盖（审查 P1 回归修复）
     pub fn load_ns(data_dir: &std::path::Path, ns: &str) -> Self {
         let file: serde_json::Value =
             crate::store::docs::sticky_bindings_load(&crate::store::db(data_dir));
-        let store = Self {
-            inner: Mutex::new(HashMap::new()),
-            last_save: Mutex::new(None),
-            explicit_ttl_secs: std::sync::atomic::AtomicI64::new(0),
-            ns: ns.to_string(),
-        };
+        let mut map = HashMap::new();
         if let Some(list) = file.get("bindings").and_then(|b| b.as_array()) {
-            let mut map = store.inner.lock().unwrap_or_else(|e| e.into_inner());
             for item in list {
                 let key = match item.get("key").and_then(|v| v.as_str()) {
-                    Some(k) if !k.is_empty() && store.owns_key(k) => k.to_string(),
+                    Some(k) if !k.is_empty() => k.to_string(),
                     _ => continue,
                 };
                 let uid = item.get("uid").and_then(|v| v.as_str()).unwrap_or("").to_string();
@@ -332,7 +322,14 @@ impl StickyStore {
                 map.insert(key, Binding { uid, conv_id, last_seen, explicit });
             }
         }
-        store
+        // 命名空间过滤：只保留归属本 store 的键（多池共用表互不串载）
+        map.retain(|k, _| owns_key(ns, k));
+        Self {
+            inner: Mutex::new(map),
+            last_save: Mutex::new(None),
+            explicit_ttl_secs: std::sync::atomic::AtomicI64::new(0),
+            ns: ns.to_string(),
+        }
     }
 }
 

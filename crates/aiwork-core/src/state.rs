@@ -205,6 +205,9 @@ pub struct AppState {
     /// （命令线程/后台刷新线程/调度器三方并发）持锁执行，防旧副本整文档覆盖
     /// 丢账号（lost-update）；长窗口网络调用（回填/续期）在锁外完成后短临界区写回
     pub wb_pool_lock: Arc<Mutex<()>>,
+    /// Buddy 国际版（buddy-ai）账号池读-改-写互斥：与 wb_pool_lock 同语义、
+    /// 独立实例（失败域与锁域均不与国内池交织；移植 main f5f2cd3..61cc245）
+    pub buddy_ai_pool_lock: Arc<Mutex<()>>,
     /// 组织定义（groups / tags 行文档表）读-改-写互斥：shared_groups 的
     /// create/update/delete、tags 的 create/update/delete、qoder 导入的 defs
     /// 合并、account_tags_set 的校验+写入全部持锁执行，杜绝并发「load→save」
@@ -255,6 +258,7 @@ impl AppState {
             jwt_refresh_lock: Arc::new(Mutex::new(())),
             qoder_pool_lock: Arc::new(Mutex::new(())),
             wb_pool_lock: Arc::new(Mutex::new(())),
+            buddy_ai_pool_lock: Arc::new(Mutex::new(())),
             group_defs_lock: Arc::new(Mutex::new(())),
             events: Arc::new(Mutex::new(None)),
         })
@@ -268,6 +272,7 @@ impl AppState {
             jwt_refresh_lock: Arc::new(Mutex::new(())),
             qoder_pool_lock: Arc::new(Mutex::new(())),
             wb_pool_lock: Arc::new(Mutex::new(())),
+            buddy_ai_pool_lock: Arc::new(Mutex::new(())),
             group_defs_lock: Arc::new(Mutex::new(())),
             events: Arc::new(Mutex::new(None)),
         }
@@ -339,11 +344,59 @@ impl AppState {
         if s.doubao_quota_url.clone().unwrap_or_default().trim().is_empty() {
             s.doubao_quota_url = Some(crate::models::default_doubao_quota_url());
         }
-        // 侧边栏应用显示：固定应用零值回填（kv 全缺失走 Settings::default() 时 String=""）
-        if s.pinned_app.trim().is_empty() {
+        // buddy-ai 打卡时刻零值回填（Settings::default 路径 String=""；默认 09:20）
+        if s.buddy_ai_checkin_hhmm.trim().is_empty() {
+            s.buddy_ai_checkin_hhmm = "09:20".into();
+        }
+        // buddy-ai 续期/目录/积分同步默认开（kv 键整体缺失走派生 Default，serde
+        // default_true 不生效；hhmm 空视为从未配置，回填默认开——对齐 jwt_renew/
+        // wb_catalog 既有定式；用户显式关后 hhmm 保持非空不会被复活）。
+        // 注意：credits_sync_enabled 回填须在下方 mode 空派生之前，派生才能得 "daily"
+        if s.buddy_ai_renew_hhmm.trim().is_empty() {
+            s.buddy_ai_renew_enabled = true;
+            s.buddy_ai_renew_hhmm = "10:35".into();
+        }
+        if s.buddy_ai_catalog_sync_hhmm.trim().is_empty() {
+            s.buddy_ai_catalog_sync_enabled = true;
+            s.buddy_ai_catalog_sync_hhmm = "05:55".into();
+        }
+        if s.buddy_ai_credits_sync_hhmm.trim().is_empty() {
+            s.buddy_ai_credits_sync_enabled = true;
+            s.buddy_ai_credits_sync_hhmm = "23:45".into();
+        }
+        // buddy-ai 积分同步模式零值归一：空视为旧数据（只有 enabled 布尔），
+        // 按旧开关派生保持语义：true→daily（原每日定时口径）、false→off
+        if s.buddy_ai_credits_sync_mode.trim().is_empty() {
+            s.buddy_ai_credits_sync_mode =
+                if s.buddy_ai_credits_sync_enabled { "daily" } else { "off" }.into();
+        }
+        // buddy-ai 积分同步间隔小时数：非法回退 2，越界 clamp 到 1..=24
+        {
+            let v = s
+                .buddy_ai_credits_sync_hours
+                .trim()
+                .parse::<i64>()
+                .map(|h| h.clamp(1, 24))
+                .unwrap_or(2);
+            s.buddy_ai_credits_sync_hours = v.to_string();
+        }
+        // buddy-ai 积分同步 every_days 间隔天数：非法回退 1，越界 clamp 到 1..=30
+        {
+            let v = s
+                .buddy_ai_credits_sync_days
+                .trim()
+                .parse::<i64>()
+                .map(|d| d.clamp(1, 30))
+                .unwrap_or(1);
+            s.buddy_ai_credits_sync_days = v.to_string();
+        }
+        // 侧边栏应用显示：固定应用零值回填（kv 全缺失走 Settings::default() 时 String=""）；
+        // buddy-ai（国际版）默认隐藏、不参与固定应用——脏值防御性回落 trae
+        if s.pinned_app.trim().is_empty() || s.pinned_app == "buddy-ai" {
             s.pinned_app = "trae".into();
         }
-        // 隐藏列表归一：丢弃非法 key、去重排序；固定应用强制可见（双保险，前端同样约束）
+        // 隐藏列表归一：丢弃非法 key、去重排序；固定应用强制可见（双保险，前端同样约束）。
+        // buddy-ai 不进隐藏列表——其可见性走独立 opt-in 开关 buddy_ai_visible
         {
             let pinned = s.pinned_app.clone();
             s.hidden_apps.retain(|k| {
@@ -353,9 +406,12 @@ impl AppState {
             s.hidden_apps.dedup();
         }
         // 自定义图标归一：丢弃非法 key 与空图标名（等于未配置）；非法图标名不在此校验，
-        // 前端 resolveAppIcon 未命中即回退默认图标（候选表只有前端持有，避免后端重复维护）
-        s.app_icons
-            .retain(|k, v| matches!(k.as_str(), "trae" | "buddy" | "qoder") && !v.trim().is_empty());
+        // 前端 resolveAppIcon 未命中即回退默认图标（候选表只有前端持有，避免后端重复维护）。
+        // buddy-ai（BuddyAI 国际版）：图标自定义放行（应用显示面板行首入口），
+        // hidden_apps 不放行（可见性走独立 opt-in 开关）
+        s.app_icons.retain(|k, v| {
+            matches!(k.as_str(), "trae" | "buddy" | "qoder" | "buddy-ai") && !v.trim().is_empty()
+        });
         s
     }
 

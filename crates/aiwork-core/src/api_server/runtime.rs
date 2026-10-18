@@ -208,19 +208,24 @@ pub fn build_shared(state: &AppState) -> Arc<ApiSharedState> {
     pool.set_strategy(strategy);
     let wb_pool = ApiPool::new();
     let qoder_pool = ApiPool::new();
-    // 冷却/禁用标记落 app.log（F-80）：三池注入 (data_dir, 池标签)，
+    let buddy_ai_pool = ApiPool::new();
+    // 冷却/禁用标记落 app.log（F-80）：四池注入 (data_dir, 池标签)，
     // note_error 打冷却/禁用时同步写 `account cooldown: pool=…` 便于排查跨池回退链路
     pool.set_log_ctx(&state.data_dir, "trae");
     wb_pool.set_log_ctx(&state.data_dir, "buddy");
     qoder_pool.set_log_ctx(&state.data_dir, "qoder");
-    // 账号保留剩余积分（issue #91）：调度策略统一配置，启动时三池应用
-    //（credits=0 时无过滤；Qoder 池 credits 恒 None 不受影响，保持口径一致仍设置）
+    buddy_ai_pool.set_log_ctx(&state.data_dir, "buddy-ai");
+    // 账号保留剩余积分（issue #91）：调度策略统一配置，启动时四池应用
+    //（credits=0 时无过滤；Qoder 池 credits 恒 None 不受影响，保持口径一致仍设置。
+    // M3 审查修复：buddy-ai 池补齐——原先冷启动漏设，调度策略保存前启动的服务
+    // 国际档不过滤低余额账号，与 dispatch_policy_set 热应用「四池即时生效」不一致）
     let reserve_credits = crate::api_server::dispatch::load_policy(&state.data_dir).reserve_credits;
     pool.set_reserve_credits(reserve_credits);
     wb_pool.set_reserve_credits(reserve_credits);
     qoder_pool.set_reserve_credits(reserve_credits);
-    let (pool_count, wb_uids_len, wb_accounts_total) =
-        apply_pool_snapshot(state, &pool, &wb_pool, &qoder_pool);
+    buddy_ai_pool.set_reserve_credits(reserve_credits);
+    let (pool_count, wb_uids_len, wb_accounts_total, buddy_ai_count) =
+        apply_pool_snapshot(state, &pool, &wb_pool, &qoder_pool, &buddy_ai_pool);
 
     let healthy_count = pool.diagnose().iter().filter(|d| d.reason.starts_with("healthy")).count();
     fs_utils::app_log(
@@ -260,6 +265,25 @@ pub fn build_shared(state: &AppState) -> Arc<ApiSharedState> {
             pool_file.qoder_enabled,
             qoder_pool.count(),
             qoder_strategy.as_str(),
+        ),
+    );
+
+    // buddy-ai 国际池启动概况（池内策略：buddy_ai_strategy 空 = 跟随 Trae 池，
+    // 与 Buddy/Qoder 池同语义；开关默认 false，未启用时不产生告警噪音）
+    let buddy_ai_strategy = PoolStrategy::resolve_buddy_ai(
+        &pool_file.strategy,
+        &pool_file.buddy_ai_strategy,
+    );
+    buddy_ai_pool.set_strategy(buddy_ai_strategy);
+    // G7 审查修复：补 accounts 计数——WB/Qoder 池启动日志均带账号数，buddy-ai 池
+    // 原先只记开关与策略，导入/同步是否落号无法从启动日志确认（排查盲区）
+    fs_utils::app_log(
+        &state.data_dir,
+        &format!(
+            "API服务启动-BuddyAI国际池: enabled={} accounts={} strategy={}",
+            pool_file.buddy_ai_enabled,
+            buddy_ai_count,
+            buddy_ai_strategy.as_str(),
         ),
     );
 
@@ -364,13 +388,32 @@ pub fn build_shared(state: &AppState) -> Arc<ApiSharedState> {
         qoder_pool_sticky_ttl_secs: std::sync::atomic::AtomicU64::new(
             pool_file.qoder_pool_sticky_ttl_secs,
         ),
+        // buddy-ai per-pool 三参数（§4.2 按池独立）：池粘性 TTL / 显式会话粘性开关
+        //（默认关——国际档显式开启制）/ 竞速对冲阈值
+        buddy_ai_pool_sticky_ttl_secs: std::sync::atomic::AtomicU64::new(
+            pool_file.buddy_ai_pool_sticky_ttl_secs,
+        ),
+        buddy_ai_sticky_enabled: std::sync::atomic::AtomicBool::new(
+            pool_file.buddy_ai_sticky_enabled,
+        ),
+        buddy_ai_hedge_threshold_ms: std::sync::atomic::AtomicU64::new(
+            pool_file.buddy_ai_hedge_threshold_ms,
+        ),
         // Qwen3.8-Flash 免费活动倍率覆盖（issue #111，api_pool.json，serde default 兼容旧文件）
         qoder_flash_free_rate: std::sync::atomic::AtomicBool::new(pool_file.qoder_flash_free_rate),
         // Trae 池会话粘性存储（per-pool 批次新增）："t:" 命名空间与 wb/qoder 互不串绑
         trae_sticky: StickyStore::load_ns(&state.data_dir, super::wb_sticky::TRAE_NS),
+        // buddy-ai 显式会话粘性存储（§4.2）："g:" 命名空间与 wb（无前缀）/q:/t: 互不串绑
+        buddy_ai_sticky: StickyStore::load_ns(&state.data_dir, super::wb_sticky::BUDDY_AI_NS),
+        // buddy-ai 独立池（§3.4 隔离清单）：开关默认关（dispatch 显式开启制）
+        buddy_ai_pool,
+        buddy_ai_enabled: std::sync::atomic::AtomicBool::new(pool_file.buddy_ai_enabled),
         wb_sticky: StickyStore::load(&state.data_dir),
         pool_sticky: Mutex::new(std::collections::HashMap::new()),
         model_cooldowns: Mutex::new(std::collections::HashMap::new()),
+        // buddy-ai 模型级冷却独立实例（§4.2：Intl 池冷却表独立，CN 侧模型故障
+        // 不得冷却 Intl 池同型号，反之亦然）
+        buddy_ai_model_cooldowns: Mutex::new(std::collections::HashMap::new()),
         default_model,
         data_dir: state.data_dir.clone(),
         total_requests: std::sync::atomic::AtomicU64::new(0),
@@ -383,6 +426,10 @@ pub fn build_shared(state: &AppState) -> Arc<ApiSharedState> {
         usage_dirty: Mutex::new(Vec::new()),
         wb_probe_ts_ms: std::sync::atomic::AtomicI64::new(-1),
         wb_probe_ok: std::sync::atomic::AtomicI64::new(-1),
+        // buddy-ai 上游健康探针（G8 审查修复）：与 wb_probe 同频控口径，探测
+        // BILLING_BASE_GLOBAL（workbuddy.ai）；-1 未探测 / 0 不可达 / 1 在线
+        buddy_ai_probe_ts_ms: std::sync::atomic::AtomicI64::new(-1),
+        buddy_ai_probe_ok: std::sync::atomic::AtomicI64::new(-1),
         // Trae 401 自愈回调（issue #27 方案 B）：AppState 克隆进闭包，走 refresh_jwt_impl
         // 全防护链路（并发锁/冷却/轮换写回/5s 成功去重窗）强制刷新并持久化
         trae_jwt_refresh: {
@@ -406,6 +453,12 @@ pub fn build_shared(state: &AppState) -> Arc<ApiSharedState> {
     shared
         .qoder_pool
         .set_concurrency_limit(pool_file.qoder_account_concurrency_limit);
+    shared
+        .buddy_ai_pool
+        .set_concurrency_limit(pool_file.buddy_ai_account_concurrency_limit);
+    shared
+        .buddy_ai_sticky
+        .set_explicit_ttl(pool_file.buddy_ai_sticky_ttl_secs as i64);
     shared
         .trae_sticky
         .set_explicit_ttl(pool_file.trae_sticky_ttl_secs as i64);
@@ -542,14 +595,16 @@ pub(crate) fn merge_pool_expire_times(rc: &crate::models::RemainingCreditsFile) 
 }
 
 /// 池装配公共逻辑（build_shared 构建 / 凭据变更热重载共用）：
-/// 读取 vault 账号 + 池配置 + 分组 + 冷却 + 积分 + 设备映射，全量重建三池内条目
-///（Trae/WB/Qoder）。返回 (trae 池条目数, wb 白名单长度, wb 账号总数) 供调用方记日志。
+/// 读取 vault 账号 + 池配置 + 分组 + 冷却 + 积分 + 设备映射，全量重建四池内条目
+///（Trae/WB/Qoder/BuddyAI）。返回 (trae 池条目数, wb 白名单长度, wb 账号总数,
+/// buddy-ai 池条目数) 供调用方记日志。
 pub fn apply_pool_snapshot(
     state: &AppState,
     pool: &ApiPool,
     wb_pool: &ApiPool,
     qoder_pool: &ApiPool,
-) -> (usize, usize, usize) {
+    buddy_ai_pool: &ApiPool,
+) -> (usize, usize, usize, usize) {
     let accounts = crate::vault::load_accounts(state);
     // 走迁移入口（防止直读落 serde default 后整表写回静默覆盖迁移值）
     let pool_file: ApiPoolFile = load_pool_file(&state.data_dir);
@@ -654,7 +709,49 @@ pub fn apply_pool_snapshot(
     //（支持模型 qoder 源恒「未启用」、调度配置无 Qoder 候选）
     let qoder_uids: Vec<String> = qoder_accounts.iter().map(|a| a.uid.clone()).collect();
     qoder_pool.sync_from_qoder(&qoder_accounts, &effective_qoder_uids(&pool_file, &qoder_uids));
-    (pool.count(), wb_uids.len(), wb_accounts.len())
+    // buddy-ai 独立池装配：buddy_ai_accounts 表独立取号独立入池，与 wb 池零混居
+    //（§3.1 硬约束 1）；fail-open 全量含凭证账号入池（禁用由 needs_relogin 表达，
+    // 对齐 Qoder 池语义）。分组筛选先行（buddy_ai_group_ids 非空时仅纳入所选分组，
+    // 未分组账号不参与，对齐 WB/Qoder 池 T10 语义）+ 标签筛选取交集（D5 池语义）。
+    // 开关 buddy_ai_enabled 在网关路由层消费（默认关，dispatch 显式开启制）
+    let buddy_ai_accounts_raw = crate::commands::workbuddy::buddy_ai_upstream_accounts(state);
+    let buddy_ai_group_filter: Option<std::collections::HashSet<&str>> =
+        if pool_file.buddy_ai_group_ids.is_empty() {
+            None
+        } else {
+            Some(
+                pool_file
+                    .buddy_ai_group_ids
+                    .iter()
+                    .map(|s| s.as_str())
+                    .collect(),
+            )
+        };
+    let buddy_ai_tag_filter =
+        crate::api_server::org_index::tag_uid_set(&pool_file.buddy_ai_tag_ids, &tag_map);
+    let buddy_ai_accounts: Vec<_> = match (&buddy_ai_group_filter, &buddy_ai_tag_filter) {
+        (Some(f), Some(t)) => buddy_ai_accounts_raw
+            .into_iter()
+            .filter(|a| f.contains(a.group_id.as_str()) && t.contains(&a.uid))
+            .collect(),
+        (Some(f), None) => buddy_ai_accounts_raw
+            .into_iter()
+            .filter(|a| f.contains(a.group_id.as_str()))
+            .collect(),
+        (None, Some(t)) => buddy_ai_accounts_raw
+            .into_iter()
+            .filter(|a| t.contains(&a.uid))
+            .collect(),
+        (None, None) => buddy_ai_accounts_raw,
+    };
+    let buddy_ai_uids: Vec<String> = buddy_ai_accounts.iter().map(|a| a.uid.clone()).collect();
+    buddy_ai_pool.sync_from_wb(&buddy_ai_accounts, &buddy_ai_uids);
+    (
+        pool.count(),
+        wb_uids.len(),
+        wb_accounts.len(),
+        buddy_ai_pool.count(),
+    )
 }
 
 /// Buddy 池生效入池白名单（纯函数，便于单测）：显式 wb_enabled_uids 优先；
@@ -845,14 +942,21 @@ pub fn gateway_shared() -> Option<Arc<ApiSharedState>> {
 }
 
 /// 凭据/池配置变更后热重载（原 commands/api_server.rs `reload_pools_if_running` 语义）：
-/// 网关在运行时全量重建三池条目（Trae/WB/Qoder）；未注册（CLI 模式）时静默跳过。
+/// 网关在运行时全量重建四池条目（Trae/WB/Qoder/BuddyAI）；未注册（CLI 模式）时静默跳过。
 pub fn reload_pools_after_change(state: &AppState) {
     let Some(shared) = gateway_shared() else { return };
-    let (n, wb_uids, wb_total) =
-        apply_pool_snapshot(state, &shared.pool, &shared.wb_pool, &shared.qoder_pool);
+    let (n, wb_uids, wb_total, buddy_ai) = apply_pool_snapshot(
+        state,
+        &shared.pool,
+        &shared.wb_pool,
+        &shared.qoder_pool,
+        &shared.buddy_ai_pool,
+    );
     fs_utils::app_log(
         &state.data_dir,
-        &format!("凭据变更热重载: trae_pool={n} wb_uids={wb_uids} wb_accounts={wb_total}"),
+        &format!(
+            "凭据变更热重载: trae_pool={n} wb_uids={wb_uids} wb_accounts={wb_total} buddy_ai_pool={buddy_ai}"
+        ),
     );
 }
 

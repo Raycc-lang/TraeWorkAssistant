@@ -256,12 +256,79 @@ pub fn sticky_bindings_load(s: &Store) -> Value {
     json!({ "version": 1, "bindings": rows })
 }
 
-/// 整表替换（save 的落库等价物；过期项由调用方 evict 后传入）
+/// 整表替换（save 的落库等价物；过期项由调用方 evict 后传入）。
+/// 多池并存时请用 [sticky_bindings_save_ns]（本函数仅遗留种子/单池场景使用）。
 pub fn sticky_bindings_save(s: &Store, root: &Value) -> Result<(), String> {
     let empty = Vec::new();
     let arr = root.get("bindings").and_then(Value::as_array).unwrap_or(&empty);
     s.with_conn(|c| {
         c.execute_batch("BEGIN; DELETE FROM sticky_bindings;")?;
+        {
+            let mut stmt = c.prepare(
+                "INSERT INTO sticky_bindings(key, uid, conv_id, last_seen, explicit, updated_at) VALUES(?1, ?2, ?3, ?4, ?5, datetime('now','localtime'))",
+            )?;
+            for b in arr {
+                stmt.execute(rusqlite::params![
+                    b.get("key").and_then(Value::as_str).unwrap_or(""),
+                    b.get("uid").and_then(Value::as_str).unwrap_or(""),
+                    b.get("conv_id").and_then(Value::as_str).unwrap_or(""),
+                    b.get("last_seen").and_then(Value::as_i64).unwrap_or(0),
+                    (b.get("explicit").and_then(Value::as_bool).unwrap_or(false)) as i64,
+                ])?;
+            }
+        }
+        c.execute_batch("COMMIT;")?;
+        Ok(())
+    })
+    .or_else(|e| {
+        let _ = s.with_conn(|c| c.execute_batch("ROLLBACK;"));
+        Err(e)
+    })
+}
+
+/// 命名空间范围替换（F-80-余 v2 多池共用 sticky_bindings 表）：
+/// 仅删除并写入归属 `ns` 的键，其他命名空间（`other_ns`）的行原样保留——
+/// 多池 StickyStore 并存时整表替换会互删对方运行期新增的绑定（审查 P1）。
+/// 归属规则与 wb_sticky::owns_key 一致：ns 非空 = key 以 ns 前缀开头；
+/// ns 空 = key 不以任何 other_ns 前缀开头（other_ns 为空时退化为整表删除，
+/// 与 [sticky_bindings_save] 等价）。LIKE 模式由常量前缀经参数绑定构造，
+/// ns 不得含 LIKE 通配符 %/_（当前登记命名空间均满足）。
+pub fn sticky_bindings_save_ns(
+    s: &Store,
+    root: &Value,
+    ns: &str,
+    other_ns: &[&str],
+) -> Result<(), String> {
+    let empty = Vec::new();
+    let arr = root.get("bindings").and_then(Value::as_array).unwrap_or(&empty);
+    s.with_conn(|c| {
+        c.execute_batch("BEGIN;")?;
+        if ns.is_empty() && other_ns.is_empty() {
+            c.execute_batch("DELETE FROM sticky_bindings;")?;
+        } else if ns.is_empty() {
+            // 无前缀键（WB/遗留）：删除不属于任何已登记命名空间的行。
+            // 逐前缀 NOT LIKE 后 AND 连接（≡ NOT(任一前缀命中)）。曾误写
+            // LIKE+AND 的恒假条件——单个 key 不可能同时命中两个前缀模式，
+            // DELETE 恒 0 行：过期绑定永不清理，且残留行占主键使后续 INSERT
+            // 整事务回滚，WB 池粘性绑定在首次落库成功后永久失效（审查 major）
+            // 防御：过滤 other_ns 中的空串——空串的 LIKE '%' 模式会让 NOT LIKE 恒假
+            // （DELETE 0 行 → 残留行占主键 → INSERT 整事务回滚，与已修复的旧 bug 同构）
+            let other_ns: Vec<&str> = other_ns.iter().copied().filter(|p| !p.is_empty()).collect();
+            if other_ns.is_empty() {
+                // 无任何有效已登记命名空间 → 退化为整表删除（与上方全空分支等价）
+                c.execute_batch("DELETE FROM sticky_bindings;")?;
+            } else {
+                let conds: Vec<String> =
+                    other_ns.iter().map(|_| "key NOT LIKE ?".to_string()).collect();
+                let sql = format!("DELETE FROM sticky_bindings WHERE {}", conds.join(" AND "));
+                let mut stmt = c.prepare(&sql)?;
+                let patterns: Vec<String> = other_ns.iter().map(|p| format!("{}%", p)).collect();
+                stmt.execute(rusqlite::params_from_iter(patterns.iter()))?;
+            }
+        } else {
+            let mut stmt = c.prepare("DELETE FROM sticky_bindings WHERE key LIKE ?")?;
+            stmt.execute(rusqlite::params![format!("{}%", ns)])?;
+        }
         {
             let mut stmt = c.prepare(
                 "INSERT INTO sticky_bindings(key, uid, conv_id, last_seen, explicit, updated_at) VALUES(?1, ?2, ?3, ?4, ?5, datetime('now','localtime'))",
@@ -801,6 +868,43 @@ mod tests {
         let b = sticky_bindings_load(&s);
         assert_eq!(b["bindings"][0]["uid"], "u1");
         assert_eq!(b["bindings"][0]["explicit"], true);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn sticky_bindings_save_ns_no_prefix_scope_replaces_only_unowned_rows() {
+        use serde_json::json;
+        let (dir, s) = tmp_store("sticky_ns");
+        // 三池共存：q:/t: 命名空间行 + WB 无前缀行（一条存活、一条待清理）
+        let seed = json!({"bindings": [
+            {"key": "q:a", "uid": "q1", "conv_id": "", "last_seen": 1, "explicit": false},
+            {"key": "t:b", "uid": "t1", "conv_id": "", "last_seen": 1, "explicit": false},
+            {"key": "cid:keep", "uid": "w1", "conv_id": "", "last_seen": 1, "explicit": false},
+            {"key": "cid:stale", "uid": "w0", "conv_id": "", "last_seen": 1, "explicit": false}
+        ]});
+        sticky_bindings_save_ns(&s, &seed, "q:", &["t:", ""]).unwrap();
+        // WB 池范围替换（ns=""，other_ns=q:/t:）：只允许动无前缀行——
+        // 回归锚点：曾误写 LIKE+AND 恒假条件，DELETE 恒 0 行后 cid:stale
+        // 残留占主键，本次 INSERT 整事务回滚（落库永久失效）
+        let wb = json!({"bindings": [
+            {"key": "cid:fresh", "uid": "w2", "conv_id": "", "last_seen": 2, "explicit": false}
+        ]});
+        sticky_bindings_save_ns(&s, &wb, "", &["q:", "t:"]).unwrap();
+        let root = sticky_bindings_load(&s);
+        let keys: Vec<&str> = root["bindings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|b| b["key"].as_str())
+            .collect();
+        assert!(keys.contains(&"q:a"), "q: 命名空间行必须原样保留");
+        assert!(keys.contains(&"t:b"), "t: 命名空间行必须原样保留");
+        assert!(keys.contains(&"cid:fresh"), "WB 新绑定必须写入");
+        assert!(!keys.contains(&"cid:stale"), "无前缀旧行必须被范围替换删除");
+        assert!(!keys.contains(&"cid:keep"), "ns=\"\" 为整命名空间替换，旧无前缀行不保留");
+        // 二次保存仍成功（旧 bug 下主键冲突会回滚）
+        sticky_bindings_save_ns(&s, &wb, "", &["q:", "t:"]).unwrap();
+        assert_eq!(sticky_bindings_load(&s)["bindings"].as_array().unwrap().len(), 3);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1540,6 +1644,86 @@ pub fn wb_token_store_save_version(s: &Store, version: i64) -> Result<(), String
     s.kv_set_raw("wb_tokens_meta", &version.to_string())
 }
 
+// ── 行文档表泛化原语（token store 通用化：wb / buddy-ai 双命名空间复用；
+// 移植 main f5f2cd3..61cc245）──────────────────────────────────────────────
+
+/// 任意 token store 表读取（结构 {version, tokens: {id: rec}}；损坏行过滤）
+pub fn token_store_load(table: &str, s: &Store) -> Value {
+    debug_assert!(super::schema::ROW_TABLES.contains(&table), "表不在白名单: {table}");
+    let tokens: serde_json::Map<String, Value> = s
+        .rows_all(table)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|(_, v)| v.is_object())
+        .collect();
+    let meta_key = format!("{table}_meta");
+    let version = s.kv_get_raw(&meta_key).and_then(|v| v.parse::<i64>().ok());
+    let mut root = serde_json::Map::new();
+    root.insert("tokens".into(), Value::Object(tokens));
+    if let Some(v) = version {
+        root.insert("version".into(), json!(v));
+    }
+    Value::Object(root)
+}
+
+/// 任意 token store 表单账号 UPSERT
+pub fn token_store_upsert(s: &Store, table: &str, id: &str, rec: &Value) -> Result<(), String> {
+    debug_assert!(super::schema::ROW_TABLES.contains(&table), "表不在白名单: {table}");
+    s.row_upsert(table, id, rec)
+}
+
+/// 任意 token store 表删除单账号（迁移/移除路径）
+pub fn token_store_remove(s: &Store, table: &str, id: &str) -> Result<(), String> {
+    debug_assert!(super::schema::ROW_TABLES.contains(&table), "表不在白名单: {table}");
+    s.row_delete(table, id)
+}
+
+/// 任意 token store 表整库替换（version 闸门由调用方维持；buddy-ai 迁移/阶段 2 接线用）
+#[allow(dead_code)]
+pub fn token_store_save(table: &str, s: &Store, store_val: &Value) -> Result<(), String> {
+    debug_assert!(super::schema::ROW_TABLES.contains(&table), "表不在白名单: {table}");
+    let empty = serde_json::Map::new();
+    let tokens = store_val.get("tokens").and_then(Value::as_object).unwrap_or(&empty);
+    let rows: Vec<(String, Value)> =
+        tokens.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+    s.rows_replace(table, &rows)?;
+    if let Some(v) = store_val.get("version").and_then(Value::as_i64) {
+        s.kv_set_raw(&format!("{table}_meta"), &v.to_string())?;
+    }
+    Ok(())
+}
+
+// ── Buddy 国际版（buddy-ai）独立池（buddy_ai_accounts / buddy_ai_tokens 表）──
+//
+// §3.4 隔离清单：与 wb 池零共享；账号结构与 WorkBuddyAccount serde 同构
+//（复用序列化形态，落库表独立）。
+
+/// 读 buddy-ai 整池（结构 {accounts: [...]}）
+pub fn buddy_ai_pool_load(s: &Store) -> Value {
+    let accounts: Vec<Value> = s
+        .rows_all("buddy_ai_accounts")
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(_, data)| data)
+        .collect();
+    json!({ "accounts": accounts })
+}
+
+/// 写 buddy-ai 整池（pk = 账号 id，缺 id 用序号占位，语义同 wb_pool_save）
+pub fn buddy_ai_pool_save(s: &Store, pool: &Value) -> Result<(), String> {
+    let empty = Vec::new();
+    let arr = pool.get("accounts").and_then(Value::as_array).unwrap_or(&empty);
+    let rows: Vec<(String, Value)> = arr
+        .iter()
+        .enumerate()
+        .map(|(i, a)| {
+            let id = a.get("id").and_then(Value::as_str).filter(|s| !s.is_empty());
+            (id.map(String::from).unwrap_or_else(|| format!("__idx{i}")), a.clone())
+        })
+        .collect();
+    s.rows_replace("buddy_ai_accounts", &rows)
+}
+
 // ── API 用量（api_usage.json → api_usage 表，(bucket, day) 行文档）───────────
 
 fn bucket_name(b: UsageBucket) -> &'static str {
@@ -1548,6 +1732,7 @@ fn bucket_name(b: UsageBucket) -> &'static str {
         UsageBucket::Wb => "wb",
         UsageBucket::Custom => "custom",
         UsageBucket::Qoder => "qoder",
+        UsageBucket::BuddyAi => "buddy-ai",
     }
 }
 
@@ -1557,6 +1742,7 @@ fn bucket_of(name: &str) -> Option<UsageBucket> {
         "wb" => Some(UsageBucket::Wb),
         "custom" => Some(UsageBucket::Custom),
         "qoder" => Some(UsageBucket::Qoder),
+        "buddy-ai" => Some(UsageBucket::BuddyAi),
         _ => None,
     }
 }
@@ -1567,6 +1753,7 @@ fn bucket_map_mut<'a>(f: &'a mut UsageFile, b: UsageBucket) -> &'a mut std::coll
         UsageBucket::Wb => &mut f.wb_days,
         UsageBucket::Custom => &mut f.custom_days,
         UsageBucket::Qoder => &mut f.qoder_days,
+        UsageBucket::BuddyAi => &mut f.buddy_ai_days,
     }
 }
 
@@ -1593,13 +1780,15 @@ pub fn api_usage_load(s: &Store) -> UsageFile {
 }
 
 pub fn api_usage_save(s: &Store, f: &UsageFile) -> Result<(), String> {
-    // 四桶必须齐全（审查 B8）：本函数整表 DELETE+重插覆盖写，漏桶 = 该池既有行
-    // 被清空（迁移路径经此整体转写，Qoder 桶缺席即历史用量丢失）
+    // 五桶必须齐全（审查 B8 + M8 国际版）：本函数整表 DELETE+重插覆盖写，漏桶 =
+    // 该池既有行被清空（迁移路径经此整体转写，桶缺席即历史用量丢失；
+    // BuddyAi 桶为移植 main f5f2cd3..61cc245 新增，save 侧与 load 侧五桶对称）
     let rows: Vec<(String, String, String)> = [
         (UsageBucket::Trae, &f.days),
         (UsageBucket::Wb, &f.wb_days),
         (UsageBucket::Custom, &f.custom_days),
         (UsageBucket::Qoder, &f.qoder_days),
+        (UsageBucket::BuddyAi, &f.buddy_ai_days),
     ]
     .into_iter()
     .flat_map(|(b, map)| {
@@ -2032,6 +2221,130 @@ pub fn wb_checkin_results_save(s: &Store, root: &Value) -> Result<(), String> {
     .or_else(|e| {
         let _ = s.with_conn(|c| c.execute_batch("ROLLBACK;"));
         Err(e)
+    })
+}
+
+// ── buddy-ai 每日活跃打卡结果（P2 对齐 wb_checkin_results；镜像同构；
+// 移植 main f5f2cd3..61cc245）───────────────────────────────────────────────
+
+/// 读回 {results: [...]}（按 id 升序 = 原追加序）
+pub fn buddy_ai_checkin_results_load(s: &Store) -> Value {
+    let rows = s
+        .with_conn(|c| {
+            let mut stmt = c.prepare(
+                "SELECT date, time, user_id, name, status, message, reward FROM buddy_ai_checkin_results ORDER BY id",
+            )?;
+            let rows = stmt
+                .query_map([], |r| {
+                    let reward: Option<f64> = r.get(6)?;
+                    Ok(json!({
+                        "date": r.get::<_, String>(0)?,
+                        "time": r.get::<_, String>(1)?,
+                        "user_id": r.get::<_, String>(2)?,
+                        "name": r.get::<_, String>(3)?,
+                        "status": r.get::<_, String>(4)?,
+                        "message": r.get::<_, String>(5)?,
+                        "reward": reward,
+                    }))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(rows)
+        })
+        .unwrap_or_default();
+    json!({ "results": rows })
+}
+
+/// 整表替换（裁剪由调用方计算）
+pub fn buddy_ai_checkin_results_save(s: &Store, root: &Value) -> Result<(), String> {
+    let empty = Vec::new();
+    let arr = root.get("results").and_then(Value::as_array).unwrap_or(&empty);
+    s.with_conn(|c| {
+        c.execute_batch("BEGIN; DELETE FROM buddy_ai_checkin_results;")?;
+        {
+            let mut stmt = c.prepare(
+                "INSERT INTO buddy_ai_checkin_results(date, time, user_id, name, status, message, reward) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            )?;
+            for r in arr {
+                let reward = r.get("reward").and_then(Value::as_f64);
+                stmt.execute(rusqlite::params![
+                    r.get("date").and_then(Value::as_str).unwrap_or(""),
+                    r.get("time").and_then(Value::as_str).unwrap_or(""),
+                    r.get("user_id").and_then(Value::as_str).unwrap_or(""),
+                    r.get("name").and_then(Value::as_str).unwrap_or(""),
+                    r.get("status").and_then(Value::as_str).unwrap_or(""),
+                    r.get("message").and_then(Value::as_str).unwrap_or(""),
+                    reward,
+                ])?;
+            }
+        }
+        c.execute_batch("COMMIT;")?;
+        Ok(())
+    })
+    .or_else(|e| {
+        let _ = s.with_conn(|c| c.execute_batch("ROLLBACK;"));
+        Err(e)
+    })
+}
+
+// ── P8：buddy-ai 每日积分快照（镜像 wb_credits_history 同构）───────────────
+
+/// 读回 {snapshots: [...]}（按日期升序）
+pub fn buddy_ai_credits_history_load(s: &Store) -> Value {
+    let rows = s
+        .with_conn(|c| {
+            let mut stmt = c.prepare(
+                "SELECT date, ts, total_balance, accounts, earned FROM buddy_ai_credits_history ORDER BY date",
+            )?;
+            let rows = stmt
+                .query_map([], |r| {
+                    let accounts: String = r.get(3)?;
+                    Ok(json!({
+                        "date": r.get::<_, String>(0)?,
+                        "ts": r.get::<_, i64>(1)?,
+                        "total_balance": r.get::<_, f64>(2)?,
+                        "accounts": serde_json::from_str::<Value>(&accounts)
+                            .unwrap_or(Value::Array(vec![])),
+                        "earned": r.get::<_, Option<f64>>(4)?,
+                    }))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(rows)
+        })
+        .unwrap_or_default();
+    json!({ "snapshots": rows })
+}
+
+/// 同日覆盖 UPSERT（打卡回写/手动同步双挂点调用，当日多账号回写自然收敛为最终态）
+pub fn buddy_ai_credits_history_upsert(s: &Store, snap: &Value) -> Result<(), String> {
+    let date = snap.get("date").and_then(Value::as_str).unwrap_or("").to_string();
+    if date.is_empty() {
+        return Err("快照缺 date 字段".into());
+    }
+    let ts = snap.get("ts").and_then(Value::as_i64).unwrap_or(0);
+    let total = snap.get("total_balance").and_then(Value::as_f64).unwrap_or(0.0);
+    let accounts = serde_json::to_string(
+        snap.get("accounts").unwrap_or(&Value::Array(vec![])),
+    )
+    .map_err(|e| format!("序列化失败: {e}"))?;
+    let earned = snap.get("earned").and_then(Value::as_f64);
+    s.with_conn(move |c| {
+        c.execute(
+            "INSERT INTO buddy_ai_credits_history(date, ts, total_balance, accounts, earned) VALUES(?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(date) DO UPDATE SET ts = excluded.ts, total_balance = excluded.total_balance, accounts = excluded.accounts, earned = excluded.earned",
+            rusqlite::params![date, ts, total, accounts, earned],
+        )?;
+        Ok(())
+    })
+}
+
+/// 365 天滚动裁剪
+pub fn buddy_ai_credits_history_prune(s: &Store) -> Result<(), String> {
+    let cutoff = (chrono::Local::now().date_naive() - chrono::Duration::days(365))
+        .format("%Y-%m-%d")
+        .to_string();
+    s.with_conn(|c| {
+        c.execute("DELETE FROM buddy_ai_credits_history WHERE date < ?1", [cutoff.as_str()])?;
+        Ok(())
     })
 }
 

@@ -64,6 +64,9 @@ fn merge_pool_set(
     // Qoder 池内调度策略；空串 = 跟随 Trae 池（同 wb_strategy 语义）；None = 保留原值
     qoder_strategy: Option<String>,
     trae_enabled: Option<bool>,
+    // buddy-ai（国际版）显式会话粘性开关 + 池粘性 TTL（§4.2）；None = 保留原值
+    buddy_ai_sticky_enabled: Option<bool>,
+    buddy_ai_pool_sticky_ttl_secs: Option<u64>,
 ) -> ApiPoolFile {
     // Trae 池白名单剥离 wb- 前缀条目：WB 账号归属独立白名单 wb_enabled_uids，
     // 旧版混存于共享 enabled_uids（历史兼容形态），保存时迁移归位防丢失
@@ -129,6 +132,19 @@ fn merge_pool_set(
         trae_tag_ids: existing.trae_tag_ids.clone(),
         wb_tag_ids: existing.wb_tag_ids.clone(),
         qoder_tag_ids: existing.qoder_tag_ids.clone(),
+        // buddy-ai 开关同 tag_ids 口径：pool_set 命令在 merge 后追加应用（热应用 AtomicBool）
+        buddy_ai_enabled: existing.buddy_ai_enabled,
+        buddy_ai_sticky_enabled: buddy_ai_sticky_enabled.unwrap_or(existing.buddy_ai_sticky_enabled),
+        buddy_ai_pool_sticky_ttl_secs: buddy_ai_pool_sticky_ttl_secs
+            .unwrap_or(existing.buddy_ai_pool_sticky_ttl_secs),
+        // buddy-ai per-pool 三参数 + 分组/标签筛选：pool_set 命令在 merge 后追加应用
+        buddy_ai_account_concurrency_limit: existing.buddy_ai_account_concurrency_limit,
+        buddy_ai_sticky_ttl_secs: existing.buddy_ai_sticky_ttl_secs,
+        buddy_ai_hedge_threshold_ms: existing.buddy_ai_hedge_threshold_ms,
+        buddy_ai_group_ids: existing.buddy_ai_group_ids.clone(),
+        buddy_ai_tag_ids: existing.buddy_ai_tag_ids.clone(),
+        // buddy-ai 池内调度策略：pool_set 命令在 merge 后追加应用
+        buddy_ai_strategy: existing.buddy_ai_strategy.clone(),
     }
 }
 
@@ -184,6 +200,21 @@ pub fn pool_set(
     qoder_strategy: Option<String>,
     // Trae 池参与调度开关（默认开）；None = 保留原值
     trae_enabled: Option<bool>,
+    // buddy-ai（国际版）池上游开关（默认关，dispatch 显式开启制）；None = 保留原值
+    buddy_ai_enabled: Option<bool>,
+    // buddy-ai 显式会话粘性开关 + 池粘性 TTL（§4.2）；None = 保留原值
+    buddy_ai_sticky_enabled: Option<bool>,
+    buddy_ai_pool_sticky_ttl_secs: Option<u64>,
+    // buddy-ai per-pool 三参数（并发上限 / 显式会话粘性 TTL / 竞速对冲阈值）；
+    // None = 保留原值（对齐 Qoder 池同型参数）
+    buddy_ai_account_concurrency_limit: Option<u32>,
+    buddy_ai_sticky_ttl_secs: Option<u64>,
+    buddy_ai_hedge_threshold_ms: Option<u64>,
+    // buddy-ai 池分组/标签筛选；None = 保留原值，Some(list) = 覆盖
+    buddy_ai_group_ids: Option<Vec<String>>,
+    buddy_ai_tag_ids: Option<Vec<String>>,
+    // buddy-ai 池内调度策略（空串 = 跟随 Trae 池）；None = 保留原值
+    buddy_ai_strategy: Option<String>,
     // 各池共享标签筛选（tag_ 前缀 id）；None = 保留原值，Some(list) = 覆盖
     // （与分组筛选取交集，D5 池语义）
     trae_tag_ids: Option<Vec<String>>,
@@ -225,6 +256,8 @@ pub fn pool_set(
         qoder_group_ids,
         qoder_strategy,
         trae_enabled,
+        buddy_ai_sticky_enabled,
+        buddy_ai_pool_sticky_ttl_secs,
     );
     // 标签筛选在 merge 后追加应用（merge_pool_set 纯函数签名不动，存量单测零改动）：
     // 显式空数组 = 清空标签筛选，None = 保留
@@ -236,6 +269,33 @@ pub fn pool_set(
     }
     if let Some(v) = qoder_tag_ids {
         pool_file.qoder_tag_ids = v;
+    }
+    // buddy-ai 开关在 merge 后追加应用（对齐 tag_ids 先例：merge_pool_set 纯函数
+    // 签名不动，存量单测零改动）；运行中热应用到 AtomicBool
+    if let Some(v) = buddy_ai_enabled {
+        pool_file.buddy_ai_enabled = v;
+    }
+    // buddy-ai per-pool 三参数 + 分组/标签筛选（merge 后追加应用，对齐 buddy_ai_enabled
+    // 与 tag_ids 先例：merge_pool_set 纯函数签名不动，存量单测零改动）
+    if let Some(v) = buddy_ai_account_concurrency_limit {
+        pool_file.buddy_ai_account_concurrency_limit = v;
+    }
+    if let Some(v) = buddy_ai_sticky_ttl_secs {
+        pool_file.buddy_ai_sticky_ttl_secs = v;
+    }
+    if let Some(v) = buddy_ai_hedge_threshold_ms {
+        pool_file.buddy_ai_hedge_threshold_ms = v;
+    }
+    if let Some(v) = buddy_ai_group_ids {
+        pool_file.buddy_ai_group_ids = v;
+    }
+    if let Some(v) = buddy_ai_tag_ids {
+        pool_file.buddy_ai_tag_ids = v;
+    }
+    // buddy-ai 池内调度策略（merge 后追加应用，对齐 buddy_ai_* 先例：
+    // merge_pool_set 纯函数签名不动，存量单测零改动）
+    if let Some(v) = buddy_ai_strategy {
+        pool_file.buddy_ai_strategy = v;
     }
     crate::store::db(&state.data_dir).kv_set("api_pool", &pool_file)?;
     drop(_pool_cfg); // 写回完成即释放；下方热应用段读内存值，不持配置锁
@@ -250,6 +310,13 @@ pub fn pool_set(
         // Qoder 池策略热应用（空 = 跟随 Trae 池，与启动逻辑一致）
         shared.qoder_pool.set_strategy(
             crate::api_server::pool::PoolStrategy::resolve_qoder(&pool_file.strategy, &pool_file.qoder_strategy),
+        );
+        // buddy-ai 池策略热应用（空 = 跟随 Trae 池，与启动逻辑一致）
+        shared.buddy_ai_pool.set_strategy(
+            crate::api_server::pool::PoolStrategy::resolve_buddy_ai(
+                &pool_file.strategy,
+                &pool_file.buddy_ai_strategy,
+            ),
         );
         // per-pool 三参数热应用（F-76②/F-77 拆分版）：并发上限 / 池粘性 TTL /
         // 显式会话粘性 TTL 三池各自生效
@@ -274,6 +341,31 @@ pub fn pool_set(
         shared
             .qoder_sticky
             .set_explicit_ttl(pool_file.qoder_sticky_ttl_secs as i64);
+        // buddy-ai 池粘性 TTL + 显式会话粘性热应用（§4.2）
+        shared.buddy_ai_pool_sticky_ttl_secs.store(
+            pool_file.buddy_ai_pool_sticky_ttl_secs,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        shared.buddy_ai_sticky_enabled.store(
+            pool_file.buddy_ai_sticky_enabled,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        // buddy-ai per-pool 三参数热应用（并发上限 / 显式会话粘性 TTL / 对冲阈值）
+        shared
+            .buddy_ai_pool
+            .set_concurrency_limit(pool_file.buddy_ai_account_concurrency_limit);
+        shared
+            .buddy_ai_sticky
+            .set_explicit_ttl(pool_file.buddy_ai_sticky_ttl_secs as i64);
+        shared.buddy_ai_hedge_threshold_ms.store(
+            pool_file.buddy_ai_hedge_threshold_ms,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        // buddy-ai 上游开关热应用（dispatch 显式开启制）
+        shared.buddy_ai_enabled.store(
+            pool_file.buddy_ai_enabled,
+            std::sync::atomic::Ordering::Relaxed,
+        );
         shared.wb_longctx_downgrade.store(
             pool_file.wb_longctx_downgrade,
             std::sync::atomic::Ordering::Relaxed,
@@ -359,6 +451,16 @@ pub fn wb_pool_status() -> Vec<PoolStatus> {
 pub fn qoder_pool_status() -> Vec<PoolStatus> {
     match crate::api_server::runtime::gateway_shared() {
         Some(shared) => shared.qoder_pool.status_list(),
+        None => vec![],
+    }
+}
+
+/// 返回运行中 Buddy 国际版（buddy-ai）池的实时状态（全局 API 管理·API Keys
+/// 调度配置候选 + 摘要卡可观测，含 per-account inflight 在途计数）；
+/// 网关未注册时返回空数组
+pub fn buddy_ai_pool_status() -> Vec<PoolStatus> {
+    match crate::api_server::runtime::gateway_shared() {
+        Some(shared) => shared.buddy_ai_pool.status_list(),
         None => vec![],
     }
 }
@@ -524,6 +626,13 @@ pub fn api_wb_catalog_list(state: &AppState) -> Vec<crate::api_server::wb_catalo
     crate::api_server::wb_catalog::load(&state.data_dir)
 }
 
+/// Buddy 国际版（buddy-ai）模型目录：kv 动态目录（/v3/config 同步落盘）优先，
+/// 缺失回落内置静态表（§4.4）。此前恒回静态表（倍率占位 1.0、能力字段全空），
+/// 「同步官网模型」落盘后表格仍不更新的根因。
+pub fn api_buddy_ai_catalog_list(state: &AppState) -> Vec<crate::api_server::wb_catalog::WbModel> {
+    crate::api_server::wb_catalog::buddy_ai_load(&state.data_dir)
+}
+
 /// 查询最近 N 天的 API 用量统计（Trae 模型请求桶，按日聚合，直接读盘，服务未运行也可查）
 pub fn api_usage_stats(state: &AppState, days: Option<u32>) -> Vec<crate::api_server::usage::UsageDayView> {
     let days = days.unwrap_or(14).clamp(1, 90);
@@ -546,6 +655,19 @@ pub fn api_custom_usage_stats(state: &AppState, days: Option<u32>) -> Vec<crate:
     )
 }
 
+/// 查询最近 N 天的 buddy-ai 国际池用量统计（buddy_ai_days 桶，BuddyAI「积分看板·模型消耗排行」专用）
+pub fn api_buddy_ai_usage_stats(
+    state: &AppState,
+    days: Option<u32>,
+) -> Vec<crate::api_server::usage::UsageDayView> {
+    let days = days.unwrap_or(30).clamp(1, 90);
+    crate::api_server::usage::query_recent_in(
+        &state.data_dir,
+        days,
+        crate::api_server::usage::UsageBucket::BuddyAi,
+    )
+}
+
 /// 手动同步 Qoder 模型目录（Qoder「资源调度」页；复用每日调度任务入口
 /// qoder_catalog::run_task，按池序逐可用账号拉取 CN 区 model/list 并原子采纳）。
 /// 返回采纳的模型数；无账号/无凭证返回 Ok(0) 语义的信息（与调度器静默跳过一致）
@@ -556,6 +678,7 @@ pub async fn api_qoder_catalog_sync(state: &AppState) -> Result<usize, String> {
         jwt_refresh_lock: state.jwt_refresh_lock.clone(),
         qoder_pool_lock: state.qoder_pool_lock.clone(),
         wb_pool_lock: state.wb_pool_lock.clone(),
+        buddy_ai_pool_lock: state.buddy_ai_pool_lock.clone(),
         group_defs_lock: state.group_defs_lock.clone(),
         events: state.events.clone(),
     };
@@ -684,7 +807,7 @@ pub fn api_unified_models(
     let Some(shared) = crate::api_server::runtime::gateway_shared() else {
         return Err("网关未启动".into());
     };
-    let (wb_enabled, trae_enabled, qoder_enabled, trae_ok, buddy_ok, qoder_ok, qoder_flash_free) = (
+    let (wb_enabled, trae_enabled, qoder_enabled, trae_ok, buddy_ok, qoder_ok, qoder_flash_free, buddy_ai_enabled, buddy_ai_ok) = (
         shared
             .wb_enabled
             .load(std::sync::atomic::Ordering::Relaxed),
@@ -701,6 +824,10 @@ pub fn api_unified_models(
         shared
             .qoder_flash_free_rate
             .load(std::sync::atomic::Ordering::Relaxed),
+        shared
+            .buddy_ai_enabled
+            .load(std::sync::atomic::Ordering::Relaxed),
+        shared.buddy_ai_pool.has_selectable(),
     );
     let data_dir = state.data_dir.clone();
     let mut list = crate::api_server::unified_catalog::unified_models_ex(
@@ -709,6 +836,7 @@ pub fn api_unified_models(
         trae_enabled && trae_ok,
         buddy_ok,
         Some((qoder_enabled, qoder_ok)),
+        Some((buddy_ai_enabled, buddy_ai_ok)),
         qoder_flash_free,
     );
     if available_only.unwrap_or(false) {
@@ -882,6 +1010,9 @@ mod pool_merge_tests {
             trae_tag_ids: Vec::new(),
             wb_tag_ids: Vec::new(),
             qoder_tag_ids: Vec::new(),
+            // buddy-ai 独立池字段：merge_pool_set 测试关注 WB/Qoder 保留语义，
+            // 新增池字段取 Default（false/0/空，与 Batch 4 pool_set 接线前口径一致）
+            ..Default::default()
         }
     }
 
@@ -918,6 +1049,8 @@ mod pool_merge_tests {
         qoder_group_ids: Option<Vec<String>>,
         qoder_strategy: Option<String>,
         trae_enabled: Option<bool>,
+        buddy_ai_sticky_enabled: Option<bool>,
+        buddy_ai_pool_sticky_ttl_secs: Option<u64>,
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -958,6 +1091,8 @@ mod pool_merge_tests {
             p.qoder_group_ids,
             p.qoder_strategy,
             p.trae_enabled,
+            p.buddy_ai_sticky_enabled,
+            p.buddy_ai_pool_sticky_ttl_secs,
         )
     }
 

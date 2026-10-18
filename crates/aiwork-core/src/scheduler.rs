@@ -20,6 +20,15 @@
 //!   48h lazy gate 内置于 impl（JWT 剩余有效期 > 48h 时零网络请求），
 //!   invalid 账号计入「需重新 OAuth N 个」摘要。
 //!
+//! ## Buddy 国际版任务（移植 main f5f2cd3..61cc245）
+//!
+//! - `buddy-ai-checkin`（09:20，默认关）：每日活跃打卡轮次（settings.buddy_ai_checkin_enabled）；
+//! - `buddy-ai-renew`（10:35，默认开）：凭证兜底续期（lazy 48h）；
+//! - `buddy-ai-credits-sync`（23:45，默认 daily）：积分数据同步，五模式 settings 驱动
+//!   （off/hourly/every_hours/every_days/daily，新增 SchedPlan::EveryDays 档；docker
+//!   适配——模式走 settings 字段不入 scheduler_cfg.task_modes/HOURLY_CAPABLE）；
+//! - `buddy-ai-catalog-sync`（05:55，默认开）：模型目录同步（/v3/config 直连）。
+//!
 //! ## 状态
 //!
 //! kv `scheduler_state`：
@@ -83,6 +92,21 @@ const TASKS: &[SchedTask] = &[
     // 对旧行生效）。展示层另有读时聚合（qoder_sessions_query 两遍归并），本任务只
     // 负责压缩历史行体积
     SchedTask { key: "qoder-sessions-compact", name: "Qoder 会话流水定时合并", hhmm: "04:30" },
+    // ── Buddy 国际版四任务（移植 main f5f2cd3..61cc245）────────────────────────
+    // Buddy 国际版每日活跃打卡：网页会话 + 沙箱 ACP 六步链跑完一轮 → 服务端自动
+    // 入账积分（无 claim 端点）；开关独立（buddy_ai_checkin_enabled，默认关）
+    SchedTask { key: "buddy-ai-checkin", name: "Buddy 国际版每日活跃打卡", hhmm: "09:20" },
+    // Buddy 国际版凭证兜底续期（对齐国内 wb-renew）：lazy 48h——AT 到期前 48h 内
+    // 才真正刷新；开关独立（buddy_ai_renew_enabled，默认开）
+    SchedTask { key: "buddy-ai-renew", name: "Buddy 国际版凭证兜底续期", hhmm: "10:35" },
+    // Buddy 国际版积分数据同步（对齐国内看板同步口径）：get-user-resource 全池取数
+    // → 池三键回写 + 当日快照落库；五模式 settings 驱动（off/hourly/every_hours/
+    // every_days/daily，不入 scheduler_cfg.task_modes/HOURLY_CAPABLE，docker 适配）；
+    // daily 用内置 23:45（task_times 可覆盖），错峰 wb 23:30 / trae 23:40
+    SchedTask { key: "buddy-ai-credits-sync", name: "Buddy 国际版积分数据同步", hhmm: "23:45" },
+    // Buddy 国际版模型目录同步：/v3/config 直连拉取（动态目录替换，与 API 服务启动
+    // 挂点互补）；开关独立（buddy_ai_catalog_sync_enabled，默认开），05:55 错峰
+    SchedTask { key: "buddy-ai-catalog-sync", name: "Buddy 国际版模型目录同步", hhmm: "05:55" },
 ];
 
 /// 启动调度线程（server main 调用；启动 90s 后首跑，避开启动高峰）
@@ -120,21 +144,23 @@ const HOURLY_CAPABLE: &[&str] =
 
 /// 单任务的生效调度计划：Skip=关闭；Daily=每日 HH:MM（到点+当日未跑，启动补跑）；
 /// Hourly=每小时（距上次成功执行 ≥1h，无记录=首次立即跑）；
-/// EveryHours(h)=每 h 小时（距上次成功执行 ≥h·1h，无记录=首次立即跑）
+/// EveryHours(h)=每 h 小时（距上次成功执行 ≥h·1h，无记录=首次立即跑）；
+/// EveryDays(d)=每 d 天（距上次成功执行 ≥d·24h，无记录=首次立即跑；
+/// 移植 main buddy-ai 积分同步 every_days 档）
 #[derive(Debug)]
 enum SchedPlan {
     Skip,
     Daily(String),
     Hourly,
     EveryHours(i64),
+    EveryDays(i64),
 }
 
 /// 单任务调度计划：合并启用判定与模式/时刻解析（tick 与 scheduler_status 共用；
 /// cfg 为整轮一次性读出的 scheduler_cfg，避免每任务重复读 db；
-/// extra_enabled 为外部设置语义门（wb-checkin → 启动自动补签开关 F-55、
-/// qoder-checkin → qoder_settings.auto_checkin，其余任务恒 true）
-fn sched_plan(cfg: &Value, t: &SchedTask, extra_enabled: bool) -> SchedPlan {
-    if !enabled_from(cfg, t.key) || !extra_enabled {
+/// st 用于外部设置语义门与 buddy-ai settings 驱动模式（移植 main））
+fn sched_plan(st: &AppState, cfg: &Value, t: &SchedTask) -> SchedPlan {
+    if !enabled_from(cfg, t.key) || !extra_enabled(st, t.key) {
         return SchedPlan::Skip;
     }
     // Qoder 凭证兜底刷新（移植 main）：固定每 6 小时，hhmm 不参与判定
@@ -145,7 +171,21 @@ fn sched_plan(cfg: &Value, t: &SchedTask, extra_enabled: bool) -> SchedPlan {
     if t.key == "qoder-sessions-compact" {
         return SchedPlan::EveryHours(COMPACT_INTERVAL_HOURS);
     }
-    if HOURLY_CAPABLE.contains(&t.key) {
+    // Buddy 国际版积分数据同步（移植 main）：五模式 settings 驱动（docker 适配——
+    // 不入 scheduler_cfg.task_modes/HOURLY_CAPABLE）；off 已被 extra_enabled 门拦截
+    if t.key == "buddy-ai-credits-sync" {
+        let s = st.settings();
+        match s.buddy_ai_credits_sync_mode.trim() {
+            "hourly" => SchedPlan::Hourly,
+            "every_hours" => SchedPlan::EveryHours(
+                s.buddy_ai_credits_sync_hours.trim().parse::<i64>().unwrap_or(2).clamp(1, 24),
+            ),
+            "every_days" => SchedPlan::EveryDays(
+                s.buddy_ai_credits_sync_days.trim().parse::<i64>().unwrap_or(1).clamp(1, 30),
+            ),
+            _ => SchedPlan::Daily(effective_hhmm_from(cfg, t)),
+        }
+    } else if HOURLY_CAPABLE.contains(&t.key) {
         match effective_task_mode_from(cfg, t.key).as_str() {
             // 看板数据同步：按模式分档——hourly 每小时节流 / every_hours 每 N 小时节流
             // （N 可手工设置，默认 2）/ daily（含非法值）按每日时刻
@@ -186,17 +226,23 @@ fn effective_task_hours_from(cfg: &Value, key: &str) -> i64 {
 }
 
 /// 任务外部设置语义门（整轮读一次）：wb-checkin 联动「启动自动补签」开关（F-55），
-/// qoder-checkin 联动 Qoder 自动签到开关（移植 main），其余任务恒 true
+/// qoder-checkin 联动 Qoder 自动签到开关（移植 main）；Buddy 国际版四任务各自
+/// 联动 settings 开关（移植 main，积分同步 off 门也在此判定，enabled 字段才准确）
 fn extra_enabled(st: &AppState, key: &str) -> bool {
     match key {
         "wb-checkin" => crate::commands::workbuddy::wb_auto_checkin_enabled(st),
         "qoder-checkin" => crate::commands::qoder::qoder_auto_checkin_enabled(st),
+        "buddy-ai-checkin" => crate::commands::workbuddy::buddy_ai_checkin_enabled(st),
+        "buddy-ai-renew" => st.settings().buddy_ai_renew_enabled,
+        "buddy-ai-catalog-sync" => st.settings().buddy_ai_catalog_sync_enabled,
+        "buddy-ai-credits-sync" => st.settings().buddy_ai_credits_sync_mode.trim() != "off",
         _ => true,
     }
 }
 
 /// 看板数据任务 → 平台 key 映射（emit `board-data-synced` 载荷，前端 Dashboard
-/// 按 platform 匹配后才静默重读缓存；issue #61 前端联动侧）
+/// 按 platform 匹配后才静默重读缓存；issue #61 前端联动侧）。buddy-ai 积分同步
+/// 的池回写与快照同为看板数据（移植 main T3 审查修复：缺映射致 BuddyAI 看板滞后）
 fn board_platform(key: &str) -> Option<&'static str> {
     match key {
         "wb-credits-snapshot" => Some("buddy"),
@@ -204,6 +250,7 @@ fn board_platform(key: &str) -> Option<&'static str> {
         // F-80 Qoder 看板与 trae/buddy 同款联动：快照任务写入 qoder_credits_cache
         // 与当日历史后，常驻页面需静默重读（审查修复：此前缺映射致 Qoder 看板滞后）
         "qoder-credits-snapshot" => Some("qoder"),
+        "buddy-ai-credits-sync" => Some("buddy-ai"),
         _ => None,
     }
 }
@@ -221,7 +268,7 @@ fn tick(st: &AppState) {
     let mut ran_this_tick: usize = 0;
     for t in TASKS {
         // 触发判定（trigger 用于日志展示：每日 HH:MM 或「每小时」）
-        let trigger = match sched_plan(&cfg, t, extra_enabled(st, t.key)) {
+        let trigger = match sched_plan(st, &cfg, t) {
             SchedPlan::Skip => continue,
             SchedPlan::Daily(hhmm) => {
                 if last_run_date(&state, t.key).as_deref() == Some(today.as_str()) {
@@ -251,6 +298,16 @@ fn tick(st: &AppState) {
                 }
                 format!("每{hours}小时")
             }
+            SchedPlan::EveryDays(days) => {
+                // EveryDays 按档位节流（移植 main buddy-ai every_days）：距上次成功
+                // 执行 ≥d·24h 才再跑（无记录=首次立即跑）
+                if let Some(ts) = last_run_ts(&state, t.key) {
+                    if chrono::Utc::now().timestamp_millis() - ts < days * 24 * HOURLY_INTERVAL_MS {
+                        continue;
+                    }
+                }
+                format!("每{days}天")
+            }
         };
         // 失败冷却：退避窗口内静默等待重试，不重复执行也不刷日志
         //（retry_cooldown_ms 与 last_fail_ts 同取整轮快照，零额外 IO）
@@ -276,7 +333,7 @@ fn tick(st: &AppState) {
         };
         match outcome {
             Ok(v) => {
-                let summary = summarize(&v);
+                let summary = summarize(&v, t.key);
                 // skipped_busy（移植 main 审查修复：qoder-checkin 轮次锁被 UI 路径持有的
                 // 幂等跳过）不 mark_run——跳过≠完成，mark_run 会固化「当日已跑」关闭当日
                 // 重试链，UI 轮次的失败账号将失去当日调度兜底。其余 skipped（空池静默
@@ -656,6 +713,48 @@ fn run_task(key: &str, st: &AppState) -> Result<Value, String> {
         }
         // WorkBuddy token 兜底续期：与 `--task-run wb-renew` 同款（lazy 24h）
         "wb-renew" => Ok(crate::tasks::wb_checkin::run_renew_only(st, 24)),
+        // Buddy 国际版每日活跃打卡（移植 main）：抢轮次锁与 UI 路径互斥。
+        // T7/BL-5 定调（移植 main）：buddy-ai 凭证失效可经网关 401 自愈/续期轮换
+        // 新值，无永久剔除——retryable = failed 全量，返 Err 交 30 分钟冷却重试
+        "buddy-ai-checkin" => {
+            let Ok(_round) = crate::commands::workbuddy::try_acquire_buddy_ai_round() else {
+                // skipped_busy：抢不到轮次锁（UI 路径在跑）= 幂等跳过而非失败（对齐
+                // wb-checkin/qoder-checkin）——返 Err 会触发当日首败误报通知
+                return Ok(json!({ "ok": true, "skipped": "已有 buddy-ai 打卡任务在执行中，本轮跳过", "skipped_busy": true }));
+            };
+            let mut events: Vec<Value> = Vec::new();
+            let done = crate::tasks::buddy_ai_checkin::run_checkin_round(st, &mut |ev| {
+                events.push(ev.clone())
+            });
+            let failed = done.get("failed").and_then(Value::as_i64).unwrap_or(0);
+            if failed > 0 {
+                // 失败明细落 app_log（对齐 main 蓝本「定时打卡失败明细」格式）
+                fs_utils::app_log(
+                    &st.data_dir,
+                    &format!(
+                        "buddy-ai: 定时打卡失败明细——{}",
+                        events
+                            .iter()
+                            .filter(|e| e.get("status").and_then(Value::as_str) == Some("fail"))
+                            .map(|e| {
+                                format!(
+                                    "{}({})",
+                                    e.get("name").and_then(Value::as_str).unwrap_or("?"),
+                                    e.get("message").and_then(Value::as_str).unwrap_or("")
+                                )
+                            })
+                            .collect::<Vec<_>>()
+                            .join("; ")
+                    ),
+                );
+                let ok = done.get("ok").and_then(Value::as_i64).unwrap_or(0);
+                let already = done.get("already").and_then(Value::as_i64).unwrap_or(0);
+                return Err(format!(
+                    "buddy-ai 打卡：{ok} 成功 / {already} 已完成 / {failed} 失败（稍后自动重试）"
+                ));
+            }
+            Ok(done)
+        }
         // WorkBuddy 积分余额每日快照：补齐近 7 日消耗差分时序；顺带刷新官方请求用量
         //（issue #61 批次：用量刷全账号聚合缓存 workbuddy_usage_official_all_cache，
         // force 跳过 10min 缓存；原单账号缓存分支前端无调用方，属刷错目标一并修复）
@@ -765,6 +864,38 @@ fn run_task(key: &str, st: &AppState) -> Result<Value, String> {
         // Qoder 模型目录同步：与 `--task-run qoder-catalog-sync` 同款（真签名拉
         // model/list → adopt_remote；空池/无凭证空转，网络失败返 Err 冷却重试）
         "qoder-catalog-sync" => crate::tasks::qoder_catalog::run_task(st),
+        // Buddy 国际版凭证兜底续期（移植 main，lazy 48h）：无临期账号空转，
+        // 全失败返 Err 冷却重试
+        "buddy-ai-renew" => crate::commands::workbuddy::buddy_ai_renew_task(st),
+        // Buddy 国际版积分数据同步（移植 main）：get-user-resource 全池取数 → 池回写
+        // + 快照；空池自然空转。docker 适配——无 runtime 句柄，池三键拨新在 impl
+        // 内部经 gateway_shared() 判定完成（对齐 trae-credits-snapshot 口径）。
+        // 顺带官网用量聚合刷新（force 跳过 10min 缓存，国内 wb-credits-snapshot 同款）
+        // 统计尽力而为不上抛；桌面 token_files 重扫属桌面专属不移植（交接定案）
+        "buddy-ai-credits-sync" => {
+            let credits = crate::commands::workbuddy::buddy_ai_credits_sync_impl(st)?;
+            let usage =
+                match crate::commands::workbuddy::buddy_ai_usage_official_all_impl(st, true) {
+                    Ok(_) => "已刷新",
+                    Err(_) => "跳过（无可用凭证或拉取失败）",
+                };
+            Ok(json!({
+                "ok": true,
+                "accounts": credits.len(),
+                "fetched": credits.iter().filter(|a| a.get("credits_balance").map(|b| !b.is_null()).unwrap_or(false)).count(),
+                "usage": usage,
+            }))
+        }
+        // Buddy 国际版模型目录同步（移植 main，/v3/config 直连 → 动态替换）：
+        // 空池/无凭证静默跳过不计失败
+        "buddy-ai-catalog-sync" => {
+            if crate::commands::workbuddy::buddy_ai_pool_size(st) == 0 {
+                Ok(json!({ "ok": true, "skipped": "无 buddy-ai 账号" }))
+            } else {
+                crate::commands::workbuddy::buddy_ai_catalog_sync_impl(st)
+                    .map(|n| json!({ "ok": true, "models": n }))
+            }
+        }
         other => Err(format!("未知调度任务: {other}")),
     }
 }
@@ -915,15 +1046,17 @@ fn write_entry(st: &AppState, key: &str, entry: Value) {
     }
 }
 
-/// 结果 JSON → 单行摘要（含 summary 字段直接取用；签到轮次取 ok/already/failed 计数，其余截断展示）
-fn summarize(v: &Value) -> String {
+/// 结果 JSON → 单行摘要（含 summary 字段直接取用；签到轮次取 ok/already/failed
+/// 计数，buddy-ai 打卡用「已完成」措辞，其余截断展示；task_key 供轮次措辞分型）
+fn summarize(v: &Value, task_key: &str) -> String {
     if let Some(s) = v.get("summary").and_then(Value::as_str) {
         return s.to_string();
     }
     if v.is_object() {
         let get = |k: &str| v.get(k).and_then(Value::as_i64);
         if let (Some(o), Some(a), Some(f)) = (get("ok"), get("already"), get("failed")) {
-            return format!("成功 {o}，已签 {a}，失败 {f}");
+            let already_word = if task_key == "buddy-ai-checkin" { "已完成" } else { "已签" };
+            return format!("成功 {o}，{already_word} {a}，失败 {f}");
         }
     }
     let s = serde_json::to_string(v).unwrap_or_default();
@@ -944,20 +1077,24 @@ pub fn scheduler_status(st: &AppState) -> Value {
             json!({
                 "key": t.key,
                 "name": t.name,
-                // 展示时刻：hourly → 「每小时」；EveryHours(h) → 「每h小时」；其余 HH:MM
-                "time": match sched_plan(&cfg, t, extra_enabled(st, t.key)) {
+                // 展示时刻：hourly → 「每小时」；EveryHours(h) → 「每h小时」；
+                // EveryDays(d) → 「每d天」；其余 HH:MM
+                "time": match sched_plan(st, &cfg, t) {
                     SchedPlan::Hourly => "每小时".to_string(),
                     SchedPlan::EveryHours(h) => format!("每{h}小时"),
+                    SchedPlan::EveryDays(d) => format!("每{d}天"),
                     SchedPlan::Daily(hhmm) => hhmm,
                     SchedPlan::Skip => "已关闭".to_string(),
                 },
-                // 执行模式（daily/hourly/every_hours/every6h/off）：前端据此切换
-                // 时刻输入/模式选择/间隔输入与徽标；every6h 保留给 qoder-refresh
-                // 固定档位（不可配置），看板数据类 every_hours 可配间隔小时数
-                "mode": match sched_plan(&cfg, t, extra_enabled(st, t.key)) {
+                // 执行模式（daily/hourly/every_hours/every_days/every6h/off）：前端据此
+                // 切换时刻输入/模式选择/间隔输入与徽标；every6h 保留给 qoder-refresh
+                // 固定档位（不可配置），看板数据类 every_hours 可配间隔小时数，
+                // every_days 仅 buddy-ai 积分同步（settings 驱动，移植 main）
+                "mode": match sched_plan(st, &cfg, t) {
                     SchedPlan::Hourly => "hourly",
                     SchedPlan::EveryHours(_) if t.key == "qoder-refresh" => "every6h",
                     SchedPlan::EveryHours(_) => "every_hours",
+                    SchedPlan::EveryDays(_) => "every_days",
                     SchedPlan::Daily(_) => "daily",
                     SchedPlan::Skip => "off",
                 },
@@ -1024,27 +1161,59 @@ mod sched_plan_tests {
         TASKS.iter().find(|t| t.key == key).unwrap()
     }
 
-    /// hourly 模式仅对 HOURLY_CAPABLE 任务生效：误配到其他任务按每日处理
+    /// 测试专用 AppState（与 sched_backoff_tests 同款构造）：sched_plan 签名含
+    /// &AppState（buddy-ai settings 驱动模式/语义门读取，移植 main 适配）
+    fn temp_state(tag: &str) -> AppState {
+        let dir = std::env::temp_dir().join(format!("aiwork_schedplan_{tag}_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        AppState {
+            data_dir: dir,
+            jwt_refresh_lock: std::sync::Arc::new(std::sync::Mutex::new(())),
+            qoder_pool_lock: std::sync::Arc::new(std::sync::Mutex::new(())),
+            wb_pool_lock: std::sync::Arc::new(std::sync::Mutex::new(())),
+            buddy_ai_pool_lock: std::sync::Arc::new(std::sync::Mutex::new(())),
+            group_defs_lock: std::sync::Arc::new(std::sync::Mutex::new(())),
+            events: std::sync::Arc::new(std::sync::Mutex::new(None)),
+        }
+    }
+
+    /// settings 整体读改写回（buddy-ai 模式预置）：整体反序列化避免部分 JSON 落 default
+    fn set_settings(st: &AppState, f: impl FnOnce(&mut crate::models::Settings)) {
+        let mut s = st.settings();
+        f(&mut s);
+        crate::store::db(&st.data_dir)
+            .kv_set("app_settings", &s)
+            .unwrap();
+    }
+
+    /// hourly 模式仅对 HOURLY_CAPABLE 任务生效：误配到其他任务按每日处理。
+    /// 预置 wb-checkin 外部门（auto_checkin=true，fresh DB 默认关为正确生产行为），
+    /// 使断言聚焦「hourly 误配不生效」而非外部 Skip
     #[test]
     fn hourly_mode_only_for_capable_tasks() {
+        let st = temp_state("capable");
+        crate::store::db(&st.data_dir)
+            .kv_set_raw("workbuddy_settings", r#"{"auto_checkin":true}"#)
+            .unwrap();
         let cfg = json!({ "task_modes": { "wb-credits-snapshot": "hourly", "wb-checkin": "hourly" } });
         assert!(matches!(
-            sched_plan(&cfg, task("wb-credits-snapshot"), true),
+            sched_plan(&st, &cfg, task("wb-credits-snapshot")),
             SchedPlan::Hourly
         ));
-        assert!(matches!(sched_plan(&cfg, task("wb-checkin"), true), SchedPlan::Daily(_)));
+        assert!(matches!(sched_plan(&st, &cfg, task("wb-checkin")), SchedPlan::Daily(_)));
     }
 
     /// 停用名单与外部设置门（wb-checkin → 启动自动补签）任一不满足即 Skip
     #[test]
     fn disabled_or_external_gate_skips() {
+        let st = temp_state("gate");
         let cfg = json!({ "disabled_tasks": ["trae-credits-snapshot"] });
         assert!(matches!(
-            sched_plan(&cfg, task("trae-credits-snapshot"), true),
+            sched_plan(&st, &cfg, task("trae-credits-snapshot")),
             SchedPlan::Skip
         ));
         assert!(matches!(
-            sched_plan(&json!({}), task("wb-checkin"), false),
+            sched_plan(&st, &json!({}), task("wb-checkin")),
             SchedPlan::Skip
         ));
     }
@@ -1052,13 +1221,14 @@ mod sched_plan_tests {
     /// 自定义时刻覆盖默认；缺省回落内置默认时刻
     #[test]
     fn custom_time_overrides_default() {
+        let st = temp_state("times");
         let cfg = json!({ "task_times": { "models-sync": "08:15" } });
         let t = task("models-sync");
-        match sched_plan(&cfg, t, true) {
+        match sched_plan(&st, &cfg, t) {
             SchedPlan::Daily(hhmm) => assert_eq!(hhmm, "08:15"),
             _ => panic!("models-sync 应为每日计划"),
         }
-        match sched_plan(&json!({}), t, true) {
+        match sched_plan(&st, &json!({}), t) {
             SchedPlan::Daily(hhmm) => assert_eq!(hhmm, t.hhmm),
             _ => panic!("models-sync 应为每日计划"),
         }
@@ -1068,16 +1238,21 @@ mod sched_plan_tests {
     /// 时刻配置不参与判定；停用时仍按 Skip 处理
     #[test]
     fn qoder_refresh_is_every6h() {
+        let st = temp_state("qrefresh");
         let cfg = json!({
             "task_times": { "qoder-refresh": "12:00" },
             "task_modes": { "qoder-refresh": "hourly" },
         });
-        match sched_plan(&cfg, task("qoder-refresh"), true) {
+        match sched_plan(&st, &cfg, task("qoder-refresh")) {
             SchedPlan::EveryHours(h) => assert_eq!(h, REFRESH_INTERVAL_HOURS),
             other => panic!("qoder-refresh 应为 EveryHours 计划，实际 {other:?}"),
         }
         assert!(matches!(
-            sched_plan(&json!({ "disabled_tasks": ["qoder-refresh"] }), task("qoder-refresh"), true),
+            sched_plan(
+                &st,
+                &json!({ "disabled_tasks": ["qoder-refresh"] }),
+                task("qoder-refresh")
+            ),
             SchedPlan::Skip
         ));
     }
@@ -1086,20 +1261,108 @@ mod sched_plan_tests {
     /// 影响，时刻配置不参与判定；停用时仍按 Skip 处理
     #[test]
     fn qoder_sessions_compact_is_every6h() {
+        let st = temp_state("qcompact");
         let cfg = json!({
             "task_times": { "qoder-sessions-compact": "03:10" },
             "task_modes": { "qoder-sessions-compact": "hourly" },
         });
-        match sched_plan(&cfg, task("qoder-sessions-compact"), true) {
+        match sched_plan(&st, &cfg, task("qoder-sessions-compact")) {
             SchedPlan::EveryHours(h) => assert_eq!(h, COMPACT_INTERVAL_HOURS),
             other => panic!("qoder-sessions-compact 应为 EveryHours 计划，实际 {other:?}"),
         }
         assert!(matches!(
             sched_plan(
+                &st,
                 &json!({ "disabled_tasks": ["qoder-sessions-compact"] }),
-                task("qoder-sessions-compact"),
-                true
+                task("qoder-sessions-compact")
             ),
+            SchedPlan::Skip
+        ));
+    }
+
+    /// buddy-ai 积分同步五模式（移植 main f5f2cd3..61cc245，docker settings 驱动）：
+    /// 默认 daily 走内置 23:45（task_times 可覆盖）；hourly/every_hours/every_days
+    /// 生效并 clamp；mode=off 经语义门 Skip（空 mode 时 state 归一化按旧 enabled
+    /// 派生 daily/off）；task_modes 误配不生效
+    #[test]
+    fn buddy_ai_credits_sync_five_modes() {
+        let st = temp_state("buddymode");
+        let t = task("buddy-ai-credits-sync");
+        // 默认（settings mode 经 state 归一化 = daily）：每日内置 23:45
+        match sched_plan(&st, &json!({}), t) {
+            SchedPlan::Daily(hhmm) => assert_eq!(hhmm, "23:45"),
+            other => panic!("buddy-ai-credits-sync 缺省应为每日计划，实际 {other:?}"),
+        }
+        // daily 时刻可被 task_times 覆盖（docker 统一链路）
+        let times = json!({ "task_times": { "buddy-ai-credits-sync": "22:10" } });
+        match sched_plan(&st, &times, t) {
+            SchedPlan::Daily(hhmm) => assert_eq!(hhmm, "22:10"),
+            other => panic!("task_times 覆盖应生效，实际 {other:?}"),
+        }
+        // hourly 模式（settings 预置）
+        set_settings(&st, |s| s.buddy_ai_credits_sync_mode = "hourly".into());
+        assert!(matches!(sched_plan(&st, &json!({}), t), SchedPlan::Hourly));
+        // every_hours 模式：默认 2 小时；手工间隔生效 + 越界 clamp（1..=24）
+        set_settings(&st, |s| {
+            s.buddy_ai_credits_sync_mode = "every_hours".into();
+            s.buddy_ai_credits_sync_hours = "99".into();
+        });
+        assert!(matches!(sched_plan(&st, &json!({}), t), SchedPlan::EveryHours(24)));
+        set_settings(&st, |s| s.buddy_ai_credits_sync_hours = "6".into());
+        assert!(matches!(sched_plan(&st, &json!({}), t), SchedPlan::EveryHours(6)));
+        // every_days 模式：默认 1 天；手工间隔生效 + 越界 clamp（1..=30）
+        set_settings(&st, |s| {
+            s.buddy_ai_credits_sync_mode = "every_days".into();
+            s.buddy_ai_credits_sync_days = "99".into();
+        });
+        assert!(matches!(sched_plan(&st, &json!({}), t), SchedPlan::EveryDays(30)));
+        set_settings(&st, |s| s.buddy_ai_credits_sync_days = "3".into());
+        assert!(matches!(sched_plan(&st, &json!({}), t), SchedPlan::EveryDays(3)));
+        // off 模式：语义门 Skip（对应 scheduler_status.enabled=false）
+        set_settings(&st, |s| s.buddy_ai_credits_sync_mode = "off".into());
+        assert!(matches!(sched_plan(&st, &json!({}), t), SchedPlan::Skip));
+        // scheduler_cfg.task_modes 误配不生效（docker：模式不入 kv）
+        set_settings(&st, |s| s.buddy_ai_credits_sync_mode = "daily".into());
+        let bogus = json!({ "task_modes": { "buddy-ai-credits-sync": "hourly" } });
+        assert!(matches!(sched_plan(&st, &bogus, t), SchedPlan::Daily(_)));
+    }
+
+    /// buddy-ai 其余三任务的 settings 语义门（移植 main）：checkin 默认关 → Skip；
+    /// renew/catalog 默认开 → Daily；预置开后 checkin 生效
+    #[test]
+    fn buddy_ai_tasks_settings_gates() {
+        let st = temp_state("buddygate");
+        // 默认：checkin 关（Skip），renew/catalog 开（Daily）
+        assert!(matches!(
+            sched_plan(&st, &json!({}), task("buddy-ai-checkin")),
+            SchedPlan::Skip
+        ));
+        assert!(matches!(
+            sched_plan(&st, &json!({}), task("buddy-ai-renew")),
+            SchedPlan::Daily(_)
+        ));
+        assert!(matches!(
+            sched_plan(&st, &json!({}), task("buddy-ai-catalog-sync")),
+            SchedPlan::Daily(_)
+        ));
+        // 预置开启 + 停用名单双门任一即 Skip
+        set_settings(&st, |s| s.buddy_ai_checkin_enabled = true);
+        assert!(matches!(
+            sched_plan(&st, &json!({}), task("buddy-ai-checkin")),
+            SchedPlan::Daily(_)
+        ));
+        assert!(matches!(
+            sched_plan(
+                &st,
+                &json!({ "disabled_tasks": ["buddy-ai-checkin"] }),
+                task("buddy-ai-checkin")
+            ),
+            SchedPlan::Skip
+        ));
+        // renew 关闭 → Skip
+        set_settings(&st, |s| s.buddy_ai_renew_enabled = false);
+        assert!(matches!(
+            sched_plan(&st, &json!({}), task("buddy-ai-renew")),
             SchedPlan::Skip
         ));
     }
@@ -1109,70 +1372,76 @@ mod sched_plan_tests {
     /// off 关闭
     #[test]
     fn board_tasks_default_every_hours() {
+        let st = temp_state("board");
         // 默认（无配置）：every_hours 每 2 小时
         assert!(matches!(
-            sched_plan(&json!({}), task("trae-credits-snapshot"), true),
+            sched_plan(&st, &json!({}), task("trae-credits-snapshot")),
             SchedPlan::EveryHours(2)
         ));
         assert!(matches!(
-            sched_plan(&json!({}), task("trae-usage-sync"), true),
+            sched_plan(&st, &json!({}), task("trae-usage-sync")),
             SchedPlan::EveryHours(2)
         ));
         // 显式 hourly 覆盖：每小时节流
         let hourly = json!({ "task_modes": { "trae-usage-sync": "hourly" } });
         assert!(matches!(
-            sched_plan(&hourly, task("trae-usage-sync"), true),
+            sched_plan(&st, &hourly, task("trae-usage-sync")),
             SchedPlan::Hourly
         ));
         // 显式 daily 覆盖：回落每日计划并用内置时刻（23:50，与积分同步 23:40 错峰）
         let daily = json!({ "task_modes": { "trae-usage-sync": "daily" } });
-        match sched_plan(&daily, task("trae-usage-sync"), true) {
+        match sched_plan(&st, &daily, task("trae-usage-sync")) {
             SchedPlan::Daily(hhmm) => assert_eq!(hhmm, "23:50"),
             other => panic!("daily 覆盖应为每日计划，实际 {other:?}"),
         }
         // 非法模式值：回落缺省（every_hours 每 2 小时）
         let bogus = json!({ "task_modes": { "trae-usage-sync": "weekly" } });
         assert!(matches!(
-            sched_plan(&bogus, task("trae-usage-sync"), true),
+            sched_plan(&st, &bogus, task("trae-usage-sync")),
             SchedPlan::EveryHours(2)
         ));
         // wb 缺省同为 every_hours 每 2 小时
         assert!(matches!(
-            sched_plan(&json!({}), task("wb-credits-snapshot"), true),
+            sched_plan(&st, &json!({}), task("wb-credits-snapshot")),
             SchedPlan::EveryHours(2)
         ));
         // qoder 缺省同为 every_hours 每 2 小时（移植 main：积分快照加入四模式族）
         assert!(matches!(
-            sched_plan(&json!({}), task("qoder-credits-snapshot"), true),
+            sched_plan(&st, &json!({}), task("qoder-credits-snapshot")),
             SchedPlan::EveryHours(2)
         ));
         // 手工间隔生效 + 越界 clamp（1..=24）
         let h6 = json!({ "task_modes": { "wb-credits-snapshot": "every_hours" }, "task_hours": { "wb-credits-snapshot": 6 } });
         assert!(matches!(
-            sched_plan(&h6, task("wb-credits-snapshot"), true),
+            sched_plan(&st, &h6, task("wb-credits-snapshot")),
             SchedPlan::EveryHours(6)
         ));
         let h99 = json!({ "task_modes": { "wb-credits-snapshot": "every_hours" }, "task_hours": { "wb-credits-snapshot": 99 } });
         assert!(matches!(
-            sched_plan(&h99, task("wb-credits-snapshot"), true),
+            sched_plan(&st, &h99, task("wb-credits-snapshot")),
             SchedPlan::EveryHours(24)
         ));
         // off 关闭（disabled_tasks 命中 → Skip）
         let off = json!({ "disabled_tasks": ["trae-usage-sync"] });
         assert!(matches!(
-            sched_plan(&off, task("trae-usage-sync"), true),
+            sched_plan(&st, &off, task("trae-usage-sync")),
             SchedPlan::Skip
         ));
     }
 
     /// board_platform 映射（emit `board-data-synced` 载荷）：仅看板数据任务有
-    /// 平台 key，签到/续期/目录同步等非看板任务返回 None（不触发前端联动）
+    /// 平台 key，签到/续期/目录同步等非看板任务返回 None（不触发前端联动）；
+    /// buddy-ai-credits-sync → buddy-ai（移植 main T3 审查修复）
     #[test]
     fn board_platform_maps_board_tasks_only() {
         assert_eq!(board_platform("wb-credits-snapshot"), Some("buddy"));
         assert_eq!(board_platform("trae-credits-snapshot"), Some("trae"));
         assert_eq!(board_platform("trae-usage-sync"), Some("trae"));
         assert_eq!(board_platform("qoder-credits-snapshot"), Some("qoder"));
+        assert_eq!(board_platform("buddy-ai-credits-sync"), Some("buddy-ai"));
+        assert_eq!(board_platform("buddy-ai-checkin"), None);
+        assert_eq!(board_platform("buddy-ai-renew"), None);
+        assert_eq!(board_platform("buddy-ai-catalog-sync"), None);
         assert_eq!(board_platform("qoder-refresh"), None);
         assert_eq!(board_platform("qoder-checkin"), None);
         assert_eq!(board_platform("trae-checkin"), None);
@@ -1194,6 +1463,7 @@ mod sched_backoff_tests {
             jwt_refresh_lock: std::sync::Arc::new(std::sync::Mutex::new(())),
             qoder_pool_lock: std::sync::Arc::new(std::sync::Mutex::new(())),
             wb_pool_lock: std::sync::Arc::new(std::sync::Mutex::new(())),
+            buddy_ai_pool_lock: std::sync::Arc::new(std::sync::Mutex::new(())),
             group_defs_lock: std::sync::Arc::new(std::sync::Mutex::new(())),
             events: std::sync::Arc::new(std::sync::Mutex::new(None)),
         }
