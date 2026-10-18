@@ -6,6 +6,27 @@
 
 ---
 
+## [1.4.18] · 2026-10-18 · 移植 main：BuddyAI 国际池五池化 + 应用显隐联动 + 风控归因修复
+
+> 合并点 `main@f5f2cd3` → `main@61cc245`（28 个提交，手工语义移植，未 merge）。桌面/OS 专属（BuddyAI 桌面客户端打开与环境档案、双客户端并存注册表探测、UI 模拟等）跳过；「应用显隐联动」以 Web 侧 `appVisibility` 池级显隐机制落地（隐藏仅移除界面入口，调度/记账/绑定继续生效）；纯文档 483018a 随本批补移 `docs/pending` 两篇（Qoder 国际版落地方案、BuddyAI 六页对齐计划）。
+
+### 新增
+
+- **BuddyAI 国际版独立池（五池化）**：后端 `buddy_ai.rs` 账号导入/导出/迁移/启停/备注/分组；`buddy_ai_checkin.rs` ACP 六步链打卡与结果落库（90 天滚动）；`wb_catalog` Intl 静态目录 17 模型 + 官网 v3/config 动态抓取（data 信封 + agents/models 解析 + 静态兜底合并）；dispatch `buddy-ai` 档 Intl 源判定动态优先/静态兜底 + 粘性 TTL；`pool_set` 扩 `buddyAiStrategy`（空=跟随 Trae 池）；积分三表 credits/history/days；`UsageBucket::BuddyAi` 记账；poolMetrics 七参。
+- **调度任务四件**：`buddy-ai-checkin` / `buddy-ai-catalog-sync`（05:55）/ `buddy-ai-renew`（lazy 48h）/ `buddy-ai-credits-sync`（23:45）；启动迁移将全局账号幂等入池。
+- **前端 BuddyAI 七页**：总览/账号/API 服务/签到/积分/设置/帮助弹窗；`appVisibility` 池级显隐；资源调度中心五池化（五池全排列预设、BuddyAI 摘要卡、poolMetrics 七参、dispatchPresets 五预设）；cmd_bridge 20 命令。
+
+### 修复与加固
+
+- **issue #118 Buddy 池 refresh 失败如实归因**：封禁/会话失效/通用拒绝三类区分，不再误安抚「重登可恢复」。
+- **issue #119 Qoder 签到 BLOCKED 归因修正**：上游风控按指纹信任分桶拦截，不再误导「客户端登录一次」。
+- **credits.rs 域名硬编码收敛**：`region_activity_base` 单点化。
+- **issue #109 三键回写校验补强**：主体已于 1.4.17 移植，本批补校验部分。
+
+### 验证
+
+- `cargo test --workspace` 724+12 通过（7 忽略）· `tsc` 0 错误 · `vitest` 193 通过（含 dispatchPresets 五池 10 例 + poolMetrics 15 例）· 61 改动文件 BOM 检查通过。
+
 ## [1.4.17] · 2026-10-16 · 移植 main：Flash 免费豁免 + 积分三键拨新 + 审查修复批
 
 > 合并点 `main@b0f81db` → `main@f5f2cd3`（16 个提交，手工语义移植，未 merge）。桌面/OS 专属（计划任务 schtasks、TraeWork 迁移引导）、CI（@tauri-apps/cli 回钉）、纯文档跳过；5468e05/541f33b/d9bf500 已随前次移植包含。
