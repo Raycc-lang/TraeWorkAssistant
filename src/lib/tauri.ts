@@ -1180,7 +1180,22 @@ export interface ListenerHandlers {
 export async function setupListeners(
   handlers: ListenerHandlers,
 ): Promise<UnlistenFn[]> {
+  // M10 修复：中途注册失败时清理已注册监听再抛出——原实现前 N-1 个监听泄漏，
+  // 且 store.init 中断后部分事件通道静默失效
   const unsubs: UnlistenFn[] = [];
+  try {
+    await registerAll(handlers, unsubs);
+    return unsubs;
+  } catch (err) {
+    for (const u of unsubs) u();
+    throw err;
+  }
+}
+
+async function registerAll(
+  handlers: ListenerHandlers,
+  unsubs: UnlistenFn[],
+): Promise<void> {
   if (handlers.onProxyLog) {
     unsubs.push(
       await listen<string>('proxy-log', (e) => handlers.onProxyLog!(e.payload)),
@@ -1263,5 +1278,4 @@ export async function setupListeners(
       ),
     );
   }
-  return unsubs;
 }

@@ -228,6 +228,11 @@ fn bundles_for_app(app_kind: &str) -> Vec<&'static str> {
         "Trae" => vec!["Trae CN"],
         "Doubao" => vec!["Doubao"],
         "WorkBuddy" => vec!["WorkBuddy"],
+        // H-1 伴生修复：BuddyAI 国际版双类别（此前缺失 → 代理运行中打开国际版
+        // 客户端报「未知的应用类别」）。目录名对齐 env.rs mac 档案表候选；路径段
+        // 匹配天然消歧，不含国内 bundle 名（对齐 Windows images_for_app 收窄先例）
+        "WorkBuddy AI" => vec!["WorkBuddy AI", "WorkBuddyAI"],
+        "CodeBuddy AI" => vec!["CodeBuddy AI", "CodeBuddy"],
         "CodeBuddy" => vec!["CodeBuddy", "CodeBuddy CN"],
         "Qoder CN" => vec!["Qoder CN", "Qoder CN IDE"],
         _ => vec![],

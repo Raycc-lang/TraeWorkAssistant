@@ -436,8 +436,10 @@ fn write_locked(st: &mut LoggerState, dir: &PathBuf) {
                 st.file = Some(f);
                 st.date = today;
             }
-            // 打开失败：丢弃本批（与旧实现 write 失败静默语义一致），保留队列外后续行
-            Err(_) => {
+            // 打开失败：丢弃本批（与旧实现 write 失败静默语义一致），保留队列外后续行。
+            // L 修复：补观测日志——「写后读一致」语义在此场景无声破坏，至少留痕可查
+            Err(e) => {
+                eprintln!("[api_logger] 打开日志文件失败，丢弃本批 {} 行: {e}", st.queue.len());
                 st.queue.clear();
                 st.date = today;
                 return;

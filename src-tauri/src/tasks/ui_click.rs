@@ -20,7 +20,10 @@ use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     SendInput, INPUT, INPUT_MOUSE, INPUT_0, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP, MOUSEINPUT,
 };
 #[cfg(windows)]
-use windows_sys::Win32::UI::WindowsAndMessaging::{GetCursorPos, SetCursorPos};
+use windows_sys::Win32::UI::WindowsAndMessaging::{
+    GetCursorPos, GetSystemMetrics, SetCursorPos, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN,
+    SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
+};
 
 #[cfg(windows)]
 const MOVE_DELAY_MS: u64 = 350; // 移动后停顿，给悬浮反馈留时间
@@ -48,12 +51,28 @@ pub fn capture_point() -> Result<(i32, i32), String> {
     }
 }
 
-/// 移动到坐标并左键单击一次（对齐 python --click；坐标需正整数屏幕坐标，
-/// 防负值/零值误触——项目输入坐标校验约定）。
-pub fn click_at(x: i32, y: i32) -> Result<(), String> {
-    if x <= 0 || y <= 0 {
-        return Err("坐标无效（需正整数屏幕坐标）".to_string());
+/// 坐标是否落在 Windows 虚拟屏幕范围内（多显示器含主屏左侧负坐标副屏）。
+#[cfg(windows)]
+fn in_virtual_screen(x: i32, y: i32) -> bool {
+    unsafe {
+        let vs_x = GetSystemMetrics(SM_XVIRTUALSCREEN);
+        let vs_y = GetSystemMetrics(SM_YVIRTUALSCREEN);
+        let vs_w = GetSystemMetrics(SM_CXVIRTUALSCREEN);
+        let vs_h = GetSystemMetrics(SM_CYVIRTUALSCREEN);
+        x >= vs_x && y >= vs_y && x < vs_x.saturating_add(vs_w) && y < vs_y.saturating_add(vs_h)
     }
+}
+
+/// 移动到坐标并左键单击一次（对齐 python --click）。
+/// M5 修复：按 Windows 虚拟屏幕边界校验——原 `x/y <= 0` 一刀切把主屏左侧
+/// 显示器的合法负坐标判为非法，左副屏用户取点/点击不可用。
+pub fn click_at(x: i32, y: i32) -> Result<(), String> {
+    #[cfg(windows)]
+    if !in_virtual_screen(x, y) {
+        return Err(format!("坐标无效（超出虚拟屏幕范围）: ({x}, {y})"));
+    }
+    #[cfg(not(windows))]
+    let _ = (x, y); // 非 Windows 平台在下方 cfg 分支统一报错，吞掉未用参数
     #[cfg(windows)]
     {
         let moved = unsafe { SetCursorPos(x, y) };
@@ -61,9 +80,9 @@ pub fn click_at(x: i32, y: i32) -> Result<(), String> {
             return Err("移动鼠标失败：SetCursorPos 返回 0".to_string());
         }
         sleep(Duration::from_millis(MOVE_DELAY_MS));
-        send_mouse_flag(MOUSEEVENTF_LEFTDOWN);
+        send_mouse_flag(MOUSEEVENTF_LEFTDOWN)?;
         sleep(Duration::from_millis(CLICK_GAP_MS));
-        send_mouse_flag(MOUSEEVENTF_LEFTUP);
+        send_mouse_flag(MOUSEEVENTF_LEFTUP)?;
         Ok(())
     }
     #[cfg(not(windows))]
@@ -73,8 +92,9 @@ pub fn click_at(x: i32, y: i32) -> Result<(), String> {
 }
 
 /// 注入单次鼠标事件（down/up 各调一次，等价 python mouse_event 两次调用）。
+/// M5 修复：校验 SendInput 返回值——原实现忽略返回值，注入失败静默当成功。
 #[cfg(windows)]
-fn send_mouse_flag(dw_flags: u32) {
+fn send_mouse_flag(dw_flags: u32) -> Result<(), String> {
     let input = INPUT {
         r#type: INPUT_MOUSE,
         Anonymous: INPUT_0 {
@@ -89,8 +109,12 @@ fn send_mouse_flag(dw_flags: u32) {
         },
     };
     unsafe {
-        SendInput(1, &input, std::mem::size_of::<INPUT>() as i32);
+        let sent = SendInput(1, &input, std::mem::size_of::<INPUT>() as i32);
+        if sent != 1 {
+            return Err(format!("SendInput 注入失败（返回 {sent}，期望 1）"));
+        }
     }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -98,10 +122,13 @@ mod ui_click_tests {
     use super::*;
 
     #[test]
-    fn click_rejects_non_positive_coords() {
-        // 不触达真实鼠标 API：坐标校验前置失败（两平台共享的校验路径）
-        assert!(click_at(0, 100).is_err());
-        assert!(click_at(100, 0).is_err());
+    fn click_rejects_out_of_virtual_screen() {
+        // 不触达真实鼠标 API：坐标校验前置失败（两平台共享的校验路径）。
+        // M5 修复后校验口径为 Windows 虚拟屏幕边界（左副屏负坐标合法），
+        // 取远超虚拟屏的坐标断言被拒
+        assert!(click_at(i32::MAX / 2, 100).is_err());
+        assert!(click_at(100, i32::MAX / 2).is_err());
+        assert!(click_at(i32::MIN / 2, 100).is_err());
         assert!(click_at(-1, -1).is_err());
     }
 }

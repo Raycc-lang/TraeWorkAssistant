@@ -757,7 +757,7 @@ export default function BuddyApiService() {
                         <td className="px-3 py-2 text-xs text-slate-500">
                           {vendorMap.get(m.id) || '—'}
                         </td>
-                        <td className="px-3 py-2 text-right tabular-nums text-amber-600 dark:text-amber-400">{m.rate.toFixed(2)}</td>
+                        <td className="px-3 py-2 text-right tabular-nums text-amber-600 dark:text-amber-400">{m.rate != null ? m.rate.toFixed(2) : '—'}</td>
                         <td className="px-3 py-2 text-xs text-slate-500">
                           {m.effort_override
                             ? `${m.effort_override}（修正）`

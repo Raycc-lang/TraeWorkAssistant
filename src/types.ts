@@ -1578,7 +1578,8 @@ export interface WbModelInfo {
   supports_image: boolean;
   supported_efforts: string[];
   effort_override: string | null;
-  rate: number;
+  /** Intl 目录元数据缺失时为 null（NaN 哨兵序列化），展示按「—」处理 */
+  rate: number | null;
 }
 
 // ---- Qoder（F-80；Rust commands/qoder；字段名严格 snake_case）----

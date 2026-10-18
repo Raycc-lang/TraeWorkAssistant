@@ -1230,8 +1230,9 @@ pub fn remaining_credits_save(s: &Store, f: &RemainingCreditsFile) -> Result<(),
             (uid, Value::Object(obj))
         })
         .collect();
-    s.rows_replace("remaining_credits", &rows)?;
-    s.kv_set("remaining_credits_updated_at", &f.updated_at)
+    // M4：行表 + kv 元数据同事务落库（防两事务间崩溃/失败留下 updated_at 分叉）
+    let kv = serde_json::to_string(&f.updated_at).map_err(|e| format!("序列化失败: {e}"))?;
+    s.rows_replace_with_kv("remaining_credits", &rows, "remaining_credits_updated_at", Some(&kv))
 }
 
 // ── 冷却状态（account_cooldowns.json → account_cooldowns 表）─────────────────
@@ -1260,8 +1261,9 @@ pub fn account_cooldowns_save(s: &Store, f: &AccountCooldownsFile) -> Result<(),
         .map(|(uid, e)| serde_json::to_value(e).map(|v| (uid.clone(), v)))
         .collect::<Result<_, _>>()
         .map_err(|e| format!("序列化失败: {e}"))?;
-    s.rows_replace("account_cooldowns", &rows)?;
-    s.kv_set("account_cooldowns_updated_at", &f.updated_at)
+    // M4：行表 + kv 元数据同事务落库
+    let kv = serde_json::to_string(&f.updated_at).map_err(|e| format!("序列化失败: {e}"))?;
+    s.rows_replace_with_kv("account_cooldowns", &rows, "account_cooldowns_updated_at", Some(&kv))
 }
 
 // ── 套餐身份（pay_status.json → pay_status 表）───────────────────────────────
@@ -1288,8 +1290,9 @@ pub fn pay_status_save(s: &Store, f: &crate::commands::trae_apps::PayStatusFile)
         .map(|(uid, e)| serde_json::to_value(e).map(|v| (uid.clone(), v)))
         .collect::<Result<_, _>>()
         .map_err(|e| format!("序列化失败: {e}"))?;
-    s.rows_replace("pay_status", &rows)?;
-    s.kv_set("pay_status_updated_at", &f.updated_at)
+    // M4：行表 + kv 元数据同事务落库
+    let kv = serde_json::to_string(&f.updated_at).map_err(|e| format!("序列化失败: {e}"))?;
+    s.rows_replace_with_kv("pay_status", &rows, "pay_status_updated_at", Some(&kv))
 }
 
 // ── API Key（api_keys.json → api_keys 表 + kv 鉴权开关）──────────────────────
@@ -1314,8 +1317,13 @@ pub fn api_keys_save(s: &Store, f: &ApiKeysFile) -> Result<(), String> {
         .map(|k| serde_json::to_value(k).map(|v| (k.id.clone(), v)))
         .collect::<Result<_, _>>()
         .map_err(|e| format!("序列化失败: {e}"))?;
-    s.rows_replace("api_keys", &rows)?;
-    s.kv_set_raw("api_keys_auth_disabled", if f.auth_disabled { "true" } else { "false" })
+    // M4：Key 注册表与鉴权开关 kv 同事务落库（两步分叉 = 鉴权语义与注册表不一致）
+    s.rows_replace_with_kv(
+        "api_keys",
+        &rows,
+        "api_keys_auth_disabled",
+        Some(if f.auth_disabled { "true" } else { "false" }),
+    )
 }
 
 // ── 自定义模型（custom_models.json → custom_models 表）───────────────────────
@@ -1340,8 +1348,13 @@ pub fn custom_models_save(s: &Store, f: &CustomModelsFile) -> Result<(), String>
         .map(|m| serde_json::to_value(m).map(|v| (m.id.clone(), v)))
         .collect::<Result<_, _>>()
         .map_err(|e| format!("序列化失败: {e}"))?;
-    s.rows_replace("custom_models", &rows)?;
-    s.kv_set_raw("custom_models_updated_at", &f.updated_at.to_string())
+    // M4：行表 + kv 元数据同事务落库
+    s.rows_replace_with_kv(
+        "custom_models",
+        &rows,
+        "custom_models_updated_at",
+        Some(&f.updated_at.to_string()),
+    )
 }
 
 // ── 豆包账号池（doubao_accounts.json → doubao_accounts 表）───────────────────
@@ -1367,11 +1380,10 @@ pub fn doubao_pool_save(s: &Store, pool: &crate::commands::doubao::DoubaoAccount
         .map(|a| serde_json::to_value(a).map(|v| (a.user_id.clone(), v)))
         .collect::<Result<_, _>>()
         .map_err(|e| format!("序列化失败: {e}"))?;
-    s.rows_replace("doubao_accounts", &rows)?;
-    s.kv_set(
-        "doubao_pool_meta",
-        &json!({ "last_keepalive_at": pool.last_keepalive_at }),
-    )
+    // M4：行表 + kv 元数据同事务落库
+    let meta = json!({ "last_keepalive_at": pool.last_keepalive_at });
+    let kv = serde_json::to_string(&meta).map_err(|e| format!("序列化失败: {e}"))?;
+    s.rows_replace_with_kv("doubao_accounts", &rows, "doubao_pool_meta", Some(&kv))
 }
 
 // ── WorkBuddy 账号池（workbuddy_accounts.json → wb_accounts 表，Value 语义）──
@@ -1762,12 +1774,12 @@ pub fn qoder_sessions_compact(s: &Store, before_days: i64) -> Result<(usize, usi
              FROM qoder_sessions q
              WHERE q.date < ?1
              GROUP BY q.date, q.uid, q.preview
-             HAVING SUM(request_id NOT GLOB 'agg:*') > 0",
+             HAVING SUM(request_id NOT GLOB '[aA][gG][gG]:*') > 0",
             [&cutoff],
         )?;
         let deleted = tx.execute(
             "DELETE FROM qoder_sessions
-             WHERE date < ?1 AND request_id NOT GLOB 'agg:*'",
+             WHERE date < ?1 AND request_id NOT GLOB '[aA][gG][gG]:*'",
             [&cutoff],
         )?;
         tx.commit()?;

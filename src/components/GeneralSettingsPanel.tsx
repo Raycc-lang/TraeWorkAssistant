@@ -115,7 +115,19 @@ export default function GeneralSettingsPanel() {
     if (!form) return;
     setSaving(true);
     try {
-      await withMinDelay(saveSettings(form));
+      // Low 修复（patch 纪律）：只发送相对当前 store 快照**有变化**的字段——
+      // 面板常驻期间他端（其他页/其他端）改过的设置不再被整份表单静默覆盖。
+      // 逐字段 JSON 串比较（Settings 含数组/对象，浅比较不适用于对象字段）
+      const cur = useAppStore.getState().settings;
+      const patch: Record<string, unknown> = {};
+      if (cur) {
+        for (const k of Object.keys(form) as Array<keyof typeof form>) {
+          if (JSON.stringify(form[k]) !== JSON.stringify((cur as unknown as Record<string, unknown>)[k])) {
+            patch[k] = form[k];
+          }
+        }
+      }
+      await withMinDelay(saveSettings(Object.keys(patch).length > 0 ? patch : form));
       toast('success', '设置已保存');
     } catch {
       /* toast 已发出 */

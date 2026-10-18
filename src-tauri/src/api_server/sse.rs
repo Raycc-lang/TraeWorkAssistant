@@ -486,13 +486,81 @@ fn stream_convert_text_src(
     (error_info, sent_any, pending_usage)
 }
 
-/// 纯文本收集器：output/thought 文本 + usage + error（无 tool_calls 场景）
+/// 纯文本收集器：output/thought 文本 + usage + error + 跨事件合并的 tool_calls
+/// （M3 修复：此前非流式聚合静默丢弃上游 tool_calls，客户端拿到空 content）
 struct PlainCollect {
     content: String,
     reasoning: String,
     finish_reason: String,
     usage: Option<Value>,
     error_info: Option<(i64, String)>,
+    tool_calls: Vec<Value>,
+}
+
+/// 归一单个上游工具调用分片：function_call→function（legacy 形态）、
+/// 剥离 namespace/partial_arguments（与流式路径的转换保持同构）
+fn normalize_tool_call(call: &Value) -> Option<Value> {
+    let mut c = call.clone();
+    if let Some(fc) = c.get("function_call").cloned() {
+        let obj = c.as_object_mut()?;
+        obj.insert("function".into(), fc);
+        obj.remove("function_call");
+    }
+    if let Some(fn_obj) = c.get("function").and_then(|f| f.as_object()).cloned() {
+        let mut clean = fn_obj;
+        clean.remove("namespace");
+        clean.remove("partial_arguments");
+        if let Some(obj) = c.as_object_mut() {
+            obj.insert("function".into(), Value::Object(clean));
+        }
+    }
+    Some(c)
+}
+
+/// 跨事件合并工具调用分片（对齐 Anthropic 侧 ToolBuf 语义）：
+/// 同一调用的流式分片按 index（缺省回退 id）归桶，function.arguments 逐片拼接，
+/// 首片缺失的 id/name 由后续分片补全
+fn merge_tool_calls(buf: &mut Vec<Value>, incoming: &[Value]) {
+    for call in incoming {
+        let Some(c) = normalize_tool_call(call) else { continue };
+        let idx = c.get("index").and_then(Value::as_u64);
+        let cid = c.get("id").and_then(Value::as_str);
+        let pos = buf.iter().position(|b| match (idx, cid) {
+            (Some(i), _) => b.get("index").and_then(Value::as_u64) == Some(i),
+            (None, Some(id)) => b.get("id").and_then(Value::as_str) == Some(id),
+            (None, None) => false,
+        });
+        let Some(p) = pos else {
+            buf.push(c);
+            continue;
+        };
+        if let Some(add_args) = c.pointer("/function/arguments").and_then(Value::as_str) {
+            let b = &mut buf[p];
+            let has_args = b.pointer("/function/arguments").and_then(Value::as_str).is_some();
+            if has_args {
+                if let Some(Value::String(s)) = b.pointer_mut("/function/arguments") {
+                    s.push_str(add_args);
+                }
+            } else if let Some(fn_obj) = b.pointer_mut("/function").and_then(Value::as_object_mut) {
+                fn_obj.insert("arguments".into(), json!(add_args));
+            }
+        }
+        if let Some(b) = buf[p].as_object_mut() {
+            if b.get("id").map(Value::is_null).unwrap_or(true) {
+                if let Some(id) = c.get("id") {
+                    b.insert("id".into(), id.clone());
+                }
+            }
+        }
+        if let Some(name) = c.pointer("/function/name").and_then(Value::as_str) {
+            let b = &mut buf[p];
+            if b.pointer("/function/name").and_then(Value::as_str).map(str::is_empty).unwrap_or(true) {
+                if let Some(fn_obj) = b.pointer_mut("/function").and_then(Value::as_object_mut) {
+                    fn_obj.insert("name".into(), json!(name));
+                }
+            }
+        }
+    }
 }
 
 /// 读取完整 SOLO SSE，收集文本/结束原因/用量/错误
@@ -505,6 +573,7 @@ fn collect_plain<R: Read + Send>(reader: R) -> PlainCollect {
         finish_reason: "stop".to_string(),
         usage: None,
         error_info: None,
+        tool_calls: Vec::new(),
     };
     for line in br.lines() {
         let line = match line {
@@ -516,6 +585,11 @@ fn collect_plain<R: Read + Send>(reader: R) -> PlainCollect {
                 "output" | "thought" => {
                     out.content.push_str(&ev.response);
                     out.reasoning.push_str(&ev.reasoning);
+                    if let Some(tc) = &ev.tool_calls {
+                        if let Some(arr) = tc.as_array() {
+                            merge_tool_calls(&mut out.tool_calls, arr);
+                        }
+                    }
                 }
                 "token_usage" => {
                     out.usage = Some(normalize_openai_usage(&ev.usage.unwrap_or(json!({}))));
@@ -551,6 +625,9 @@ pub fn aggregate<R: Read + Send>(
     });
     if !c.reasoning.is_empty() {
         message["reasoning_content"] = json!(c.reasoning);
+    }
+    if !c.tool_calls.is_empty() {
+        message["tool_calls"] = json!(c.tool_calls);
     }
 
     let mut resp = json!({

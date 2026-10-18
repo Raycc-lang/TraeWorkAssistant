@@ -53,9 +53,18 @@ pub fn cert_query(subject: &str) -> bool {
             opts.mode(0o600);
             match opts.open(&tmp) {
                 Ok(f) => f,
-                // 已存在（历史残留/异常撞名）→ 放弃本次信任判定（返回未信任，
-                // cert_status 表现为「未信任」提示，用户可重试）
-                Err(_) => return false,
+                // M7 修复：已存在（历史残留/异常撞名——pid 复用 + SEQ 进程重启归零）
+                // 时先删残留再重试一次（内容是公开证书，删除无害）。原实现直接
+                // return false → cert_status 永久误报「未信任」且无法自愈
+                Err(_) => {
+                    if std::fs::remove_file(&tmp).is_err() {
+                        return false;
+                    }
+                    match opts.open(&tmp) {
+                        Ok(f) => f,
+                        Err(_) => return false,
+                    }
+                }
             }
         };
         let written = file.write_all(pem.as_bytes()).is_ok();

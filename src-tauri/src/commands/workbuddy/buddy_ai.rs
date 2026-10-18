@@ -338,6 +338,12 @@ pub fn buddy_ai_account_import_creds(
         .and_then(|t| t.get(&target_id))
         .cloned()
         .unwrap_or_default();
+    // L2 修复：持锁后复查账号仍在池中——导入「先落池后落凭证」与并发删除号
+    // 之间存在竞态（删号只删池、不回收 token 行），防止写入幽灵凭证行
+    // （孤儿 rec 永驻 store 且后续 credits_sync 会读到）
+    if !load_pool(&state).accounts.iter().any(|a| a.id == target_id) {
+        return Err(format!("账号 {target_id} 已被移除，取消凭证写入"));
+    }
     let new_rt = refresh_token.as_deref().filter(|t| !t.trim().is_empty());
     let old_rt = existing.get("refresh_token").and_then(Value::as_str);
     let mut creds = json!({
@@ -847,6 +853,11 @@ pub fn buddy_ai_credits_sync_impl(
         .unwrap_or_default();
     let mut out = Vec::new();
     for a in &pool.accounts {
+        // L1 修复：停用账号不参与同步落库——积分/Token 数据对其无意义，
+        // 且会被看板统计（活跃账号数 vs 同步行数）误读
+        if a.disabled {
+            continue;
+        }
         let rec = tokens.get(&a.id).cloned().unwrap_or_default();
         let token = as_str(fs_utils::dig(&rec, &["access_token"])).unwrap_or_default().to_string();
         if token.is_empty() {
@@ -1715,7 +1726,13 @@ fn buddy_ai_official_usage_rows(
             if next_page > 30 {
                 break;
             }
-            page_responses.push(call(&url, next_page)?);
+            // L5 修复：页级失败降级为部分数据返回（复用 truncated 信号，调用方/
+            // 前端已有感知路径），不再丢弃已取全部页的行——原 `?` 把整段用量
+            // 数据变成一次网络抖动的全损
+            page_responses.push(match call(&url, next_page) {
+                Ok(v) => v,
+                Err(_) => return Ok((rows, sess_rows, true)),
+            });
             next_page += 1;
             continue;
         };

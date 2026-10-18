@@ -138,7 +138,9 @@ export default function Sidebar({
     if (!settings) return;
     const next = nextTheme(settings.theme);
     try {
-      await saveSettings({ ...settings, theme: next.id });
+      // Low 修复（patch 纪律）：只发主题字段——原整份 settings 快照回传，会用
+      // 陈旧快照静默覆盖面板打开期间他端已落库的其他设置
+      await saveSettings({ theme: next.id });
       pushToast('success', `主题已切换：${next.name}`);
     } catch {
       /* toast 已发出 */

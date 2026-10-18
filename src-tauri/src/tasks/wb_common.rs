@@ -388,6 +388,15 @@ pub(crate) fn refresh_lock_for(acct_id: &str) -> std::sync::Arc<std::sync::Mutex
 pub(crate) fn refresh_lock_remove(acct_id: &str) {
     let mut g = WB_REFRESH_LOCKS.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(map) = g.as_mut() {
+        // L4 修复：仍有使用者持有旧锁（调用方 drop 守卫与 remove 之间的窗口，
+        // 或新读者刚取到 Arc）时不回收条目——原实现 remove 后新读者拿到全新锁，
+        // 与旧锁并行，每账号互斥失效。条目留待下次 remove（无并发时）回收；
+        // 泄漏面仅限「持续被并发使用」的账号，远小于互斥失效
+        if let Some(arc) = map.get(acct_id) {
+            if std::sync::Arc::strong_count(arc) > 1 {
+                return;
+            }
+        }
         map.remove(acct_id);
     }
 }

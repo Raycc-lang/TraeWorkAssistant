@@ -662,12 +662,25 @@ pub fn workbuddy_refresh_token(
     let rexp_ms = refresh_expires_in.map(|s| now_ms + s * 1000);
 
     // 回写工具侧副本 + 账号池过期时间
-    let creds = serde_json::json!({
+    let mut creds = serde_json::json!({
         "access_token": new_access,
         "refresh_token": new_refresh,
         "expires_at_ms": exp_ms,
         "refresh_expires_at_ms": rexp_ms,
     });
+    if new_refresh.as_deref().map(str::is_empty).unwrap_or(true) {
+        // L3 修复：上游未回发 rt 时保留存储中旧 rt——空串覆盖会把仍有效的 rt
+        // 清空，下轮刷新必失败（与 buddy_ai OAuth 合并写回同款语义）
+        if let Some(old_rt) = crate::tasks::wb_common::load_token_store(&state)
+            .get("tokens")
+            .and_then(|t| t.get(&acct.id))
+            .and_then(|r| r.get("refresh_token"))
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+        {
+            creds["refresh_token"] = serde_json::json!(old_rt);
+        }
+    }
     upsert_token_store(&state, &acct.id, &creds)?;
     // 短临界区写回：重读最新池 → 按 id 更新仍存在的账号；窗口内账号已被删除
     // 则跳过池回写（token store 副本已更新，删除方本就不保留该账号）

@@ -72,21 +72,29 @@ fn networksetup_apply(enable: bool, server: &str, bypass: &str) -> Result<(), St
 }
 
 /// #11 还原面收窄：捕获快照时启用代理的网络服务清单（mac 专用）。
+/// 条目 = (服务名, server(host:port), bypass)——M6 修复：逐服务记录各自快照值，
+/// 还原按服务写回各自的值（此前只存首个服务的值，还原时把同一对值铺满全部
+/// 捕获服务，多服务不同代理配置时原值丢失）。
 /// `capture_proxy_snapshot_services` 写入、`restore_system_proxy_services` 消费；
 /// None = 本次启动未捕获到清单（读失败/无代理），还原退化为全服务写（旧行为）。
 #[cfg(target_os = "macos")]
-static CAPTURED_PROXY_SERVICES: std::sync::Mutex<Option<Vec<String>>> = std::sync::Mutex::new(None);
+static CAPTURED_PROXY_SERVICES: std::sync::Mutex<Option<Vec<(String, String, String)>>> =
+    std::sync::Mutex::new(None);
 
 /// mac 快照捕获（commands/proxy.rs do_start 消费）：读快照三元组的同时，
-/// 把「已启用代理的服务清单」存入 CAPTURED_PROXY_SERVICES 供还原面收窄。
+/// 把「已启用代理的服务 + 各自快照值」存入 CAPTURED_PROXY_SERVICES 供还原。
+/// 返回首个启用服务的快照（Windows 形状兼容：上游透传 + PREV_SYSTEM_PROXY）。
 /// 读失败/无代理时清空清单，避免上一次启动的陈旧清单被本次还原误用。
 #[cfg(target_os = "macos")]
 pub fn capture_proxy_snapshot_services() -> Option<(bool, String, String)> {
     let captured = networksetup_read();
     *CAPTURED_PROXY_SERVICES
         .lock()
-        .unwrap_or_else(|e| e.into_inner()) = captured.as_ref().map(|(_, svcs)| svcs.clone());
-    captured.map(|(snap, _)| snap)
+        .unwrap_or_else(|e| e.into_inner()) = captured.clone();
+    captured
+        .as_ref()
+        .and_then(|v| v.first())
+        .map(|(_, sv, bp)| (true, sv.clone(), bp.clone()))
 }
 
 /// mac 还原路径（#11 还原面收窄核心，commands/proxy.rs apply_prev_proxy 消费）：
@@ -103,14 +111,19 @@ pub fn restore_system_proxy_services(enable: bool, server: &str, bypass: &str) -
     let Some(list) = captured.filter(|l| !l.is_empty()) else {
         return networksetup_apply(enable, server, bypass);
     };
+    let svc_names: Vec<String> = list.iter().map(|(s, _, _)| s.clone()).collect();
     // 审查修复（代理还原短路）：network_services() 枚举失败不应阻断整个还原链——
     // 否则已捕获的 CAPTURED_PROXY_SERVICES 服务不会被写回用户 VPN，其余服务的
     // 127.0.0.1:port 残留也不会被清除，系统代理可能指向死端口。枚举失败时降级为
     // 仅还原捕获清单（用户 VPN 写回优先级最高），其余服务清理放弃并记入错误。
     let others = match network_services() {
-        Ok(all) => all.into_iter().filter(|s| !list.contains(s)).collect::<Vec<_>>(),
+        Ok(all) => all.into_iter().filter(|s| !svc_names.contains(s)).collect::<Vec<_>>(),
         Err(e) => {
-            let r_captured = networksetup_apply_services(enable, server, bypass, &list);
+            let r_captured = if enable {
+                restore_captured_per_service(&list)
+            } else {
+                networksetup_apply_services(false, server, bypass, &svc_names)
+            };
             return match r_captured {
                 Ok(()) => Err(format!("其余服务代理清理跳过（枚举网络服务失败: {e}），如仍有断网请手动在系统设置中关闭代理")),
                 Err(ce) => Err(format!("{ce}；枚举网络服务失败: {e}")),
@@ -123,11 +136,34 @@ pub fn restore_system_proxy_services(enable: bool, server: &str, bypass: &str) -
     } else {
         networksetup_apply_services(false, "", "", &others)
     };
-    let r_captured = networksetup_apply_services(enable, server, bypass, &list);
+    // M6 修复：捕获服务逐条写回**各自的**捕获快照值（enable=true 还原用户 VPN）；
+    // enable=false（清接管残留路径）保持整表 off
+    let r_captured = if enable {
+        restore_captured_per_service(&list)
+    } else {
+        networksetup_apply_services(false, server, bypass, &svc_names)
+    };
     match (r_others, r_captured) {
         (Ok(()), Ok(())) => Ok(()),
         (Err(a), Err(b)) => Err(format!("{a}；{b}")),
         (Err(e), Ok(())) | (Ok(()), Err(e)) => Err(e),
+    }
+}
+
+/// M6 修复配套：捕获服务逐条写回**各自的**捕获快照值（enable=true 还原用户 VPN）。
+/// 逐服务独立收集错误（个别服务失败不掩盖其余服务成功）。
+#[cfg(target_os = "macos")]
+fn restore_captured_per_service(list: &[(String, String, String)]) -> Result<(), String> {
+    let mut errs: Vec<String> = Vec::new();
+    for (svc, sv, bp) in list {
+        if let Err(e) = networksetup_apply_services(true, sv, bp, std::slice::from_ref(svc)) {
+            errs.push(e);
+        }
+    }
+    if errs.is_empty() {
+        Ok(())
+    } else {
+        Err(errs.join("；"))
     }
 }
 
@@ -212,10 +248,11 @@ pub(crate) fn networksetup_apply_services(
 /// 审查 #11：遍历全部服务收集「已启用代理的服务清单」一并返回——还原面收窄
 /// 只还原捕获时启用代理的服务，不把用户 VPN 铺满全部网络服务
 #[cfg(target_os = "macos")]
-fn networksetup_read() -> Option<((bool, String, String), Vec<String>)> {
+fn networksetup_read() -> Option<Vec<(String, String, String)>> {
     let services = network_services().ok()?;
-    let mut result: Option<(bool, String, String)> = None;
-    let mut enabled_services: Vec<String> = Vec::new();
+    // M6 修复：逐服务收集 (服务名, server(host:port), bypass) 快照——还原按
+    // 服务写回各自的值（此前只记首个服务的值，多服务不同代理配置时原值丢失）
+    let mut result: Vec<(String, String, String)> = Vec::new();
     for svc in &services {
         let out = |args: &[&str]| -> Option<String> {
             crate::platform::cmd::sys_output(
@@ -258,14 +295,10 @@ fn networksetup_read() -> Option<((bool, String, String), Vec<String>)> {
                     .join(";")
             })
             .unwrap_or_default();
-        // 快照取首个命中服务（与原「任一启用即返回」口径一致）；服务清单收集
-        // 全部启用代理的服务——还原面收窄的数据来源
-        if result.is_none() {
-            result = Some((true, format!("{host}:{port}"), bypass));
-        }
-        enabled_services.push(svc.clone());
+        // 快照逐服务记录（M6：还原按服务写回各自的值）
+        result.push((svc.clone(), format!("{host}:{port}"), bypass));
     }
-    result.map(|r| (r, enabled_services))
+    (!result.is_empty()).then_some(result)
 }
 
 /// networksetup 读输出 Enabled 行解析（Yes/No；缺行返回 None）。

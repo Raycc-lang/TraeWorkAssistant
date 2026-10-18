@@ -176,6 +176,40 @@ fn ide_aes_keys(_data_dir: &Path) -> Result<Vec<Vec<u8>>, String> {
     Ok(keys)
 }
 
+/// 惰性解密（审查 L 修复）：mac 上逐 service「读 Keychain → 派生 → 尝试解密」，
+/// 命中即返回——原实现先串行读完全部候选（单次 Keychain 访问可达 90s，最坏
+/// ~270s）再逐个试解；Windows 单候选等价旧路径。
+fn decrypt_with_ide_keys(data_dir: &Path, enc: &[u8]) -> Option<String> {
+    #[cfg(windows)]
+    {
+        let keys = ide_aes_keys(data_dir).ok()?;
+        decrypt_v10_any(enc, &keys)
+    }
+    #[cfg(target_os = "macos")]
+    {
+        use hmac::Hmac;
+        use sha1::Sha1;
+        for svc in SAFE_STORAGE_SERVICES {
+            let Ok(pw) = read_keychain_password(svc) else {
+                continue;
+            };
+            let mut key = [0u8; 16];
+            if pbkdf2::pbkdf2::<Hmac<Sha1>>(pw.as_bytes(), b"saltysalt", 1003, &mut key).is_err() {
+                continue;
+            }
+            if let Some(plain) = decrypt_v10(enc, &key.to_vec()) {
+                return Some(plain);
+            }
+        }
+        None
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
+    {
+        let _ = (data_dir, enc);
+        None
+    }
+}
+
 /// 多候选密钥逐一尝试 v10 解密，命中即返回（Windows 单候选恒一步命中）
 fn decrypt_v10_any(enc: &[u8], keys: &[Vec<u8>]) -> Option<String> {
     for key in keys {
@@ -283,8 +317,7 @@ fn read_vscdb_key(vscdb: &Path, key: &str) -> Result<Option<String>, String> {
 /// 文件缺失/解密失败/JSON 无 user.id → None（调用方 fail-open，不阻断流程）
 pub fn scan_work_login_uid(data_dir: &Path) -> Option<String> {
     let enc = std::fs::read(data_dir.join("auth.v1.dat")).ok()?;
-    let keys = ide_aes_keys(data_dir).ok()?;
-    let plain = decrypt_v10_any(&enc, &keys)?;
+    let plain = decrypt_with_ide_keys(data_dir, &enc)?;
     let v: serde_json::Value = serde_json::from_str(&plain).ok()?;
     v.get("user")?
         .get("id")?
@@ -315,13 +348,17 @@ fn expire_ms_of(v: &serde_json::Value) -> Option<i64> {
 
 /// 读 IDE 存储当前登录态（未登录/解密失败 → Err，描述脱敏不含凭证）
 pub fn scan_ide_login(data_dir: &Path) -> Result<IdeLogin, String> {
-    let keys = ide_aes_keys(data_dir)?;
     let vscdb = data_dir.join("User").join("globalStorage").join("state.vscdb");
     let raw = read_vscdb_key(&vscdb, KEY_USER_INFO)?
         .ok_or("state.vscdb 无登录态（可能未登录或已清除）")?;
     let bytes = parse_buffer(&raw).ok_or("登录态键值形态不识别")?;
-    let plain =
-        decrypt_v10_any(&bytes, &keys).ok_or("登录态解密失败（密钥或密文不匹配）")?;
+    // 解密失败时回落 ide_aes_keys 取 Keychain 诊断错误（原实现区分
+    // 「Keychain 读不到」与「密文不匹配」两类错误，保持该可观测性）
+    let plain = decrypt_with_ide_keys(data_dir, &bytes).ok_or_else(|| {
+        ide_aes_keys(data_dir)
+            .err()
+            .unwrap_or_else(|| "登录态解密失败（密钥或密文不匹配）".into())
+    })?;
     let v: serde_json::Value =
         serde_json::from_str(&plain).map_err(|e| format!("userInfo 解析失败: {e}"))?;
     let s = |k: &str| {

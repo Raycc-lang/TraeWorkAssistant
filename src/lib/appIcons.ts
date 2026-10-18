@@ -2,6 +2,7 @@ import {
   Sparkles,
   Bot,
   Boxes,
+  Globe,
   LayoutGrid,
   Terminal,
   Code,

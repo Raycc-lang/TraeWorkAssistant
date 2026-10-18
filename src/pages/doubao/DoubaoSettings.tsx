@@ -155,8 +155,9 @@ export default function DoubaoSettings() {
   };
 
   const registerTask = async () => {
-    if (!/^\d{2}:\d{2}$/.test(taskTime)) {
-      pushToast('warn', '时间格式应为 HH:MM');
+    // Low 修复：收紧为合法时刻（原 `^\d{2}:\d{2}$` 放行 99:99，任务注册成功但永不触发）
+    if (!/^([01]\d|2[0-3]):[0-5]\d$/.test(taskTime)) {
+      pushToast('warn', '时间格式应为合法的 HH:MM（00:00–23:59）');
       return;
     }
     try {
@@ -179,8 +180,9 @@ export default function DoubaoSettings() {
   };
 
   const registerQuotaTask = async () => {
-    if (!/^\d{2}:\d{2}$/.test(quotaTaskTime)) {
-      pushToast('warn', '时间格式应为 HH:MM');
+    // Low 修复：同上收紧为合法时刻
+    if (!/^([01]\d|2[0-3]):[0-5]\d$/.test(quotaTaskTime)) {
+      pushToast('warn', '时间格式应为合法的 HH:MM（00:00–23:59）');
       return;
     }
     try {

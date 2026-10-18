@@ -1615,7 +1615,11 @@ fn process_account(
             let Some(post) = super::qoder_credits::fetch_usage_balance(agent, &headers) else {
                 continue; // 回读失败：本轮作废重试；3 轮全失败则 flat_reads=0 不判负
             };
-            let Some(pre) = pre_balance else { break; };
+            // 审查 L（死代码守卫清理）：pre_balance 外层已保证 Some——原
+            // `let Some(pre) = pre_balance else { break }` 恒不可达。改用安全
+            // 绑定：万一不变量被破坏，pre=i64::MAX 使 post>pre 恒 false（不误判
+            // 到账），行为退化为「无法判定增长」而非 panic
+            let pre = pre_balance.unwrap_or(f64::MAX);
             if reward.is_none() && post > pre {
                 reward = Some(post - pre);
             }

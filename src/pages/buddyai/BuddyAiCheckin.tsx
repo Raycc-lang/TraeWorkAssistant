@@ -38,16 +38,18 @@ export default function BuddyAiCheckin() {
   });
 
   const load = async () => {
-    try {
-      const [accs, recs] = await Promise.all([
-        api.buddyai.accountsList().catch(() => [] as BuddyAiAccountView[]),
-        api.buddyai.checkinResults(90).catch(() => [] as WbCheckinRecord[]),
-      ]);
-      setAccounts(accs);
-      setRecords(recs);
-    } catch (err) {
-      pushToast('error', `数据加载失败：${String(err).slice(0, 120)}`);
-    }
+    // M8 修复：两路加载失败分别可见——原 `.catch(()=>[])` 吞掉接口错误后外层
+    // catch 不可达，双接口失败静默展示「暂无数据」空态（对齐 Overview 页口径）
+    const accs = await api.buddyai.accountsList().catch((err) => {
+      pushToast('error', `账号列表加载失败：${String(err).slice(0, 120)}`);
+      return [] as BuddyAiAccountView[];
+    });
+    const recs = await api.buddyai.checkinResults(90).catch((err) => {
+      pushToast('error', `打卡记录加载失败：${String(err).slice(0, 120)}`);
+      return [] as WbCheckinRecord[];
+    });
+    setAccounts(accs);
+    setRecords(recs);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   };
 

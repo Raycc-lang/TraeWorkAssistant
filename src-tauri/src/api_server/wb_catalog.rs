@@ -325,7 +325,13 @@ fn merge_static_fallback(models: Vec<WbModel>) -> Vec<WbModel> {
                 m.effort_override = b.and_then(|b| b.effort_override.clone());
             }
             if m.rate.is_nan() {
-                m.rate = b.map(|b| b.rate).unwrap_or(1.0);
+                // M2 修复：builtin 命中继承内置倍率（既有设计）；未命中保留 NaN
+                // 哨兵不再 1.0 占位——否则占位值被 unified_catalog rate_of 的
+                // is_finite() 放行，元数据缺失的动态模型以假倍率 1.0 进展示/计费。
+                // NaN 序列化为 null，前端目录表按「—」显示
+                if let Some(b) = b {
+                    m.rate = b.rate;
+                }
             }
             m
         })
@@ -1067,7 +1073,9 @@ mod tests {
     }
 
     /// 元数据缺失兜底（data.models 未覆盖 / 旧形态纯 id 清单）：
-    /// 内置表命中 → 继承 display/rate/上下文；未命中 → 1.0 占位（NaN 哨兵路径）
+    /// 内置表命中 → 继承 display/rate/上下文；未命中 → 保留 NaN 哨兵
+    ///（审查 M2 修复：不再 1.0 占位——占位值会被 unified_catalog rate_of 的
+    /// is_finite() 放行成假定价；NaN 序列化为 null，前端按「—」显示）
     #[test]
     fn parse_v3_config_static_fallback_for_missing_metadata() {
         let body: Value = serde_json::json!({
@@ -1085,7 +1093,7 @@ mod tests {
         assert_eq!(ds.display, "DeepSeek V4.1 Flash", "内置表继承 display");
         let k3 = m.iter().find(|x| x.id == "brand-new-model").unwrap();
         assert_eq!(k3.display, "brand-new-model");
-        assert!((k3.rate - 1.0).abs() < 1e-9, "未命中内置表 → 1.0 占位");
+        assert!(k3.rate.is_nan(), "未命中内置表 → 保留 NaN 哨兵（防假定价）");
     }
 
     #[test]

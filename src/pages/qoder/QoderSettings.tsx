@@ -148,7 +148,7 @@ export default function QoderSettings() {
     // Token 续期间隔：整数 1~24（越界钳制 + 提示，不静默拦截保存）
     const hours = Math.round(Number(renewHours));
     if (!Number.isFinite(hours) || hours < 1 || hours > 24) {
-      pushToast('error', `续期间隔无效：${renewHours}（应为 1~24 的整数小时）`);
+      pushToast('error', `续期间隔无效：${renewHours === '' ? '（空）' : renewHours}（应为 1~24 的整数小时）`);
       return;
     }
     const compactDaysNum = String(

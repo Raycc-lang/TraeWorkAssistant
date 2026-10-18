@@ -722,6 +722,16 @@ fn run_task(
                 &sink,
             )
             .map(|_| json!({ "ok": true }))
+            // M5 修复：对齐 wb-checkin/qoder/buddy-ai-checkin 的 skipped_busy 口径——
+            // 切换互斥忙态（action_gate 被占）是幂等跳过而非任务失败，原实现
+            // mark_fail 会白耗当日首败 Server酱通知额度
+            .or_else(|e| {
+                if e.contains("已有切换/备份操作进行中") {
+                    Ok(json!({ "ok": true, "skipped": e }))
+                } else {
+                    Err(e)
+                }
+            })
         }
         // 豆包会员额度每日巡检：与 `--task-run doubao-quota` 同款
         "doubao-quota" => super::doubao_quota::run_batch(st),

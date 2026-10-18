@@ -13,6 +13,7 @@ use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use tauri::{AppHandle, State};
 
+use crate::fs_utils;
 use crate::platform::cmd::sys_command;
 use crate::state::AppState;
 
@@ -147,7 +148,11 @@ fn persist_detected_path(state: &State<AppState>, key: &str, exe: &str) {
         if let Some(obj) = current.as_object_mut() {
             obj.insert(key.to_string(), serde_json::json!(exe));
         }
-        let _ = store.kv_set("app_settings", &current);
+        // M11 修复：写失败落日志——F-47 路径兜底静默失效会让「手动指定过的路径
+        // 再次探测失败后打不开」无据可查（对齐同文件 app_log 先例口径）
+        if let Err(e) = store.kv_set("app_settings", &current) {
+            fs_utils::app_log(&state.data_dir, &format!("[env] persist_detected_path 写入失败（key={key}）: {e}"));
+        }
     }
 }
 
@@ -752,6 +757,27 @@ fn app_locate_macos(state: &State<AppState>, app: &str) -> AppLocate {
             format!("{home}/.codebuddy"),
             Some("codebuddy_path"),
         ),
+        // H-1 修复：BuddyAI 国际版双档案（此前漏配命中 `_` 兜底 → mac 上误定位成
+        // Trae 并直开 Trae）。数据目录对齐 switcher/profile.rs（~/.workbuddy-ai 国际
+        // 独立根；~/.codebuddy 与国内双端共享）。CFBundleIdentifier 暂无真机实测
+        // 证据，按国内命名惯例推断（codebuddy→codebuddycn 反推）——推断未校准时
+        // 表现为 fail-safe「未找到」（绝不再误启 Trae）；用户可在环境配置页手动
+        // 指定 .app 路径（手动路径仅校验 bundle 目录形态，不校验 id，必生效）。
+        // 待真机侦察后回填精确 id（对齐 M-1 ⑥流程）。
+        "workbuddy_ai" => (
+            "WorkBuddy AI",
+            &["WorkBuddyAI", "WorkBuddy AI"],
+            &["com.tencent.workbuddy.ai", "com.tencent.workbuddy"],
+            format!("{home}/.workbuddy-ai"),
+            Some("workbuddy_ai_path"),
+        ),
+        "codebuddy_ai" => (
+            "CodeBuddy AI",
+            &["CodeBuddyAI", "CodeBuddy AI", "CodeBuddy"],
+            &["com.tencent.codebuddy.ai", "com.tencent.codebuddy"],
+            format!("{home}/.codebuddy"),
+            Some("codebuddy_ai_path"),
+        ),
         // trae_work / traework / work / solo 及其它值 → 默认 Trae（对齐 main 双应用合并：
         // Windows 侧同款兜底；Trae Work 档案与 trae_path 设置键已随合并退役）
         _ => (
@@ -771,6 +797,8 @@ fn app_locate_macos(state: &State<AppState>, app: &str) -> AppLocate {
             "doubao_path" => settings.doubao_path,
             "workbuddy_path" => settings.workbuddy_path,
             "codebuddy_path" => settings.codebuddy_path,
+            "workbuddy_ai_path" => settings.workbuddy_ai_path,
+            "codebuddy_ai_path" => settings.codebuddy_ai_path,
             _ => None,
         };
         if let Some(p) = custom {

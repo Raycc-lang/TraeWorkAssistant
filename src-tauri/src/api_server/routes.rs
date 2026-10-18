@@ -26,6 +26,10 @@ use super::{classify_error, classify_solo_error, streaming_agent, ApiSharedState
             InflightGuard,
             AGENT_HOST, APP_ID, EP_LLM_CHAT, IDE_VERSION, IDE_VERSION_CODE, REFERER_BASE};
 
+/// Trae 池流式轮换上限（审查备案：与 WB/Qoder 的「全池轮换到耗尽」口径有意不同——
+/// Trae 池账号通常较少且首字超时窗口短，3 次换号已覆盖绝大多数瞬态故障；扩到全池
+/// 会线性放大最坏首字延迟。多账号 Trae 池若出现第 4+ 候选才成功的场景，会提前报
+/// no_healthy_account——如需对齐 WB/Qoder 口径再放开此值）
 const MAX_ROTATE: usize = 3;
 /// 请求体上限（issue #21）：axum `Bytes` 提取器受 DefaultBodyLimit 约束（默认 2MiB），
 /// build_router 已显式放开到本值，两处阈值必须一致。32MiB 适配长上下文客户端
@@ -1682,13 +1686,16 @@ fn stream_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: String, str
         let mut sanitize = state.wb_sanitize.load(std::sync::atomic::Ordering::Relaxed);
         let templates = super::wb_route::load_templates(&super::wb_route::WbView::wb(state.clone()));
 
+        // L1 修复：记录最近一次真实绑定的账号——外层断连终局用它归因
+        //（此前恒 "none"，轮换过账号后上游已真实消耗 tokens，用量页却无法归因）
+        let mut last_bound_uid: Option<String> = None;
         for _ in 0..MAX_ROTATE {
             // 客户端断连检测：通道关闭即终止轮换/重试，不再占用账号并发槽。
             // 审查 M5：断连也是请求终局，补记一行失败用量（未取号 → "none"，
             // 与下方轮换耗尽收尾同口径），防用量页 requests 缺口
             if tx.is_closed() {
                 state.record_usage(
-                    false, &model, "none", &key_id, false, true,
+                    false, &model, last_bound_uid.as_deref().unwrap_or("none"), &key_id, false, true,
                     start_ts.elapsed().as_millis() as u64, 0, 0,
                 );
                 return;
@@ -1724,6 +1731,7 @@ fn stream_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: String, str
             }
             attempts += 1;
             *safe_lock(&state.active_uid) = Some(picked.uid.clone());
+            last_bound_uid = Some(picked.uid.clone());
 
             let mut converted = super::payload::prepare_llm_chat_body(
                 &body_vec, &state.default_model, &picked.uid, &picked.device_id, &picked.machine_id,

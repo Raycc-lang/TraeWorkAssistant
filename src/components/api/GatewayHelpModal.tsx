@@ -112,11 +112,12 @@ export default function GatewayHelpModal({ open, onClose }: { open: boolean; onC
       if (await copyText(example)) {
         setCopied(true);
         toast('success', 'cURL 示例已复制到剪贴板');
+        // Low 修复：成功态停留 2s 再复位——原 finally 立即置 false，「已复制」
+        // 视觉状态一闪而过等于死状态
+        setTimeout(() => setCopied(false), 2000);
       } else toast('error', '复制失败');
     } catch {
       toast('error', '复制失败');
-    } finally {
-      setCopied(false);
     }
   };
 

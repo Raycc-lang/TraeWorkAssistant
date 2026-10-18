@@ -37,8 +37,26 @@ pub(crate) static POOL_CFG_LOCK: Mutex<()> = Mutex::new(());
 // ==================== 启停命令 ====================
 
 /// 启动 API 服务核心逻辑（页面命令 / 托盘菜单共用）。
+/// do_start 的进程级启动闸门（L 修复）：「检查已运行 → 长时间 await 启动 → 写入
+/// 句柄」之间的 TOCTOU——并发双启动此前会双双通过检查。占位失败方直接报已运行。
+static DO_START_GATE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// 启动本地 LLM 网关服务（带 TOCTOU 闸门包装，见 DO_START_GATE）。
 /// 成功后同步托盘菜单文本并发送系统通知。
 pub async fn do_start(
+    app: &tauri::AppHandle,
+    state: &AppState,
+    runtime: &Mutex<Option<ApiServerRuntime>>,
+) -> Result<ApiServiceStatus, String> {
+    if DO_START_GATE.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        return Err("API 服务已在运行或正在启动".into());
+    }
+    let out = do_start_inner(app, state, runtime).await;
+    DO_START_GATE.store(false, std::sync::atomic::Ordering::SeqCst);
+    out
+}
+
+async fn do_start_inner(
     app: &tauri::AppHandle,
     state: &AppState,
     runtime: &Mutex<Option<ApiServerRuntime>>,
@@ -1270,14 +1288,12 @@ pub fn pool_set(
         pool_file.qoder_tag_ids = v;
     }
     // buddy-ai 开关在 merge 后追加应用（对齐 tag_ids 先例：merge_pool_set 纯函数
-    // 签名不动，存量单测零改动）；运行中热应用到 AtomicBool
+    // 签名不动，存量单测零改动）；运行中热应用移到配置锁外（M12 修复：此前持
+    // POOL_CFG_LOCK 叶子锁期间嵌套取 runtime 锁，违反「持锁期间不再取其他锁」纪律）
+    let mut buddy_ai_enabled_applied: Option<bool> = None;
     if let Some(v) = buddy_ai_enabled {
         pool_file.buddy_ai_enabled = v;
-        if let Some(rt) = safe_lock(&runtime).as_ref() {
-            rt.shared
-                .buddy_ai_enabled
-                .store(v, std::sync::atomic::Ordering::Relaxed);
-        }
+        buddy_ai_enabled_applied = Some(v);
     }
     // buddy-ai per-pool 三参数 + 分组/标签筛选（merge 后追加应用，对齐 buddy_ai_enabled
     // 与 tag_ids 先例：merge_pool_set 纯函数签名不动，存量单测零改动）
@@ -1304,6 +1320,14 @@ pub fn pool_set(
     crate::store::db(&state.data_dir).kv_set("api_pool", &pool_file)?;
     drop(_cfg);
     // 热应用（配置锁外）：运行中即改内存池策略（Buddy 池空值沿用 Trae 池策略，与启动逻辑一致）
+    // buddy-ai 开关热应用（M12：随本段移出配置锁外）
+    if let Some(v) = buddy_ai_enabled_applied {
+        if let Some(rt) = safe_lock(&runtime).as_ref() {
+            rt.shared
+                .buddy_ai_enabled
+                .store(v, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
     if let Some(rt) = safe_lock(&runtime).as_ref() {
         rt.shared
             .pool

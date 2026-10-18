@@ -1671,13 +1671,16 @@ pub fn oauth_login(
     } else {
         // 此处 refresh_token 刚从 OAuth 回调取得（非存量失效凭证），
         // server_rejected 分支仅转为错误信息，不涉及生命周期标记
-        exchange_token_refresh(&state, &callback_info.refresh_token, Some(&login_device_id))
-            .map_err(|e| e.msg)
-            .ok()
-            .map(|(a, r, _)| (a, r))
+        match exchange_token_refresh(&state, &callback_info.refresh_token, Some(&login_device_id))
+        {
+            Ok((a, r, _)) => Some((a, r)),
+            // M8 修复：保留信封详细错误（含码/信封 msg）——原 `.ok()` 压扁成统一
+            // 文案，用户只看到「refresh_token 交换失败」无从排查
+            Err(e) => return Err(format!("refresh_token 交换失败: {}", e.msg)),
+        }
     };
     let (access_token, new_refresh_token) = new_pair
-        .ok_or_else(|| "refresh_token 交换失败".to_string())?;
+        .ok_or_else(|| "refresh_token 交换失败：回调未携带 accessToken".to_string())?;
 
     // 3. 规范化 JWT 格式
     let jwt = if access_token.starts_with("Cloud-IDE-JWT ") {

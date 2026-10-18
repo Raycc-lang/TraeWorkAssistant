@@ -711,13 +711,25 @@ where
                 reason.push_str(&format!("；上游: {d}（{}）", wb_common::refresh_fail_hint(d)));
             }
             wb_common::mark_needs_relogin(state, acct_id, &reason);
+        } else if fail_reason == Some(wb_common::RefreshFail::NoRefreshToken) {
+            // M6 修复：无 rt 永不自愈（重试必然同样失败），与 Auth 同样标记
+            // needs_relogin 让网关池同步/调度跳过生效
+            wb_common::mark_needs_relogin(state, acct_id, "无 refresh_token，需重新登录");
         }
-        let msg_fail = match fail_detail.as_deref() {
-            Some(d) => format!(
-                "登录态失效且刷新失败；上游: {d}（{}）",
-                wb_common::refresh_fail_hint(d)
-            ),
-            None => "登录态失效且刷新失败".into(),
+        // M6 修复：文案按失败类型如实区分——原实现把 Network/BadResponse/Busy
+        //（瞬时故障，下次自动重试）也渲染成「登录态失效」，误导用户重登
+        let msg_fail = if fail_reason == Some(wb_common::RefreshFail::Auth)
+            || fail_reason == Some(wb_common::RefreshFail::NoRefreshToken)
+        {
+            match fail_detail.as_deref() {
+                Some(d) => format!(
+                    "登录态失效且刷新失败；上游: {d}（{}）",
+                    wb_common::refresh_fail_hint(d)
+                ),
+                None => "登录态失效且刷新失败".into(),
+            }
+        } else {
+            format!("refresh 暂时失败（{msg}），将自动重试，无需重新登录")
         };
         return ("fail".into(), msg_fail);
     }

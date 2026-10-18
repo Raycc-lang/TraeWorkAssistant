@@ -173,6 +173,13 @@ function DispatchCenterCard({
           ...(patch.qoder !== undefined ? { qoder_strategy: patch.qoder } : null),
           ...(patch.buddyAi !== undefined ? { buddy_ai_strategy: patch.buddyAi } : null),
         });
+        // 审查 H-3 伴生修复：保存成功后回读池快照刷新父级——弹窗常驻期间
+        // 他端可能改过池配置（Qoder/Buddy 页同款修复；失败保留本地合并结果）
+        try {
+          onPoolChanged(await api.apiServer.poolList());
+        } catch {
+          /* 回读失败保留本地合并结果 */
+        }
         toast('success', '调度策略已保存，运行中网关即时生效');
       }
     } catch (e) {

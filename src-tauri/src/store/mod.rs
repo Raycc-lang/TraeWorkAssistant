@@ -213,6 +213,57 @@ impl Store {
         })
     }
 
+    /// 行表整表替换 + KV 写入的**同事务**原语（审查 M4）：`rows_replace` 与
+    /// `kv_set` 分属两个独立事务，两步之间崩溃/写失败会留下「表已更新而 kv
+    /// 元数据未更新（或反之）」的永久分叉——最敏感的是 api_keys 表与鉴权开关 kv。
+    /// `kv_content` 为 None 时仅执行行替换（kv 与行表同事务更新）。
+    pub fn rows_replace_with_kv(
+        &self,
+        table: &str,
+        rows: &[(String, serde_json::Value)],
+        kv_key: &str,
+        kv_content: Option<&str>,
+    ) -> Result<(), String> {
+        if !schema::ROW_TABLES.contains(&table) {
+            return Err(format!("非法表名: {table}"));
+        }
+        // 序列化在事务外完成（闭包内仅做 rusqlite 操作）
+        let mut texts: Vec<(String, String)> = Vec::with_capacity(rows.len());
+        for (pk, data) in rows {
+            texts.push((
+                pk.clone(),
+                serde_json::to_string(data).map_err(|e| format!("序列化失败: {e}"))?,
+            ));
+        }
+        let kv_key = kv_key.to_string();
+        let kv_content = kv_content.map(str::to_string);
+        self.with_conn(move |c| {
+            c.execute_batch(&format!("BEGIN; DELETE FROM [{table}];"))?;
+            {
+                let mut stmt = c.prepare(&format!(
+                    "INSERT INTO [{table}](pk, data, updated_at) VALUES(?1, ?2, datetime('now','localtime'))"
+                ))?;
+                for (pk, text) in &texts {
+                    stmt.execute(rusqlite::params![pk, text])?;
+                }
+            }
+            if let Some(content) = &kv_content {
+                c.execute(
+                    "INSERT INTO kv(key, content, updated_at) VALUES(?1, ?2, datetime('now','localtime'))
+                     ON CONFLICT(key) DO UPDATE SET content = excluded.content, updated_at = excluded.updated_at",
+                    rusqlite::params![kv_key, content],
+                )?;
+            }
+            c.execute_batch("COMMIT;")?;
+            Ok(())
+        })
+        .or_else(|e| {
+            // 事务中途失败回滚（连接可能残留未结束的事务）
+            let _ = self.with_conn(|c| c.execute_batch("ROLLBACK;"));
+            Err(e)
+        })
+    }
+
     /// 单行 UPSERT（多写方 map 的增量更新路径，如 wb_tokens / account_cooldowns）
     pub fn row_upsert(&self, table: &str, pk: &str, data: &serde_json::Value) -> Result<(), String> {
         if !schema::ROW_TABLES.contains(&table) {

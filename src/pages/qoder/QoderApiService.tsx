@@ -192,6 +192,14 @@ export default function QoderApiService() {
         }),
         600,
       );
+      // 审查 H-3 修复：保存成功后回读池快照——本页常驻期间全局 API 管理弹窗
+      // 可能改过池配置，旧快照下次保存原样回传会静默覆盖他端配置
+      //（BuddyApiService 同款修复；回读失败保留旧快照，不阻断成功提示）
+      try {
+        setPool(await api.apiServer.poolList());
+      } catch {
+        /* 回读失败保留旧快照 */
+      }
       pushToast('success', 'Qoder 上游配置已保存（服务运行中即时生效）');
     } catch (err) {
       pushToast('error', `保存失败：${String(err)}`);

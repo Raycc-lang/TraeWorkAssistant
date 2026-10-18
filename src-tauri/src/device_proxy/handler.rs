@@ -304,7 +304,33 @@ async fn read_chunked_body<R: AsyncRead + Unpin>(r: &mut R, mut buf: BytesMut) -
         let size = usize::from_str_radix(size_str.trim().split(';').next().unwrap_or("").trim(), 16)
             .map_err(|_| format!("非法 chunk size: {size_str}"))?;
         if size == 0 {
-            // 终结块后的 trailer 不再消费（极少见，Python 版同样不处理 chunked 请求）
+            // L 修复：消费终结块后的 CRLF 与可选 trailer 行直至空行——原实现直接
+            // 返回，keep-alive 复用连接时残留字节会被下一请求解析为请求行 → 解析
+            // 错误断连。EOF 容忍（连接即将关闭，body 已完整）
+            loop {
+                let mut line = Vec::new();
+                let eof = loop {
+                    if let Some(pos) = buf.iter().position(|&b| b == b'\n') {
+                        line = buf.split_to(pos + 1).to_vec();
+                        break false;
+                    }
+                    let mut chunk = [0u8; 1024];
+                    let n = r
+                        .read(&mut chunk)
+                        .await
+                        .map_err(|e| format!("读取 trailer 失败: {e}"))?;
+                    if n == 0 {
+                        break true;
+                    }
+                    buf.extend_from_slice(&chunk[..n]);
+                };
+                if eof {
+                    break;
+                }
+                if String::from_utf8_lossy(&line).trim_end().is_empty() {
+                    break;
+                }
+            }
             return Ok(out.freeze());
         }
         if out.len() + size > MAX_BODY {
@@ -1054,7 +1080,10 @@ pub async fn serve_mitm<S: AsyncRead + AsyncWrite + Unpin>(
             if let Some(auth) = auth_header_value(&req) {
                 let raw = auth.strip_prefix("Cloud-IDE-JWT ").unwrap_or(auth);
                 static AUTH_HINT: OnceLock<Mutex<std::collections::HashSet<String>>> = OnceLock::new();
-                let is_valid = valid_cloud_ide_jwt(raw).is_some();
+                // L 修复：JWT 解析一次复用（此前 is_valid 与捕获分支各验一次，
+                // 每请求双重 base64 解码开销）
+                let valid_jwt = valid_cloud_ide_jwt(raw);
+                let is_valid = valid_jwt.is_some();
                 let seen = AUTH_HINT.get_or_init(|| Mutex::new(std::collections::HashSet::new()));
                 let inserted = seen
                     .lock()
@@ -1067,7 +1096,7 @@ pub async fn serve_mitm<S: AsyncRead + AsyncWrite + Unpin>(
                         "  [JWT-DEBUG] 在 {host} 发现鉴权头 (类型: {marker}: {prefix}…)"
                     ));
                 }
-                if let (true, Some(valid)) = (is_valid, valid_cloud_ide_jwt(raw)) {
+                if let Some(valid) = valid_jwt {
                     if let Some(uid) = extract_user_id(&valid) {
                         // 重 DB 写盘（SQLite 全量账号读写）移出 async worker
                         let ctx2 = Arc::clone(&ctx);

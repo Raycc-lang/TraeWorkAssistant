@@ -282,13 +282,17 @@ pub fn stop_app(sess: &mut Session, sink: &dyn ProgressSink) -> Result<(), Strin
             sess.prof.graceful_wait_secs
         ),
     );
-    if !wait_gone(&sess.prof, Duration::from_secs(sess.prof.graceful_wait_secs)) {
+    // L 修复：优雅等待与强杀收窄到 stop 前捕获的 PID 集合（原 wait_gone/kill_all
+    // 按「映像名全量匹配」——等待窗口内用户新启的同应用实例会被当作未退出的旧
+    // 实例误杀；对齐 stop_spawned 的 PID+身份双重防护）
+    let stop_pids: Vec<u32> = procs.iter().map(|(pid, _)| *pid).collect();
+    if !wait_gone_pids(&sess.prof, &stop_pids, Duration::from_secs(sess.prof.graceful_wait_secs)) {
         // 二级：仍有存活进程 → 强杀
         sink.step("stop", super::StepStatus::Warn, "优雅关闭超时，强制结束进程");
-        kill_all(&sess.prof);
+        kill_pids(&sess.prof, &stop_pids);
     }
     // 三级：等待完全退出 ≤5 秒（强杀后 handle 释放）
-    if !wait_gone(&sess.prof, Duration::from_secs(5)) {
+    if !wait_gone_pids(&sess.prof, &stop_pids, Duration::from_secs(5)) {
         sink.step(
             "stop",
             super::StepStatus::Error,
@@ -356,13 +360,13 @@ pub fn stop_spawned(sess: &mut Session, sink: &dyn ProgressSink, pids: &[u32]) -
             sess.prof.graceful_wait_secs
         ),
     );
-    if !wait_gone_pids(&alive, Duration::from_secs(sess.prof.graceful_wait_secs)) {
+    if !wait_gone_pids(&sess.prof, &alive, Duration::from_secs(sess.prof.graceful_wait_secs)) {
         // 二级：仍有存活 PID → 按 PID 强杀（不使用映像名 kill_all，防误伤）
         sink.step("stop", super::StepStatus::Warn, "优雅关闭超时，按 PID 强制结束");
-        kill_pids(&alive);
+        kill_pids(&sess.prof, &alive);
     }
     // 三级：等待完全退出 ≤5 秒
-    if !wait_gone_pids(&alive, Duration::from_secs(5)) {
+    if !wait_gone_pids(&sess.prof, &alive, Duration::from_secs(5)) {
         sink.step(
             "stop",
             super::StepStatus::Error,
@@ -380,12 +384,13 @@ fn pid_alive_matching(sys: &System, pid: u32, prof: &AppProfile) -> bool {
         .unwrap_or(false)
 }
 
-/// 在 deadline 内等待给定 PID 全部退出（1s 轮询）
-fn wait_gone_pids(pids: &[u32], timeout: Duration) -> bool {
+/// 在 deadline 内等待给定 PID 全部退出（1s 轮询；PID 存在但身份不匹配视为已退出，
+/// 与 pid_alive_matching 同口径，防 PID 复用导致无谓超时）
+fn wait_gone_pids(prof: &AppProfile, pids: &[u32], timeout: Duration) -> bool {
     let start = Instant::now();
     loop {
         let sys = snapshot();
-        if !pids.iter().any(|pid| sys.process(sysinfo::Pid::from_u32(*pid)).is_some()) {
+        if !pids.iter().any(|pid| pid_alive_matching(&sys, *pid, prof)) {
             return true;
         }
         if start.elapsed() >= timeout {
@@ -395,12 +400,15 @@ fn wait_gone_pids(pids: &[u32], timeout: Duration) -> bool {
     }
 }
 
-/// 按 PID 强杀（sysinfo TerminateProcess；PID 已退出时静默跳过）
-fn kill_pids(pids: &[u32]) {
+/// 按 PID 强杀（sysinfo TerminateProcess；PID 已退出或身份不匹配时静默跳过，
+/// 防 PID 复用误杀无关进程）
+fn kill_pids(prof: &AppProfile, pids: &[u32]) {
     let sys = snapshot();
     for pid in pids {
         if let Some(p) = sys.process(sysinfo::Pid::from_u32(*pid)) {
-            let _ = p.kill();
+            if proc_matches(prof, p) {
+                let _ = p.kill();
+            }
         }
     }
 }
@@ -455,13 +463,22 @@ pub fn start_app_pid(sess: &mut Session, sink: &dyn ProgressSink) -> Result<u32,
         // 分离启动：`open` 经 LaunchServices 异步拉起（spawn 到的是短命 open 进程，
         // 其 PID 无意义）——轮询等待真正的 Electron 主进程出现（≤5s）返回其 PID，
         // 保活 stop 阶段按该 PID 精确关闭；未观测到（启动极慢）返回 0，
-        // stop_spawned 的存活重检（mac_main_matches）对 0 恒 false → 自然 Skip
+        // stop_spawned 的存活重检（mac_main_matches）对 0 恒 false → 自然 Skip。
+        // L 修复：open 对已运行应用只做激活——先记录既有实例 PID，等待阶段仅认
+        // 新出现的 PID（原实现返回既有 PID，stop_spawned 会关掉用户自己打开的应用）
+        let pre_existing: std::collections::HashSet<u32> = list_procs(&sess.prof)
+            .iter()
+            .map(|(pid, _)| *pid)
+            .collect();
         cmd.spawn().map_err(|e| {
             super::thrown(sink, &format!("启动 {} 失败: {e}", sess.prof.app_name))
         })?;
         for _ in 0..10 {
             std::thread::sleep(std::time::Duration::from_millis(500));
-            if let Some((pid, _)) = list_procs(&sess.prof).first() {
+            if let Some((pid, _)) = list_procs(&sess.prof)
+                .iter()
+                .find(|(pid, _)| !pre_existing.contains(pid))
+            {
                 return Ok(*pid);
             }
         }
@@ -507,20 +524,6 @@ pub fn start_app_pid(sess: &mut Session, sink: &dyn ProgressSink) -> Result<u32,
     }
 }
 
-/// 在 deadline 内等待目标进程全部退出（1s 轮询，对齐 PS Start-Sleep 1s 循环）
-fn wait_gone(prof: &AppProfile, timeout: Duration) -> bool {
-    let start = Instant::now();
-    loop {
-        if list_procs(prof).is_empty() {
-            return true;
-        }
-        if start.elapsed() >= timeout {
-            return false;
-        }
-        std::thread::sleep(Duration::from_secs(1));
-    }
-}
-
 /// 向 pid 的所有顶层窗口投递 WM_CLOSE（PS $proc.CloseMainWindow() 的全窗口版，
 /// 覆盖多窗口 Electron 应用；投递不阻塞）。
 /// F-75 M1-1.1：Windows 专属实现（windows-sys），mac 走上方 SIGTERM 分支。
@@ -540,17 +543,6 @@ pub fn post_wm_close(pid: u32) {
         1 // TRUE：继续枚举
     }
     unsafe { EnumWindows(Some(cb), pid as isize) };
-}
-
-/// 强杀全部白名单进程（sysinfo TerminateProcess，等价 PS Stop-Process -Force）
-fn kill_all(prof: &AppProfile) {
-    let sys = snapshot();
-    for (_, p) in sys.processes() {
-        // proc_matches 平台分派 + ark 仲裁（与 list_procs 同源）
-        if proc_matches(prof, p) {
-            let _ = p.kill();
-        }
-    }
 }
 
 #[cfg(test)]
@@ -766,13 +758,54 @@ mod tests {
     #[test]
     fn wait_gone_pids_不存在pid立即返回true() {
         // 第一轮枚举即无命中 → 立即 true，不做 1s 轮询空转
-        assert!(wait_gone_pids(&[u32::MAX - 1, u32::MAX - 2], Duration::from_secs(5)));
+        assert!(wait_gone_pids(
+            &prof(TargetApp::Doubao),
+            &[u32::MAX - 1, u32::MAX - 2],
+            Duration::from_secs(5)
+        ));
     }
 
+    // 负路径需「存活且身份匹配」的进程：win 用自身测试进程（白名单临时替换映像名）；
+    // mac 身份信号是 exe 路径 bundle 段（测试进程不在 .app 内，不可伪造），
+    // 以真实常驻的 Finder 对测（Finder 未运行的极端环境则跳过）
+    #[cfg(windows)]
     #[test]
     fn wait_gone_pids_存活pid超时返回false() {
-        // 自身进程在等待期间必然存活 → 走满超时返回 false（负路径）
-        assert!(!wait_gone_pids(&[std::process::id()], Duration::from_millis(100)));
+        let stem = std::env::current_exe()
+            .ok()
+            .and_then(|p| p.file_stem().map(|s| s.to_string_lossy().into_owned()))
+            .expect("无法获取测试进程映像名");
+        let leaked: &'static str = Box::leak(stem.into_boxed_str());
+        let whitelist: &'static [&'static str] = Box::leak(vec![leaked].into_boxed_slice());
+        let mut p = prof(TargetApp::Doubao);
+        p.proc_names = whitelist;
+        // 自身进程在等待期间必然存活且匹配 → 走满超时返回 false（负路径）
+        assert!(!wait_gone_pids(&p, &[std::process::id()], Duration::from_millis(100)));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn wait_gone_pids_存活pid超时返回false() {
+        let leaked: &'static str = Box::leak("Finder".to_string().into_boxed_str());
+        let whitelist: &'static [&'static str] = Box::leak(vec![leaked].into_boxed_slice());
+        let mut p = prof(TargetApp::Doubao);
+        p.proc_names = whitelist;
+        let sys = snapshot();
+        let Some(pid) = sys
+            .processes()
+            .values()
+            .find(|pr| {
+                pr.exe()
+                    .map(|e| {
+                        e.to_string_lossy().to_lowercase().contains("/finder.app/contents/macos/")
+                    })
+                    .unwrap_or(false)
+            })
+            .map(|pr| pr.pid().as_u32())
+        else {
+            return;
+        };
+        assert!(!wait_gone_pids(&p, &[pid], Duration::from_millis(100)));
     }
 
     #[test]

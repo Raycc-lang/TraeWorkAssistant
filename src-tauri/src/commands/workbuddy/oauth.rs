@@ -442,6 +442,11 @@ pub(super) fn oauth_flow(
     // last_daily_chat（当日打卡幂等失效→重复跑六步链）/uid/domain 等既有键——
     // 与导入路径 BL-2 同类缺陷。新键优先，旧键缺省补齐；新码未回发 rt 时保留旧 rt
     if matches!(sink, PoolSink::BuddyAi) {
+        // M4 修复：读-合并-写全程持每账号刷新锁（对齐导入路径 buddy_ai.rs:334——
+        // 并发续期/网关 401 国际档轮换 rt 时，锁外读到的 stale rt 会整行覆盖新 rt，
+        // 账号须重登）。与续期/打卡写段同锁域
+        let refresh_lock = crate::tasks::wb_common::refresh_lock_for(&target_id);
+        let _refresh_guard = refresh_lock.lock().unwrap_or_else(|e| e.into_inner());
         let existing = sink.load_token(state, &target_id);
         let mut creds = creds;
         if let (Some(obj), Some(eobj)) = (creds.as_object_mut(), existing.as_object()) {
@@ -477,6 +482,16 @@ pub fn workbuddy_oauth_login(app: AppHandle) -> Result<(), String> {
     oauth_login_async(app, &crate::tasks::wb_common::REGION_CN, PoolSink::Cn)
 }
 
+/// RAII 闸门守护（对齐 qoder 侧 OAuthGuard）：闭包存活期间持有闸门，
+/// 任何退出路径（正常结束/panic/事件发送失败）经 Drop 自动复位，
+/// 杜绝 OAUTH_RUNNING 永久卡死导致后续登录被拒。
+struct OAuthGuard;
+impl Drop for OAuthGuard {
+    fn drop(&mut self) {
+        OAUTH_RUNNING.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
 /// 通用异步启动器（CN/Intl 共用 OAUTH_RUNNING 全局闸门，一次仅允许一个流程；
 /// 进度/终态事件按池前缀分流：wb-oauth-* / buddy-ai-oauth-*）
 pub(super) fn oauth_login_async(
@@ -494,30 +509,40 @@ pub(super) fn oauth_login_async(
     // 原 AppState::new() 在本线程构造全新实例，锁域互不相干 → OAuth 写池与
     // 命令/调度写池并发时失去互斥，可能整池覆盖丢账号。
     let st = app.state::<AppState>().inner().clone();
-    std::thread::spawn(move || {
-        // panic 兜底（审查修复）：oauth_flow panic 原实现会让 OAUTH_RUNNING 永久卡死
-        //（CN/Intl 共享闸门）且 done 事件永不发出 → 前端弹框永远 loading 直到重启。
-        // catch_unwind 确保复位 + 补发失败终态
-        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            oauth_flow(&app, &st, ep, sink)
-        }));
-        let payload = match outcome {
-            Ok(Ok((id, nickname))) => serde_json::json!({
-                "ok": true,
-                "id": id,
-                "nickname": nickname,
-                "message": format!("账号「{nickname}」已扫码登录并自动入池"),
-            }),
-            Ok(Err(e)) => serde_json::json!({ "ok": false, "message": e }),
-            Err(_) => serde_json::json!({
-                "ok": false,
-                "message": "OAuth 流程内部异常（已恢复），请重试或查看日志"
-            }),
-        };
-        // 终态事件：emit 失败落日志（issue #44 遗留项——前端 OAuth 弹框依赖此事件收尾）
-        crate::events::emit_logged(&app, &done_event, payload, None);
+    // 审查修复（闸门 RAII 化，对齐 qoder 侧）：裸 std::thread::spawn 失败即 panic，
+    // panic 点在下方 catch_unwind 之外 → 闸门永久 true 且 done 事件永不发出。
+    // 改用命名 Builder 线程并处理 spawn 结果；闭包内以 OAuthGuard 兜底复位。
+    let spawned = std::thread::Builder::new()
+        .name("wb-oauth".into())
+        .spawn(move || {
+            // RAII 守护：闭包内任何路径退出（含 panic/emit 失败）经 Drop 自动复位闸门
+            let _guard = OAuthGuard;
+            // panic 兜底（审查修复）：oauth_flow panic 原实现会让 OAUTH_RUNNING 永久卡死
+            //（CN/Intl 共享闸门）且 done 事件永不发出 → 前端弹框永远 loading 直到重启。
+            // catch_unwind 确保复位 + 补发失败终态
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                oauth_flow(&app, &st, ep, sink)
+            }));
+            let payload = match outcome {
+                Ok(Ok((id, nickname))) => serde_json::json!({
+                    "ok": true,
+                    "id": id,
+                    "nickname": nickname,
+                    "message": format!("账号「{nickname}」已扫码登录并自动入池"),
+                }),
+                Ok(Err(e)) => serde_json::json!({ "ok": false, "message": e }),
+                Err(_) => serde_json::json!({
+                    "ok": false,
+                    "message": "OAuth 流程内部异常（已恢复），请重试或查看日志"
+                }),
+            };
+            // 终态事件：emit 失败落日志（issue #44 遗留项——前端 OAuth 弹框依赖此事件收尾）
+            crate::events::emit_logged(&app, &done_event, payload, None);
+        });
+    if spawned.is_err() {
         OAUTH_RUNNING.store(false, Ordering::SeqCst);
-    });
+        return Err("OAuth 后台线程启动失败，请重试".into());
+    }
     Ok(())
 }
 

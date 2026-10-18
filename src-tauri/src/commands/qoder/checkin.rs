@@ -2,9 +2,11 @@
 //! 签到（NDJSON 管线）/ 签到结果 / 启动自动补签。
 //!
 //! 每日定时统一由应用内 Rust 调度器（tasks/scheduler.rs，60s tick + 当日幂等 +
-//! 启动补跑）驱动，全平台一致；2026-10-05 起移除 Windows schtasks 双轨命令
-//! （qoder_checkin_task_register/status/unregister）——原双轨与调度器重复维护
-//! 时刻口径，且 mac 无对应物；时刻修改统一走 settings.qoder_checkin_hhmm。
+//! 启动补跑）驱动，全平台一致；前端已无 schtasks 注册 UI（单轨设计，时刻修改统一
+//! 走 settings.qoder_checkin_hhmm）。注意：qoder_checkin_task_register/status/
+//! unregister 三命令 2026-10-18 复核**仍保留实现并注册**（main.rs），mac 上由
+//! schtasks_gate() 在 spawn 前拦截、Windows 侧仅作 CLI/兼容口——前端零调用；
+//! 如确认无外部依赖可整体移除（决策项，勿在无依据时删改）。
 
 use serde::Serialize;
 use serde_json::Value;

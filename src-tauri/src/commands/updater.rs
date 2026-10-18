@@ -11,6 +11,7 @@
 //   update_check       解析最新 release 并与 CARGO_PKG_VERSION 比较；同时解析发布校验清单
 //                      latest.json（scripts/rename_release.mjs 生成随 Release 上传）取安装包 SHA256，
 //                      清单存在即 fail-closed（缺失/损坏/版本不符均阻止自动更新），无清单回退正文约定行；
+//                      两者皆无（存量旧 release）下载步同样 fail-closed 拒绝（H-4 修复：不再跳过校验放行）；
 //   update_download    下载资产到临时目录（emit update-download-progress），完成后与发布方
 //                      SHA256 比对（不匹配即删除并报错），返回文件路径由前端确认后再安装；
 //   update_run_installer 以 /P /UPDATE /R 启动 NSIS 安装器：
@@ -528,7 +529,15 @@ pub fn update_download(
             }
             Some(s)
         }
-        None => None,
+        None => {
+            // H-4 fail-closed：前端未回传摘要（存量旧 release 无清单/正文约定行）时
+            // 不再「跳过校验」放行——否则 update_check 的 fail-closed 可被
+            // update_download(恶意URL, ..., None) + update_run_installer 组合绕过
+            // （webview 注入场景构成任意安装包执行链）。引导手动下载。
+            return Err(format!(
+                "发布方 SHA-256 缺失（存量旧版本 Release），已中止下载以保证安全。请手动下载安装：{RELEASES_PAGE}"
+            ));
+        }
     };
 
     // 下载目录：%TEMP%\ai-work-assistant-update\
@@ -536,13 +545,18 @@ pub fn update_download(
     std::fs::create_dir_all(&dir).map_err(|e| format!("创建临时目录失败: {e}"))?;
     // 清理历史版本残留（只删本目录下的安装包文件，保留当前目标文件）
     if let Ok(entries) = std::fs::read_dir(&dir) {
+        let target_sidecar = format!("{asset_name}.sha256");
         for entry in entries.flatten() {
             let p = entry.path();
             let name = p.file_name().map(|n| n.to_string_lossy().into_owned());
-            if name.as_deref() != Some(asset_name.as_str())
-                && p.is_file()
-                && p.extension().map(|e| e == "exe" || e == "msi" || e == "dmg").unwrap_or(false)
-            {
+            let is_installer = p
+                .extension()
+                .map(|e| e == "exe" || e == "msi" || e == "dmg")
+                .unwrap_or(false);
+            let is_sidecar = name.as_deref().map(|n| n.ends_with(".sha256")).unwrap_or(false);
+            let is_target = name.as_deref() == Some(asset_name.as_str())
+                || name.as_deref() == Some(target_sidecar.as_str());
+            if !is_target && p.is_file() && (is_installer || is_sidecar) {
                 let _ = std::fs::remove_file(&p);
             }
         }
@@ -569,6 +583,14 @@ pub fn update_download(
                             "安装包完整性校验失败（SHA256 不匹配），已删除下载文件。\
                              可能为网络劫持或下载损坏，请重试或手动下载：{RELEASES_PAGE}"
                         ));
+                    }
+                    // 下载-安装窗口绑定：把已通过校验的期望哈希落 sidecar 清单，
+                    // update_run_installer 安装前对磁盘文件复验（防 TOCTOU 替换）；
+                    // 无 sidecar 的安装包在安装步一律拒绝（fail-closed）
+                    let sidecar = dir.join(format!("{asset_name}.sha256"));
+                    if let Err(e) = std::fs::write(&sidecar, expected) {
+                        let _ = std::fs::remove_file(&dest);
+                        return Err(format!("写入安装包校验清单失败，已中止下载: {e}"));
                     }
                 }
                 let _ = app.emit(
@@ -668,6 +690,31 @@ pub fn update_run_installer(
     match version_from_asset(&asset_name) {
         Some(v) if cmp_version(v, current) == std::cmp::Ordering::Greater => {}
         _ => return Err("安装包版本不大于当前版本，已中止".to_string()),
+    }
+    // 文件名与资产名绑定校验（防 file_path / asset_name 错位组合安装）
+    if path.file_name().map(|n| n.to_string_lossy().into_owned()).as_deref() != Some(asset_name.as_str())
+    {
+        return Err("安装包文件名与资产名不匹配，已中止".to_string());
+    }
+    // 下载-安装窗口 TOCTOU 防护（H-4）：对磁盘文件复验下载步落盘的 sidecar
+    // 校验清单——仅「通过过完整性校验」的安装包才允许进入安装
+    let sidecar = path.with_file_name(format!("{asset_name}.sha256"));
+    let expected = std::fs::read_to_string(&sidecar)
+        .ok()
+        .map(|s| s.trim().to_ascii_lowercase())
+        .filter(|s| is_sha256_hex(s));
+    let Some(expected) = expected else {
+        return Err(
+            "缺少安装包校验清单（请重新执行「检查更新→下载」），已中止安装".to_string(),
+        );
+    };
+    let actual = file_sha256(path).unwrap_or_default();
+    if actual != expected {
+        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_file(&sidecar);
+        return Err(format!(
+            "安装包完整性复验失败（SHA256 不匹配），已删除安装包。请重新检查更新：{RELEASES_PAGE}"
+        ));
     }
 
     // F-75 M3-3.3 macOS 分支：无安装器概念——`open` 挂载 dmg 并弹 Finder 窗口，

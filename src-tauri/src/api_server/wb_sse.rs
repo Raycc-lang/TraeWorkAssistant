@@ -160,7 +160,15 @@ fn parse_data(data: &str) -> Option<WbEvent> {
             .and_then(|m| m.as_str())
             .unwrap_or("upstream error")
             .to_string();
-        let code = err.get("code").and_then(|c| c.as_i64()).unwrap_or(0);
+        // code 宽口径：上游可能以字符串形态下发（"code":"4001"），as_i64 落 0 会
+        // 误入 ErrKind::Server 兜底（30m 熔断）——字符串可 parse 时取值（对齐 token_number 风格）
+        let code = err
+            .get("code")
+            .and_then(|c| {
+                c.as_i64()
+                    .or_else(|| c.as_str().and_then(|s| s.trim().parse::<i64>().ok()))
+            })
+            .unwrap_or(0);
         return Some(WbEvent::Error { code, msg });
     }
     let choice = v

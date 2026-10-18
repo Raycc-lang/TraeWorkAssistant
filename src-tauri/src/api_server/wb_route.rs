@@ -35,7 +35,7 @@ use super::wb_sse;
 use super::wb_sse::{cache_write_tokens_of, cached_tokens_of, u64_pair};
 use super::wb_sticky::SessionKey;
 use super::wb_upstream::{self, WbCreds};
-use super::{classify_error, ApiSharedState, ErrKind, InflightGuard};
+use super::{classify_error, is_model_config_mismatch, ApiSharedState, ErrKind, InflightGuard};
 use crate::api_server::routes::{anthropic_error, openai_error, Protocol, stream_msg_or_fallback_str};
 
 // ==================== wb 族执行视图（buddy-ai 阶段 2 分流） ====================
@@ -367,6 +367,13 @@ pub fn load_templates(state: &WbView) -> Vec<(String, String)> {
 /// WB 流内错误 → ErrKind：WB 无 SOLO 业务码体系，按类 HTTP 状态码 +
 /// message 关键词判定（积分耗尽标记词表集中维护，F-33）
 pub fn classify_wb_error(code: i64, msg: &str) -> ErrKind {
+    // 模型级错误豁免（对齐 HTTP 路径 classify_error / SOLO 路径 4001 口径）：
+    // 4001/model config is empty 是「模型在该 function 下不可用」而非账号问题——
+    // 落 Client/Server 会给每个账号打冷却/熔断，换号遍历全池后 no_healthy_account。
+    // ErrKind::None：不冷却账号，仅按 inline_error_action 换号重试。
+    if code == 4001 || is_model_config_mismatch(msg) {
+        return ErrKind::None;
+    }
     let lower = msg.to_lowercase();
     if code == 401 || lower.contains("unauthorized") || lower.contains("token expired") {
         return ErrKind::SessionDead;
@@ -448,21 +455,26 @@ fn race_first_byte(
     tried: &HashSet<String>,
     allowed: Option<&HashSet<String>>,
     dedicated: Option<&str>,
-) -> Result<RaceWin, ()> {
+) -> Result<RaceWin, Vec<String>> {
     let hedge_ms = state.route_hedge_ms();
     if hedge_ms == 0 {
-        return wb_upstream::lines_with_first_byte_timeout(reader).map(|lines| RaceWin {
-            lines,
-            uid: primary_uid.to_string(),
-            hedge: None,
-            takeover: false,
-        });
+        return wb_upstream::lines_with_first_byte_timeout(reader)
+            .map(|lines| RaceWin {
+                lines,
+                uid: primary_uid.to_string(),
+                hedge: None,
+                takeover: false,
+            })
+            .map_err(|_| vec![primary_uid.to_string()]);
     }
     let state2 = state.clone();
     let tried2 = tried.clone();
     let allowed2 = allowed.cloned();
     let dedicated2 = dedicated.map(str::to_string);
     let body = converted.to_vec();
+    // 双败归因：闭包内记录实际取得的对冲账号 uid（建连失败/双败路径据此上报）
+    let hedge_spawned = std::rc::Rc::new(std::cell::RefCell::new(Option::<String>::None));
+    let hedge_spawned2 = hedge_spawned.clone();
     let spawn_backup = move || -> Option<(Box<dyn Read + Send>, HedgeLease)> {
         let (picked2, ev) = state2
             .route_pool()
@@ -473,6 +485,7 @@ fn race_first_byte(
         }
         // 租约先于建连获取：建连失败（下行 `?`）时随闭包局部变量 Drop 自动 -1
         let lease = HedgeLease::acquire(&state2, &picked2.uid);
+        *hedge_spawned2.borrow_mut() = Some(lease.uid.clone());
         let creds2 = WbCreds {
             id: picked2.uid.clone(),
             uid: picked2.uid.clone(),
@@ -497,7 +510,17 @@ fn race_first_byte(
             };
             Ok(RaceWin { uid, lines: out.lines, hedge: out.hedge, takeover: out.takeover })
         }
-        Err(()) => Err(()),
+        Err(()) => {
+            // 双败归因修复：主/对冲两侧账号都上报——此前只记主账号，对冲账号的
+            // 上游故障无 note_error/冷却，可被反复选中消耗真实上游请求
+            let mut failed = vec![primary_uid.to_string()];
+            if let Some(h) = hedge_spawned.borrow().as_ref() {
+                if failed.last().map(|u| u != h).unwrap_or(true) {
+                    failed.push(h.clone());
+                }
+            }
+            Err(failed)
+        }
     }
 }
 
@@ -704,6 +727,9 @@ fn run_wb_stream(
     // 虚大 rotated 分母，稀释「空完成主导」判定，审查 2026-10-07）
     let mut attempts: usize = 0;
     let mut last_11128_sample: Option<String> = None; // 11128 诊断样本按请求去重
+    // L1 修复：记录最近一次真实绑定的账号——外层断连终局用它归因（此前恒 "none"，
+    // 轮换过账号后上游已真实消耗 tokens，用量页却无法归因到账号）
+    let mut last_bound_uid: Option<String> = None;
 
     loop {
         // 客户端断连检测：通道关闭即终止轮换/重试，不再占用账号并发槽（对齐 routes.rs stream_chat）。
@@ -711,7 +737,11 @@ fn run_wb_stream(
         // 轮换耗尽收尾同口径），防用量页 requests 缺口
         if tx.is_closed() {
             let duration_ms = start_ts.elapsed().as_millis() as u64;
-            state.record_usage_bucket(state.usage_bucket(), model, "none", key_id, false, true, duration_ms, 0, 0);
+            state.record_usage_bucket(
+                state.usage_bucket(), model,
+                last_bound_uid.as_deref().unwrap_or("none"), key_id,
+                false, true, duration_ms, 0, 0,
+            );
             return;
         }
         // ── 取号：粘性/专一命中优先，否则按 Key 约束 + 调度策略；换号后仅走策略 ──
@@ -792,6 +822,7 @@ fn run_wb_stream(
         }
         attempts += 1; // 绑定成功即真实消耗一个候选（CAS 拒绝不计入分母）
         *safe_lock(&state.active_uid) = Some(picked.uid.clone());
+        last_bound_uid = Some(picked.uid.clone());
 
         // 上游会话 id：粘性命中复用，否则新生成（成功后绑定）
         let is_sticky_hit = sticky_uid.as_deref() == Some(picked.uid.as_str()) && !sticky_conv.is_empty();
@@ -842,8 +873,11 @@ fn run_wb_stream(
                         dedicated.as_deref(),
                     ) {
                         Ok(w) => w,
-                        Err(()) => {
-                            state.route_pool().note_error(&picked.uid, ErrKind::Server);
+                        Err(failed_uids) => {
+                            // 双败：主/对冲两侧账号均记 Server 冷却
+                            for uid in &failed_uids {
+                                state.route_pool().note_error(uid, ErrKind::Server);
+                            }
                             note_model_failure(state, model);
                             break;
                         }
@@ -1049,9 +1083,9 @@ fn run_wb_stream(
                                             // 即时观测日志：接通「401→他方刷新→换号」反查通道
                                             //（与其余换号路径一致；此为中间态，usage 由终态统一落账）
                                             state.logger.log_request(
-                                                "buddy", "POST", "/v2/chat/completions", model, true, status, &picked.uid,
+                                                state.pool_label(), "POST", "/v2/chat/completions", model, true, status, &picked.uid,
                                                 start_ts.elapsed().as_millis() as u64,
-                                                &key_name, &state.wb_pool.name_of(&picked.uid),
+                                                &key_name, &state.route_pool().name_of(&picked.uid),
                                                 Some("401 → 他方进程刷新中，换号（未记冷却）"),
                                             );
                                             break;
@@ -1275,8 +1309,11 @@ pub async fn wb_aggregate_chat(
                             dedicated.as_deref(),
                         ) {
                             Ok(w) => w,
-                            Err(()) => {
-                                state.route_pool().note_error(&picked.uid, ErrKind::Server);
+                            Err(failed_uids) => {
+                                // 双败：主/对冲两侧账号均记 Server 冷却
+                                for uid in &failed_uids {
+                                    state.route_pool().note_error(uid, ErrKind::Server);
+                                }
                                 note_model_failure(&state, &model);
                                 break;
                             }
@@ -1414,9 +1451,9 @@ pub async fn wb_aggregate_chat(
                                                 // 即时观测日志：接通「401→他方刷新→换号」反查通道
                                                 //（此为中间态，usage 由终态路径统一落账）
                                                 state.logger.log_request(
-                                                    "buddy", "POST", "/v2/chat/completions", &model, stream, status, &picked.uid,
+                                                    state.pool_label(), "POST", "/v2/chat/completions", &model, stream, status, &picked.uid,
                                                     start_ts.elapsed().as_millis() as u64,
-                                                    &key_name, &state.wb_pool.name_of(&picked.uid),
+                                                    &key_name, &state.route_pool().name_of(&picked.uid),
                                                     Some("401 → 他方进程刷新中，换号（未记冷却）"),
                                                 );
                                                 break;
@@ -1833,9 +1870,9 @@ pub async fn wb_tool_exec_chat(
                                                 // 即时观测日志：接通「401→他方刷新→换号」反查通道
                                                 //（与其余路径一致；此为中间态，usage 由终态统一落账）
                                                 state.logger.log_request(
-                                                    "buddy", "POST", "/v1/responses", &model, stream, status, &picked.uid,
+                                                    state.pool_label(), "POST", "/v1/responses", &model, stream, status, &picked.uid,
                                                     start_ts.elapsed().as_millis() as u64,
-                                                    &key_name, &state.wb_pool.name_of(&picked.uid),
+                                                    &key_name, &state.route_pool().name_of(&picked.uid),
                                                     Some("401 → 他方进程刷新中，换号（未记冷却）"),
                                                 );
                                                 break Err(format!(

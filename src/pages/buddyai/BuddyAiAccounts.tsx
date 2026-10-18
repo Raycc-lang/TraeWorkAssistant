@@ -173,6 +173,9 @@ export default function BuddyAiAccounts() {
     });
     const unDone = listen<WbOauthDone>('buddy-ai-oauth-done', (e) => {
       setOauthBusy(false);
+      // Low 修复：done（含失败）即撤销看门狗——原 310s 定时器在失败信息已展示后
+      // 仍会触发，把失败信息覆盖成「登录超时」误导排查
+      if (watchdog) clearTimeout(watchdog);
       if (e.payload.ok) {
         pushToast('success', e.payload.message || '国际账号已扫码登录并自动入池');
         void refresh();
@@ -249,8 +252,8 @@ export default function BuddyAiAccounts() {
         if (!swBusyRef.current) return;
         setSwBusy(false);
         swBusyRef.current = false;
-        if (e.payload.success) pushToast('success', e.payload.raw || '切换完成');
-        else pushToast('error', e.payload.raw || '切换失败，详见进度面板');
+        // M9 修复：成功/失败 toast 由 store 全局监听统一推送（原页面级再弹一次
+        // = 双 toast，与国内 BuddyAccounts 口径不一致）；本页只负责解锁与刷新
         void refresh();
       }),
     );
@@ -259,8 +262,7 @@ export default function BuddyAiAccounts() {
         if (!swBusyRef.current) return;
         setSwBusy(false);
         swBusyRef.current = false;
-        if (e.payload.success) pushToast('success', e.payload.raw || '当前登录态已保存');
-        else pushToast('error', e.payload.raw || '保存失败，详见进度面板');
+        // M9 修复：同上，toast 交由 store 全局监听
         void refresh();
       }),
     );

@@ -165,12 +165,22 @@ export default function BuddyAiApiService() {
     // 乐观更新（审查 P2：原在 await 之后 setFlags，保存进行中（≥400ms）再点
     // 另一个开关会基于旧 flags 快照提交，把第一次改动静默回退）
     const prev = flags;
+    // M10b：分组/标签 chip 是独立 state，失败回滚需各自的调用时快照
+    const prevGroups = poolGroupScope;
+    const prevTags = poolTagScope;
     setFlags(next);
     try {
       await withMinDelay(
         api.apiServer.poolSet(pool.enabled_uids, pool.strategy, pool.group_ids, next),
         400,
       );
+      // H-3 修复（与 Buddy/Qoder 页同款）：保存成功后回读池快照——本页常驻期间
+      // 他端可能改过池配置，旧快照下次保存原样回传会静默覆盖他端配置
+      try {
+        setPool(await api.apiServer.poolList());
+      } catch {
+        /* 回读失败保留旧快照 */
+      }
       pushToast(
         'success',
         next.buddyAiEnabled ? 'buddy-ai 国际档已开启（独立池参与调度）' : '已保存 buddy-ai 调度配置',
@@ -184,6 +194,10 @@ export default function BuddyAiApiService() {
         (revert as Record<string, unknown>)[k] = prev[k as keyof typeof prev];
       }
       setFlags(revert);
+      // M10b 修复：chip 乐观高亮随本次 patch 回滚（原只回滚 flags，chip 保持
+      // 高亮但后端未落库，展示与实际状态分叉）
+      if (next.buddyAiGroupIds !== undefined) setPoolGroupScope(prevGroups);
+      if (next.buddyAiTagIds !== undefined) setPoolTagScope(prevTags);
       pushToast('error', `保存失败：${String(err).slice(0, 160)}`);
       return false;
     } finally {
@@ -238,6 +252,11 @@ export default function BuddyAiApiService() {
         buddy_ai_catalog_sync_enabled: next.enabled,
         buddy_ai_catalog_sync_hhmm: next.hhmm || '05:55',
       });
+      // M10a 修复：写操作成功可见反馈（UX 硬标准）——原只有失败 toast
+      pushToast(
+        'success',
+        next.enabled ? `每日定时同步已开启（每日 ${next.hhmm || '05:55'}）` : '每日定时同步已关闭',
+      );
       await useAppStore.getState().refreshSettings().catch(() => {
         /* 全局设置快照刷新失败不阻塞本地保存结果，下次刷新自愈 */
       });
@@ -599,7 +618,7 @@ export default function BuddyAiApiService() {
                       max: 86400,
                       value: poolTtl,
                       setValue: setPoolTtl,
-                      desc: 'TTL 内同会话路由同一账号（上游 KV cache 复用）；有效期 60s–24h',
+                      desc: '0 = 关闭池粘性；否则 TTL 内同会话路由同一账号（上游 KV cache 复用），有效范围 60–86400 秒',
                       save: (v: number) => ({ buddyAiPoolStickyTtlSecs: v }),
                     },
                     {
@@ -744,7 +763,7 @@ export default function BuddyAiApiService() {
                         {vendorMap.get(m.id) || inferVendor(m.id) || '—'}
                       </td>
                       <td className="py-2 pr-3 text-xs tabular-nums text-amber-600 dark:text-amber-400">
-                        {m.rate.toFixed(2)}
+                        {m.rate != null ? m.rate.toFixed(2) : '—'}
                       </td>
                       <td className="py-2 pr-3 text-xs text-slate-500">
                         {m.supported_efforts?.length ? m.supported_efforts.join(' / ') : '—'}

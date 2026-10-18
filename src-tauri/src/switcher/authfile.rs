@@ -35,6 +35,12 @@ pub(crate) fn wb_auth_dir() -> PathBuf {
     {
         std::env::var("LOCALAPPDATA")
             .map(|l| PathBuf::from(l).join(WB_AUTH_DIR_REL))
+            // L 修复：LOCALAPPDATA 缺失（计划任务/服务上下文）时从 USERPROFILE 推导
+            // 标准绝对路径——原兜底退化相对路径，相对 CWD 解析会读写到错误位置
+            .or_else(|_| {
+                std::env::var("USERPROFILE")
+                    .map(|p| PathBuf::from(p).join("AppData").join("Local").join(WB_AUTH_DIR_REL))
+            })
             .unwrap_or_else(|_| PathBuf::from(WB_AUTH_DIR_REL))
     }
     // M-1 侦察 ②（2026-09-20 实测确认）：mac auth 文件与 Windows 同构，仅宿主基根

@@ -393,6 +393,18 @@ pub fn save_token_store(state: &AppState, id: &str, creds: &QoderCreds) -> Resul
     // 敏感字段收敛进 vault（慢 IO）——期间其他进程可能已写库；vault 写入后落库
     // 走逐行 UPSERT（仅覆盖目标行，见下方说明），进程间并发保存互不丢行
     //（审查 H-1 第②步 + P2 修复；进程内并发由 TOKEN_STORE_LOCK + 每账号刷新锁防护）。
+    // version 闸门（审查 L 修复，前移）：在 vault 收敛（慢 IO）**之前**判定——原
+    // 位置在 vault 写入之后，版本不识别时 vault 已被收敛成半迁移态，拒绝写入留下
+    // 孤儿 vault 记录。直接读 kv qoder_tokens_meta 判定（非 1 拒写；缺失视为初始库
+    // 放行，与 qoder_token_store_load 口径一致）
+    let cur_version = crate::store::db(&state.data_dir)
+        .kv_get_raw("qoder_tokens_meta")
+        .and_then(|v| v.parse::<i64>().ok());
+    if let Some(v) = cur_version {
+        if v != 1 {
+            return Err("token_store 版本不识别，拒绝写入".to_string());
+        }
+    }
     let vault_result = secure_store_for_save(&state.data_dir, &mut store).map(|_| ());
     // 落库改逐行 UPSERT（审查 P2 跨进程 last-writer-wins 修复，方案 A）：原
     // 「重读整表 → 仅目标行替换 → qoder_token_store_save 整表 rows_replace」已把
@@ -404,17 +416,7 @@ pub fn save_token_store(state: &AppState, id: &str, creds: &QoderCreds) -> Resul
     // 需整表占位化，非并发写路径）。
     // 保持不变：vault 写入口径（secure_store_for_save 整库收敛）、行占位化、
     // 锁序（refresh_lock → TOKEN_STORE_LOCK，未引入新锁）、进程内并发防护。
-    // version 闸门：qoder_token_store_load 的 version 字段源即 kv qoder_tokens_meta，
-    // 直接读 kv 判定（非 1 拒写；缺失视为初始库放行，口径一致），写入后回填 1
-    //（kv_set_raw 为原子 UPSERT，version 恒 1 无 last-writer-wins 面）
-    let cur_version = crate::store::db(&state.data_dir)
-        .kv_get_raw("qoder_tokens_meta")
-        .and_then(|v| v.parse::<i64>().ok());
-    if let Some(v) = cur_version {
-        if v != 1 {
-            return Err("token_store 版本不识别，拒绝写入".to_string());
-        }
-    }
+    //（version 闸门已前移至 vault 写入之前，见上方注释）
     // 凭证红线（审查 P0 修复）：target 是 secure_store_for_save 占位化**之前**克隆的
     // 明文行，直接落库会把明文凭证写进 SQLite（直到下次启动迁移才收敛，且
     // token_store_load_secure「DB 明文优先」会持续旁路 vault 回填）。落库前必须与
