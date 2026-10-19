@@ -6,9 +6,9 @@
 
 ---
 
-## [1.5.0] · 2026-10-18 · BuddyAI 国际池五池化 + 审查修复（13 项）
+## [1.5.0] · 2026-10-19 · BuddyAI 国际池五池化 + 审查修复
 
-> 移植 `main@f5f2cd3` → `main@61cc245`（28 提交，手工语义移植）+ 移植批次审查修复 7 项 + 未提交改动全量审查修复 6 项。桌面/OS 专属改动跳过；「应用显隐联动」以 Web 侧 `appVisibility` 池级显隐落地（隐藏仅移除界面入口，调度/记账/绑定继续生效）。
+> 手工语义移植 main 侧与系统无关的修复：`f5f2cd3`→`61cc245`（28 提交）+ `61cc245`→`origin/main`（2 提交）。桌面/OS 专属逻辑跳过；「应用显隐联动」以 Web 侧 `appVisibility` 池级显隐落地（隐藏仅移除界面入口，调度/记账/绑定继续生效）。
 
 ### 新增
 
@@ -16,7 +16,7 @@
 - **调度任务四件**：`buddy-ai-checkin` / `buddy-ai-catalog-sync`（05:55）/ `buddy-ai-renew`（lazy 48h）/ `buddy-ai-credits-sync`（23:45）；启动迁移将全局账号幂等入池。
 - **前端 BuddyAI 七页 + 资源调度中心五池化**：总览/账号/API 服务/签到/积分/设置/帮助；五池全排列预设、BuddyAI 摘要卡、poolMetrics 七参、dispatchPresets 五预设；cmd_bridge 20 命令。
 
-### 修复与加固（13 项）
+### 修复与加固
 
 **网关分发（5）**
 
@@ -57,9 +57,14 @@
 - **风控归因**：issue #118 Buddy 池 refresh 失败三类区分（封禁/会话失效/通用拒绝）；issue #119 Qoder 签到 BLOCKED 按指纹信任分桶归因。
 - **三键回写校验 + 注释 + 单点化**：issue #109 三键回写补校验；`/v1/responses` Intl 分流边界补注释明示（不改行为）；`credits.rs` 域名硬编码单点化。
 
+**WB 积分解析（2，移植 `main@61cc245`→`origin/main`）**
+
+- **总余额翻倍（issue #120）**：`balance_from_summary` 在聚合父字段与 `Packages[]` 明细并存时父/子重复求和（800+500+300=1600=2× 真实余额），积分页总余额与签到差值兜底同步翻倍（+100 显示 +200）。改为存在带 `PackageCode` 的明细 dict 时仅对其求和，全部无 code 的旧形态回退全量和；`wb_checkin::fetch_balance` 统一复用同一解析器，使 pre/post 与积分页口径一致。
+- **coded 判定深搜误判（审查修复）**：判定「dict 是否携带 PackageCode」原用 `fs_utils::dig`，而它会沿 `ENVELOPE_KEYS` 递归下钻——父容器自身无 code 却因子层有 code 被误判为明细包，父 + 子双算（实测 100+50=150），issue #120 在嵌套形态下复发。改为严格判定 dict 自身键。
+
 ### 验证
 
-- `cargo test --workspace` 736 通过（7 忽略）· `tsc` 0 错误 · `vitest` 193 通过（含 dispatchPresets 五池 10 例 + poolMetrics 15 例）· 61 改动文件 BOM 检查通过。
+- `cargo test --workspace` 739 通过（7 忽略）· `tsc` 0 错误 · `vitest` 193 通过（含 dispatchPresets 五池 10 例 + poolMetrics 15 例）· 61 改动文件 BOM 检查通过。
 
 ## [1.4.17] · 2026-10-16 · 移植 main：Flash 免费豁免 + 积分三键拨新 + 审查修复批
 

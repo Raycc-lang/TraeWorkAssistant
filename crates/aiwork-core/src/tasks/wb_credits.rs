@@ -267,7 +267,10 @@ fn packages_from(body: &Value) -> Vec<Value> {
 
 /// summary 响应 → 余额。旧结构：顶层 RemainingCapacity/Balance 等字段；
 /// 新结构（2026-09 实测）：data.Packages[] 各包 CycleRemainCapacity 求和。
-fn balance_from_summary(body: &Value) -> Option<f64> {
+/// 聚合父字段（如 data.CycleRemainCapacity）与 Packages[] 明细并存时，父/子
+/// 不可重复计数（移植自 main 5f88dfe，issue #120 余额翻倍根因）：存在带
+/// PackageCode 的明细 dict 时仅对其求和，全部无 code 的旧形态回退全量和。
+pub(crate) fn balance_from_summary(body: &Value) -> Option<f64> {
     if let Some(t) = num_of(fs_utils::dig(
         body,
         &["RemainingCapacity", "remaining", "TotalRemaining", "Balance", "balance"],
@@ -276,18 +279,43 @@ fn balance_from_summary(body: &Value) -> Option<f64> {
     }
     let mut found = vec![];
     walk_capable_dicts(body, 0, &mut found);
-    let mut s = 0.0;
-    let mut has = false;
-    for item in found {
-        if let Some(v) = num_of(fs_utils::dig(item, &["CycleRemainCapacity", "RemainingCapacity", "remaining"])) {
-            s += v;
-            has = true;
+    let sum_of = |items: &[&Value]| -> Option<f64> {
+        let mut s = 0.0;
+        let mut has = false;
+        for item in items {
+            // 审查修复（M3，移植自 main 1148b7b）：逐项走 remaining_of 宽键链
+            //（含 CycleCapacityRemainPrecise 与 used/total 倒推）——此前键链窄于
+            // remaining_of，明细仅携带 CycleCapacityRemainPrecise 时 coded 求和落空、
+            // 静默跌回全量和，issue #120 翻倍复发
+            if let Some(v) = remaining_of(item, total_of(item)) {
+                s += v;
+                has = true;
+            }
+        }
+        has.then_some(s)
+    };
+    let coded: Vec<&Value> = found
+        .iter()
+        .copied()
+        .filter(|d| {
+            // 仅判定 dict **自身**是否携带 PackageCode：若沿用 fs_utils::dig 会沿
+            // ENVELOPE_KEYS 下钻到子层取到 code，把自身无 code 的父容器误判为
+            // 明细包 → 父 + 子双算（issue #120 嵌套形态复发，实测 100+50=150）
+            d.get("PackageCode")
+                .or_else(|| d.get("packageCode"))
+                .and_then(Value::as_str)
+                .map_or(false, |c| !c.is_empty())
+        })
+        .collect();
+    if !coded.is_empty() {
+        if let Some(s) = sum_of(&coded) {
+            return Some(s);
         }
     }
-    if has {
-        return Some(s);
-    }
-    num_of(fs_utils::dig(body, &["CycleCapacitySizePrecise", "CycleTotalCapacity", "CapacitySize"]))
+    // 审查修复（M3）：删除「总量键」回退分支——CycleCapacitySizePrecise/
+    // CycleTotalCapacity/CapacitySize 是周期总量而非余额，末级把总量当余额
+    // 会凭空放大（宁缺勿错，交由调用方按失败处理）
+    sum_of(&found)
 }
 
 /// summary 响应 → PackageCode 列表（去重，保序）。2026-09 起 paid/free 接口要求
@@ -795,6 +823,57 @@ mod wb_credits_tests {
             {"CycleRemainCapacity": 10.0}, {"CycleRemainCapacity": 32.0}
         ]}});
         assert_eq!(balance_from_summary(&body), Some(42.0));
+    }
+
+    #[test]
+    fn balance_from_summary_no_double_count_with_packages() {
+        // issue #120 翻倍形态（移植自 main 5f88dfe）：聚合父字段与 Packages[]
+        // 明细并存 → 仅按明细求和（修复前：父 800 + 包 500+300 = 1600 = 2× 真实余额，
+        // 签到差值兜底随之翻倍）
+        let body = json!({"data": {
+            "CycleRemainCapacity": 800.0,
+            "Packages": [
+                {"PackageCode": "p_a", "CycleRemainCapacity": 500.0},
+                {"PackageCode": "p_b", "CycleRemainCapacity": 300.0}
+            ]
+        }});
+        assert_eq!(balance_from_summary(&body), Some(800.0));
+        // 全部无 PackageCode 的旧形态：回退全量和（原行为不变）
+        let legacy = json!({"data": {
+            "CycleRemainCapacity": 30.0,
+            "Accounts": [{"RemainingCapacity": 10.0}]
+        }});
+        assert_eq!(balance_from_summary(&legacy), Some(40.0));
+    }
+
+    #[test]
+    fn balance_from_summary_parent_with_nested_code_not_double_counted() {
+        // 「父 dict 自身无 PackageCode、仅子信封键下有」形态：coded 判定若用 dig
+        // 深搜会沿 ENVELOPE_KEYS 下钻到子层取到 code，父被误判为 coded →
+        // 父 100 + 子 50 双算复发（issue #120 根因形态之一）
+        let body = json!({"data": {
+            "CycleRemainCapacity": 100.0,
+            "response": {"PackageCode": "p_x", "CycleRemainCapacity": 50.0}
+        }});
+        assert_eq!(balance_from_summary(&body), Some(50.0));
+    }
+
+    #[test]
+    fn balance_from_summary_coded_uses_wide_remaining_chain() {
+        // 审查修复（M3，移植自 main 1148b7b）：明细仅携带 CycleCapacityRemainPrecise
+        //（不含 CycleRemainCapacity）时，coded 求和亦须命中——此前窄键链导致
+        // coded 求和落空、静默跌回全量和（父 + 明细翻倍）
+        let body = json!({"data": {
+            "CycleRemainCapacity": 800.0,
+            "Packages": [
+                {"PackageCode": "p_a", "CycleCapacityRemainPrecise": 500.0},
+                {"PackageCode": "p_b", "CycleCapacityRemainPrecise": 300.0}
+            ]
+        }});
+        assert_eq!(balance_from_summary(&body), Some(800.0));
+        // M3：末级不再回落「周期总量」键——总量不是余额，宁缺勿错
+        let total_only = json!({"data": {"CycleTotalCapacity": 1000.0}});
+        assert_eq!(balance_from_summary(&total_only), None);
     }
 
     #[test]
