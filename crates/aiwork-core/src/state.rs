@@ -27,6 +27,11 @@ pub const IDENTIFIER: &str = "com.aiwork.assistant";
 /// - 否则递归复制旧目录 → 新目录（**复制而非移动**，旧目录保持完整）；
 /// - 任一步失败静默跳过（下次启动重试），绝不影响本次启动。
 /// 返回迁移结果说明（无迁移时为 None），供启动日志记录。
+///
+/// 审查标注（Web/Docker 分支）：本函数与 `LEGACY_*` 常量属桌面版品牌迁移遗留——
+/// 桌面 main 由 `main.rs` 启动时调用，本分支数据目录恒由 `AIWORK_DATA_DIR`/默认
+/// `/data` 决定，无 %APPDATA%/%LOCALAPPDATA% 迁移场景，故全仓无调用点。保留仅为
+/// 与蓝本同位一致（将来若支持 Windows 非容器部署可直接接线），运行时零影响。
 pub fn migrate_legacy_dirs() -> Option<String> {
     let mut notes: Vec<String> = Vec::new();
 

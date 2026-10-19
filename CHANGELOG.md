@@ -6,26 +6,60 @@
 
 ---
 
-## [1.4.18] · 2026-10-18 · 移植 main：BuddyAI 国际池五池化 + 应用显隐联动 + 风控归因修复
+## [1.5.0] · 2026-10-18 · BuddyAI 国际池五池化 + 审查修复（13 项）
 
-> 合并点 `main@f5f2cd3` → `main@61cc245`（28 个提交，手工语义移植，未 merge）。桌面/OS 专属（BuddyAI 桌面客户端打开与环境档案、双客户端并存注册表探测、UI 模拟等）跳过；「应用显隐联动」以 Web 侧 `appVisibility` 池级显隐机制落地（隐藏仅移除界面入口，调度/记账/绑定继续生效）；纯文档 483018a 随本批补移 `docs/pending` 两篇（Qoder 国际版落地方案、BuddyAI 六页对齐计划）。
+> 移植 `main@f5f2cd3` → `main@61cc245`（28 提交，手工语义移植）+ 移植批次审查修复 7 项 + 未提交改动全量审查修复 6 项。桌面/OS 专属改动跳过；「应用显隐联动」以 Web 侧 `appVisibility` 池级显隐落地（隐藏仅移除界面入口，调度/记账/绑定继续生效）。
 
 ### 新增
 
-- **BuddyAI 国际版独立池（五池化）**：后端 `buddy_ai.rs` 账号导入/导出/迁移/启停/备注/分组；`buddy_ai_checkin.rs` ACP 六步链打卡与结果落库（90 天滚动）；`wb_catalog` Intl 静态目录 17 模型 + 官网 v3/config 动态抓取（data 信封 + agents/models 解析 + 静态兜底合并）；dispatch `buddy-ai` 档 Intl 源判定动态优先/静态兜底 + 粘性 TTL；`pool_set` 扩 `buddyAiStrategy`（空=跟随 Trae 池）；积分三表 credits/history/days；`UsageBucket::BuddyAi` 记账；poolMetrics 七参。
+- **BuddyAI 国际版独立池（五池化）**：账号导入/导出/迁移/启停/备注/分组；ACP 六步链打卡与结果落库（90 天滚动）；Intl 静态目录 17 模型 + 官网动态抓取（静态兜底合并）；dispatch Intl 源判定动态优先/静态兜底 + 粘性 TTL；`pool_set` 扩 `buddyAiStrategy`；积分三表与 `UsageBucket::BuddyAi` 记账。
 - **调度任务四件**：`buddy-ai-checkin` / `buddy-ai-catalog-sync`（05:55）/ `buddy-ai-renew`（lazy 48h）/ `buddy-ai-credits-sync`（23:45）；启动迁移将全局账号幂等入池。
-- **前端 BuddyAI 七页**：总览/账号/API 服务/签到/积分/设置/帮助弹窗；`appVisibility` 池级显隐；资源调度中心五池化（五池全排列预设、BuddyAI 摘要卡、poolMetrics 七参、dispatchPresets 五预设）；cmd_bridge 20 命令。
+- **前端 BuddyAI 七页 + 资源调度中心五池化**：总览/账号/API 服务/签到/积分/设置/帮助；五池全排列预设、BuddyAI 摘要卡、poolMetrics 七参、dispatchPresets 五预设；cmd_bridge 20 命令。
 
-### 修复与加固
+### 修复与加固（13 项）
 
-- **issue #118 Buddy 池 refresh 失败如实归因**：封禁/会话失效/通用拒绝三类区分，不再误安抚「重登可恢复」。
-- **issue #119 Qoder 签到 BLOCKED 归因修正**：上游风控按指纹信任分桶拦截，不再误导「客户端登录一次」。
-- **credits.rs 域名硬编码收敛**：`region_activity_base` 单点化。
-- **issue #109 三键回写校验补强**：主体已于 1.4.17 移植，本批补校验部分。
+**网关分发（5）**
+
+- **Intl 目录折入门控**：折入仅国际档开启时生效；关闭态恢复 Trae 透传既有语义，避免 503 `NoHealthy(Trae)` 误导排障。
+- **国际池加 CN 门控**：`available(BuddyAi)` 仅服务 Intl 专属 / 双目录模型（`ModelSources.buddy_in_both` 字段）；CN 专属模型不会因智能调度静默切到国际上游。
+- **WbDisabled 早退语义**：改按 `sources.available(BuddyAi, …)` 判定而非开关本身，「wb 关 + intl 开 + CN 模型」恢复 400 而非 503。
+- **冷却错误归池**：`ModelCooling` 改带 `TargetPool`——buddy-ai / qoder 的模型级冷却不再恒记到国内 buddy 池（用量看板 + app_log 归因失真）。
+- **排障日志快照**：`dispatch exhausted` 补 `trae/buddy/intl_only/qoder/buddy_ai_on/wb_on` 字段，便于 Intl 专属模型 503 时一眼定位。
+
+**BuddyAI 后端（4）**
+
+- **导入缺网关热重载**：账号导入回灌后按国内池口径热重载（先释放池锁，仅实际变更时触发），运行中网关即看到新账号/新凭证。
+- **凭证回灌覆盖已轮换凭证**：回灌前读 token store 现状判存在，过期副本不再覆盖已轮换 refresh_token。
+- **停用账号误判已移除**：打卡删号保护新增 `buddy_ai_pool_contains`（含停用）二次判定，停用账号与真正移除可区分。
+- **跨进程锁失败误报**：续期锁失败按原因分流（Busy 保留原语义，CreateFailed/WaitFailed 真实原因落日志）。
+
+**安全与平台无关（4）**
+
+- **BuddyAI 含凭证导出加密**：原导出口令明文（文件等同密码），与 Qoder 侧「含凭证必须设密码」口径不一致。改为 AIWQENC1 信封（Argon2id KDF + AES-256-GCM），导入需同一密码；不含凭证的元数据导出保持明文。复用 `qoder::data_io`（`envelope_data_of`/`kdf_scheme_of` 改 `pub(crate)`），凭证前剥离 `machine_id`/`machine_token`。前端 `BuddyAiAccounts.tsx` 加双输入密码 + 加密导入 Modal。
+- **管理面双门禁**：`web_auth_disabled` 在非环回监听时忽略（对齐网关 `auth.rs`），容器/公网部署下 `/api/*` 写命令表不再免鉴权。
+- **外置 OAuth 配置读不到**：`oauth_client` / 调试 CA 路径只拼 `%APPDATA%`，容器恒空静默回落内置值——改 `AIWORK_DATA_DIR` 优先（桌面兼容保留）。
+- **本地 quota 空探测**：容器无本机客户端时仍串行探测 20 个本机端口（每端口 0.8s，最坏 ~16s 阻塞）——新增 `AIWORK_DISABLE_LOCAL_QUOTA` 开关，Dockerfile / compose 默认置 1。
+
+**调度与配置（2）**
+
+- **buddy-ai 调度时刻不生效**：设置页 `buddy_ai_*_hhmm` 四个编辑框落盘后无消费方（本分支调度只读 `scheduler_cfg.task_times`）——补 settings 二级回退（非法 HH:MM 回退默认，仅 buddy-ai 四任务，既有任务零变化）。
+- **BuddyAI 打卡永久失败门限**：失效凭证（封禁/会话失效/refresh 永久拒绝）触发的整轮失败本不可自愈，原实现全天 30min 冷却 + 每日首败通知是纯噪声。引入 `buddy_ai_checkin_fail_streak`（kv 持久化、跨日重置），连续 3 次全轮失败 → 改返 `Ok({skipped})` 当日暂停自动重试；任一成功（含 already）清零。
+
+**用量与前端（2）**
+
+- **用量跨日**：`record_cached_in` 写入路径二次取当日，跨零点 cached_tokens 与同请求统计落不同日期行——改由调用方持锁取日传入（`record_cached_in_on`）。
+- **前端反馈与文案**：调度策略读取失败整块「调度策略中心」静默消失（改错误态 + 重试 + toast）；BuddyAI 概述「导入凭证」、Buddy 页「本地 token store」、「扫描本机账号」等残留/误导文案对齐真实入口。
+
+**杂项（4）**
+
+- **打卡轮询确定性 4xx 空转**：400-499（除 408/429）早退交冷却，保留 408/429/5xx/网络抖动重试语义。
+- **凭证导入 500**：前端未填 AT 传 null，`arg()` 反序列化失败返 500——改 `opt_arg` 由业务校验「access_token 不能为空」。
+- **风控归因**：issue #118 Buddy 池 refresh 失败三类区分（封禁/会话失效/通用拒绝）；issue #119 Qoder 签到 BLOCKED 按指纹信任分桶归因。
+- **三键回写校验 + 注释 + 单点化**：issue #109 三键回写补校验；`/v1/responses` Intl 分流边界补注释明示（不改行为）；`credits.rs` 域名硬编码单点化。
 
 ### 验证
 
-- `cargo test --workspace` 724+12 通过（7 忽略）· `tsc` 0 错误 · `vitest` 193 通过（含 dispatchPresets 五池 10 例 + poolMetrics 15 例）· 61 改动文件 BOM 检查通过。
+- `cargo test --workspace` 736 通过（7 忽略）· `tsc` 0 错误 · `vitest` 193 通过（含 dispatchPresets 五池 10 例 + poolMetrics 15 例）· 61 改动文件 BOM 检查通过。
 
 ## [1.4.17] · 2026-10-16 · 移植 main：Flash 免费豁免 + 积分三键拨新 + 审查修复批
 

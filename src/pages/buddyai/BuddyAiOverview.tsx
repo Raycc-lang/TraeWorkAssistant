@@ -126,7 +126,9 @@ export default function BuddyAiOverview() {
     {
       key: 'account',
       title: '录入国际账号',
-      desc: '通过 workbuddy.ai OAuth 登录或导入凭证的方式将账号入池（Docker 无本机客户端，不支持扫描本机账号）。',
+      // 审查修复（M9 同款）：入口实名对齐账号管理页实际按钮——「导入凭证」非按钮名，
+      // 导入仅接受账号池 JSON 文件；Web 版无本机客户端可扫描
+      desc: '通过 workbuddy.ai OAuth 登录，或导入账号池 JSON 的方式将账号入池（不支持扫描本机账号）。',
       done: total > 0,
       actionLabel: '去导入',
       view: 'buddyai-accounts',

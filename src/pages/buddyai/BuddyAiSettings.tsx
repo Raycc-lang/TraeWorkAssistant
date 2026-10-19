@@ -127,7 +127,7 @@ export default function BuddyAiSettings() {
     <div className="animate-fade-in">
       <PageHeader
         title="BuddyAI · 环境配置"
-        desc="任务配置（Docker 部署无本机客户端，客户端路径配置已裁剪）"
+        desc="BuddyAI 定时任务配置（打卡 / 续期 / 积分同步 / 目录同步）"
         actions={
           <button className="btn-outline" onClick={() => void save()} disabled={saving || !settings}>
             {saving ? <Spinner /> : <Save size={15} />} 保存配置

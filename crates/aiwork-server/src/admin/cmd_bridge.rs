@@ -655,7 +655,9 @@ pub fn dispatch(admin: &AdminState, name: &str, args: Value) -> Result<Value, St
         }
         "buddy_ai_account_import_creds" => {
             let name = opt_arg(&args, "name")?;
-            let access_token = arg(&args, "access_token")?;
+            // 审查修复：前端未填 AT 时传 null，arg() 对 Null 直接 500「参数错误」，
+            // 业务侧的「access_token 不能为空」校验永远走不到。改 opt_arg 由业务校验
+            let access_token = opt_arg(&args, "access_token")?.unwrap_or_default();
             let refresh_token = opt_arg(&args, "refresh_token")?;
             let domain = opt_arg(&args, "domain")?;
             workbuddy::buddy_ai_account_import_creds(state, name, access_token, refresh_token, domain)
@@ -701,12 +703,15 @@ pub fn dispatch(admin: &AdminState, name: &str, args: Value) -> Result<Value, St
             workbuddy::buddy_ai_credits_history(state, days).and_then(to_json)
         }
         "buddy_ai_accounts_export" => {
+            // 审查修复第二轮：含凭证导出走口令加密信封（对齐 qoder_accounts_export）
             let include_credentials = opt_arg(&args, "include_credentials")?;
-            workbuddy::buddy_ai_accounts_export(state, include_credentials).and_then(to_json)
+            let password = opt_arg(&args, "password")?;
+            workbuddy::buddy_ai_accounts_export(state, include_credentials, password).and_then(to_json)
         }
         "buddy_ai_accounts_import" => {
             let pool_json = arg(&args, "pool_json")?;
-            workbuddy::buddy_ai_accounts_import(state, pool_json).and_then(to_json)
+            let password = opt_arg(&args, "password")?;
+            workbuddy::buddy_ai_accounts_import(state, pool_json, password).and_then(to_json)
         }
         "buddy_ai_request_usage" => {
             let user_id = arg(&args, "user_id")?;

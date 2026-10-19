@@ -811,16 +811,19 @@ export const api = {
         'buddy_ai_credits_history',
         { days: days ?? null },
       ),
-    /** 账号池导出（includeCredentials=true 附带凭证明文副本，前端强确认） */
-    accountsExport: (includeCredentials?: boolean) =>
+    /** 账号池导出（审查修复：includeCredentials=true 时**必须**提供导出密码——
+     *  凭证以 AES-256-GCM 信封（AIWQENC1）加密，导入时需同一密码；对齐 Qoder 侧口径） */
+    accountsExport: (includeCredentials?: boolean, password?: string) =>
       invoke<Record<string, unknown>>('buddy_ai_accounts_export', {
         includeCredentials: includeCredentials ?? null,
+        password: password ?? null,
       }),
-    /** 账号池导入（accounts_export 回导；合并语义：同 id 跳过，凭证副本仅回灌缺失账号） */
-    accountsImport: (poolJson: Record<string, unknown>) =>
+    /** 账号池导入（accounts_export 回导；合并语义：同 id 跳过，凭证副本仅回灌缺失账号。
+     *  加密信封文件须传导出时设置的 password） */
+    accountsImport: (poolJson: Record<string, unknown>, password?: string) =>
       invoke<{ added: number; skipped: number; invalid: number; tokens_added: number }>(
         'buddy_ai_accounts_import',
-        { poolJson },
+        { poolJson, password: password ?? null },
       ),
     /** 手动同步 Intl 模型目录（/v3/config 直连 → 动态替换；返回替换模型数） */
     catalogSync: () => invoke<number>('buddy_ai_catalog_sync'),

@@ -115,14 +115,21 @@ function DispatchCenterCard({
   // 失焦时还原策略值不落盘，合法数值才提交（保存侧 fail-closed，无失焦抢跑钳制）
   const [reserveDraft, setReserveDraft] = useState<string | null>(null);
 
+  // 审查修复：策略读取失败不再静默——原实现整块「调度策略中心」直接消失且无提示，
+  // 用户会以为页面本就没有这块（与 BuddyAI 七页的失败反馈口径不一致）
+  const [policyError, setPolicyError] = useState<string | null>(null);
   useEffect(() => {
     api.apiServer
       .dispatchPolicyGet()
-      .then(setPolicy)
-      .catch(() => {
-        /* 保留空态 */
+      .then((p) => {
+        setPolicy(p);
+        setPolicyError(null);
+      })
+      .catch((err) => {
+        setPolicyError(String(err).slice(0, 120));
+        toast('error', `调度策略加载失败：${String(err).slice(0, 120)}`);
       });
-  }, []);
+  }, [toast]);
 
   /** 当前组合命中的预设（匹配规则见 dispatchPresets.matchPreset） */
   const activePreset = useMemo(() => matchPreset(pool, policy), [pool, policy]);
@@ -230,7 +237,37 @@ function DispatchCenterCard({
     }
   };
 
-  if (!policy) return null;
+  if (!policy) {
+    return (
+      <div className="card p-4">
+        <div className="mb-1 flex items-center gap-2">
+          <SlidersHorizontal size={16} className="text-brand-500" />
+          <span className="text-sm font-medium text-slate-800 dark:text-zinc-100">调度策略中心</span>
+        </div>
+        {/* 审查修复：加载失败给出明确错误态 + 重试入口（原 return null 整块消失） */}
+        <p className="text-xs text-amber-600 dark:text-amber-400">
+          {policyError ? `调度策略加载失败：${policyError}` : '调度策略加载中…'}
+        </p>
+        {policyError && (
+          <button
+            className="btn-outline mt-2"
+            onClick={() => {
+              setPolicyError(null);
+              api.apiServer
+                .dispatchPolicyGet()
+                .then((p) => setPolicy(p))
+                .catch((err) => {
+                  setPolicyError(String(err).slice(0, 120));
+                  toast('error', `调度策略加载失败：${String(err).slice(0, 120)}`);
+                });
+            }}
+          >
+            重试
+          </button>
+        )}
+      </div>
+    );
+  }
 
   return (
     <div className="card p-4">

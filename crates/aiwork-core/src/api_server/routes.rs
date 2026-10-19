@@ -325,9 +325,11 @@ pub(crate) fn dispatch_error_response(
                 "trae_pool_disabled",
                 "invalid_request_error",
             ),
-            DispatchError::ModelCooling(rem) => (
+            // 池标识随错误下行（审查修复）：buddy-ai / qoder 冷却曾恒记 "buddy"，
+            // 致用量看板与 app_log 把国际池/Qoder 冷却归到国内 buddy 池
+            DispatchError::ModelCooling(pool, rem) => (
                 StatusCode::TOO_MANY_REQUESTS,
-                "buddy",
+                pool.as_str(),
                 format!("model {model} cooling down, retry after {rem}s"),
                 "model_cooldown",
                 "rate_limit_error",
@@ -1000,7 +1002,11 @@ pub async fn responses_api(
         }
     };
     // buddy-ai（阶段 2）：wb 档关闭且国际档开启时走国际池（与 /v1/chat 的
-    // priority 语义一致：buddy 优先、buddy-ai 兜底；wb 开时保持现状 CN 路径）
+    // priority 语义一致：buddy 优先、buddy-ai 兜底；wb 开时保持现状 CN 路径）。
+    // 审查修复（#6，仅注释明示边界不改行为）：wb 开启时 Intl 专属模型经
+    // /v1/responses 仍投递 CN 上游（可能 4xx），与 /v1/chat 的 Intl 分流不对称
+    // ——蓝本同位一致的有意设计（改之需动 resolve_wb_target 返回签名并波及
+    // 多处调用点，风险大于收益）；/v1/chat 无此边界
     let wb_enabled = state.wb_enabled.load(std::sync::atomic::Ordering::Relaxed);
     let buddy_ai_enabled = state
         .buddy_ai_enabled

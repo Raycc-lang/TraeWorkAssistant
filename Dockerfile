@@ -52,6 +52,7 @@ ENV AIWORK_DATA_DIR=/app/data \
     AIWORK_WEB_DIST=/app/dist \
     AIWORK_LISTEN_ADDR=0.0.0.0:8080 \
     AIWORK_PORT=8080 \
+    AIWORK_DISABLE_LOCAL_QUOTA=1 \
     TZ=Asia/Shanghai
 EXPOSE 8080
 VOLUME ["/app/data"]

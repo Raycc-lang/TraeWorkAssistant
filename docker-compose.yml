@@ -13,6 +13,9 @@ services:
       TZ: Asia/Shanghai
       AIWORK_DATA_DIR: /app/data
       AIWORK_LISTEN_ADDR: 0.0.0.0:8080
+      # 容器内无本机 WorkBuddy/CodeBuddy 客户端：关闭本地 quota 端口探测兜底
+      #（否则云端取数失败时会串行探测 20 个本机端口，最坏约 16s 阻塞）
+      AIWORK_DISABLE_LOCAL_QUOTA: "1"
       # 管理令牌：建议显式注入（.env 中设置 AIWORK_ADMIN_TOKEN）；
       # 留空则首启自动生成 64 位随机 token 落 /app/data/conf/admin_token
       AIWORK_ADMIN_TOKEN: ${AIWORK_ADMIN_TOKEN:-}

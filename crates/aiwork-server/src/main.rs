@@ -136,7 +136,7 @@ async fn main() {
     // 强制在 aiwork-core auth.rs::bearer_auth，此处仅可观测提示）
     if !aiwork_core::api_server::auth::listen_is_loopback() {
         let warn = format!(
-            "安全提示: 监听地址 {addr} 非环回——「关闭鉴权」开关不生效，/v1/* 网关必须携带 API Key 访问"
+            "安全提示: 监听地址 {addr} 非环回——「关闭鉴权」开关不生效：/v1/* 网关必须携带 API Key，/api/* 管理面仍需管理员 token"
         );
         println!("{warn}");
         fs_utils::app_log(&state.data_dir, &warn);

@@ -242,8 +242,10 @@ pub enum DispatchError {
     /// 仅 Trae 源模型且 trae_enabled=false（同族镜像；Trae 开关默认开，
     /// 关闭属用户显式动作，与"池耗尽 503"区分开）
     TraeDisabled,
-    /// Buddy 模型级冷却中（单源显式 429；双源已在选池时回退）
-    ModelCooling(i64),
+    /// 模型级冷却中（单源显式 429；双源已在选池时回退）。携带实际池——buddy /
+    /// buddy-ai / qoder 冷却共用本变体，池标识需随错误下行，否则日志与用量看板
+    /// 会把国际池/Qoder 的冷却记到国内 buddy 池（审查修复）
+    ModelCooling(TargetPool, i64),
     /// 首选（唯一可用）池耗尽：无健康账号 / 全冷却
     NoHealthy(TargetPool),
 }
@@ -293,6 +295,9 @@ struct ModelSources {
     /// Intl 专属标记（审查修复）：buddy 源来自 Intl 静态目录而非 CN 目录——
     /// Buddy(CN) 池不服务该模型（available 门控），仅 buddy-ai 池可取号
     buddy_intl_only: bool,
+    /// 双目录标记（审查修复第二轮）：该模型 CN 与 Intl 目录均收录——buddy-ai 池
+    /// 可服务（否则 CN 专属模型会被智能调度静默切到国际上游，跨区计费/合规歧义）
+    buddy_in_both: bool,
     /// Trae 源：api_models 命中；或模型不属于任何目录（透传语义，单源 Trae）
     trae: bool,
     /// Trae 侧最终模型 + effort 提示 + Max Mode 入口标志（issue #31 T3.1/T4.2：
@@ -322,9 +327,9 @@ impl ModelSources {
         if self.buddy.is_some() && wb_enabled && !self.buddy_intl_only {
             n += 1;
         }
-        // buddy-ai 与 buddy 平级计数（同一 wb 目录源、独立池/开关）；Intl 专属
-        // 模型源同样计入（CN 目录未命中但 Intl 目录命中时 buddy 源存在）
-        if self.buddy.is_some() && buddy_ai_enabled {
+        // buddy-ai 与 buddy 平级计数（同一 wb 目录源、独立池/开关）；仅 Intl 专属
+        // 或双目录模型计入（CN 专属模型不进国际池，见 available 门控）
+        if self.buddy.is_some() && buddy_ai_enabled && (self.buddy_intl_only || self.buddy_in_both) {
             n += 1;
         }
         if self.qoder.is_some() && qoder_enabled {
@@ -347,7 +352,14 @@ impl ModelSources {
             TargetPool::Trae => self.trae && trae_enabled,
             // Intl 专属模型源不得路由 Buddy(CN) 池（审查修复：CN 上游无该模型 id）
             TargetPool::Buddy => self.buddy.is_some() && wb_enabled && !self.buddy_intl_only,
-            TargetPool::BuddyAi => self.buddy.is_some() && buddy_ai_enabled,
+            // 审查修复（第二轮）：国际池仅服务 Intl 专属 / 双目录模型——原门控只看
+            // 开关，CN 专属模型在开启国际档后也会被智能调度（到期/倍率更优时）切到
+            // 国际上游，与「国际档显式开启、避免模型被静默路由到国际池」的定调冲突
+            TargetPool::BuddyAi => {
+                self.buddy.is_some()
+                    && buddy_ai_enabled
+                    && (self.buddy_intl_only || self.buddy_in_both)
+            }
             TargetPool::Qoder => self.qoder.is_some() && qoder_enabled,
             TargetPool::Custom => false,
         }
@@ -442,6 +454,11 @@ pub fn resolve_target(
         }
     }
 
+    // buddy-ai 国际档开关（阶段 2）：显式开启制，默认关。② 段即需判定（Intl 目录
+    // 折入以开关为前置），故在此读取，后续 ③ 段沿用同一快照
+    let buddy_ai_enabled = state
+        .buddy_ai_enabled
+        .load(std::sync::atomic::Ordering::Relaxed);
     // ② 模型名归一化（四段管线）+ Buddy 源判定：管线命中目录 → Buddy 源存在
     let cfg = wb_model_route::load_config(&state.data_dir);
     let catalog = super::wb_catalog::load(&state.data_dir);
@@ -449,19 +466,25 @@ pub fn resolve_target(
     // Intl 目录动态化（2026-10-15）：动态抓取结果优先（kv buddy_ai_model_catalog），
     // 缺失回落内置静态表——/v3/config 实抓成功后倍率/上下文即随动态目录生效
     let intl_catalog = super::wb_catalog::buddy_ai_load(&state.data_dir);
-    // 审查修复（buddy-ai Intl 专属模型误路由）：CN 目录未命中时并查 Intl 目录
-    //（§4.4 Global 专属模型可路由）——deepseek-v4.1-flash / gpt-* 等 Intl 专属 id
-    // 不在 CN 目录，原实现 buddy_hit=None → 落 Trae 透传语义被误路由 Trae 上游。
-    // 命中折入 buddy 源（final_model/effort/冷却链路复用），buddy_intl_only 标记
-    // 随源携带：Buddy(CN) 池不得服务 Intl 专属模型（available 门控），buddy-ai 池正常取号
-    let intl_hit = if super::wb_catalog::find(&catalog, &r.model).is_none() {
-        super::wb_catalog::find(&intl_catalog, &r.model)
-            .or_else(|| super::wb_catalog::find(&intl_catalog, model))
-            .map(|m| (m.id.clone(), None))
+    // Intl 目录并查（§4.4 Global 专属模型可路由）——deepseek-v4.1-flash / gpt-* 等
+    // Intl 专属 id 不在 CN 目录，命中折入 buddy 源（final_model/effort/冷却链路复用），
+    // buddy_intl_only 标记随源携带：Buddy(CN) 池不得服务 Intl 专属模型（available 门控）。
+    //
+    // 审查修复（第二轮）：折入**仅在国际档开启时生效**——无条件折入会让国际档默认
+    // 关闭时「Intl 专属 id 且不在 Trae 列表」的模型四源全不可用 → 503 NoHealthy(Trae)，
+    // 而改动前是 Trae 透传语义（上游如实报错），且 503 文案指向「Trae 池无健康账号」
+    // 误导排障。关闭态即保持既有透传语义，零行为变化
+    let cn_hit = super::wb_catalog::find(&catalog, &r.model).is_some();
+    let intl_entry = super::wb_catalog::find(&intl_catalog, &r.model)
+        .or_else(|| super::wb_catalog::find(&intl_catalog, model));
+    let intl_hit = if !cn_hit && buddy_ai_enabled {
+        intl_entry.map(|m| (m.id.clone(), None))
     } else {
         None
     };
     let buddy_intl_only = intl_hit.is_some();
+    // 双目录模型（CN 与 Intl 均收录）：国际池可服务，与 CN 池构成同源双失败域
+    let buddy_in_both = cn_hit && intl_entry.is_some();
     let buddy_hit = super::wb_catalog::find(&catalog, &r.model)
             .map(|_| {
                 // T5.6③ 后台任务降级（显式开启才生效）：标题/摘要类短请求 → 目录最低倍率模型
@@ -560,6 +583,7 @@ pub fn resolve_target(
     let sources = ModelSources {
         buddy: buddy_hit,
         buddy_intl_only,
+        buddy_in_both,
         trae: trae_hit,
         trae_final,
         qoder: qoder_hit,
@@ -572,20 +596,26 @@ pub fn resolve_target(
     let trae_enabled = state
         .trae_enabled
         .load(std::sync::atomic::Ordering::Relaxed);
-    // buddy-ai 国际档开关（阶段 2）：显式开启制，默认关
-    let buddy_ai_enabled = state
-        .buddy_ai_enabled
-        .load(std::sync::atomic::Ordering::Relaxed);
+    // buddy_ai_enabled 已在 ② 段读取（Intl 折入前置），此处不再重复读
 
     // 仅 Buddy 源模型 + wb_enabled=false → 显式报错（§4.3：保持现有
     // wb_upstream_disabled 语义；"关闭"与"不可用"是两个概念）。
     // 三源扩展（p3-3 审查修复）：Qoder 源可用时 Buddy 关闭不构成"无源可用"，
     // 不早退、交由下方选池路由 Qoder（与下方镜像判定的 buddy.is_none() 守卫对称）；
-    // 阶段 2：buddy-ai 国际档开启时同源可服务，同样不早退
+    // 阶段 2：buddy-ai 国际档开启且该模型可走国际池时同样不早退。
+    // 审查修复（第二轮）：原条件只看 `!buddy_ai_enabled`（开关），致「wb 关 + intl 开 +
+    // CN 专属模型」不再 400 而被国际池接管——用户显式关闭 WB 上游的语义失效，且错误码
+    // 由 400 变 503。改按「国际池是否真能服务该模型」判定（与 available 门控同口径）
     if sources.buddy.is_some()
         && !sources.trae
         && !wb_enabled
-        && !buddy_ai_enabled
+        && !sources.available(
+            TargetPool::BuddyAi,
+            trae_enabled,
+            wb_enabled,
+            qoder_enabled,
+            buddy_ai_enabled,
+        )
         && !(sources.qoder.is_some() && qoder_enabled)
     {
         return Err(DispatchError::WbDisabled);
@@ -754,14 +784,14 @@ pub fn resolve_target(
                             let view = super::wb_route::WbView::wb(state.clone());
                             let secs = super::wb_route::model_cooling_remaining(&view, &final_buddy_model(&sources))
                                 .unwrap_or(0);
-                            DispatchError::ModelCooling(secs)
+                            DispatchError::ModelCooling(TargetPool::Buddy, secs)
                         }
                         // buddy-ai 模型级冷却同构映射（独立冷却表：同名模型跨区不混轮）
                         (TargetPool::BuddyAi, FallbackReason::ModelCooldown) => {
                             let view = super::wb_route::WbView::intl(state.clone());
                             let secs = super::wb_route::model_cooling_remaining(&view, &final_buddy_model(&sources))
                                 .unwrap_or(0);
-                            DispatchError::ModelCooling(secs)
+                            DispatchError::ModelCooling(TargetPool::BuddyAi, secs)
                         }
                         // Qoder 模型级冷却同构映射（审查修复）：单源排队冷却显式 429
                         (TargetPool::Qoder, FallbackReason::ModelCooldown) => {
@@ -769,7 +799,7 @@ pub fn resolve_target(
                                 &sources.qoder.clone().unwrap_or_default(),
                             )
                             .unwrap_or(0) as i64;
-                            DispatchError::ModelCooling(secs)
+                            DispatchError::ModelCooling(TargetPool::Qoder, secs)
                         }
                         (p, _) => DispatchError::NoHealthy(p),
                     });
@@ -790,10 +820,19 @@ pub fn resolve_target(
         crate::fs_utils::app_log(
             &state.data_dir,
             &format!(
-                "dispatch exhausted: model={} key={} preferred={}",
+                // 审查修复（可观测）：Intl 专属模型（buddy_intl_only）在国际档关闭时
+                // 四源全不可用，原日志只记 model/preferred，排障会误判成「Trae 池耗尽」；
+                // 补源判定与开关快照
+                "dispatch exhausted: model={} key={} preferred={} trae={} buddy={} intl_only={} qoder={} buddy_ai_on={} wb_on={}",
                 model,
                 key_label,
                 preferred.map(|p| p.as_str()).unwrap_or("none"),
+                sources.trae,
+                sources.buddy.is_some(),
+                sources.buddy_intl_only,
+                sources.qoder.is_some(),
+                buddy_ai_enabled,
+                wb_enabled,
             ),
         );
     }
@@ -1530,7 +1569,7 @@ mod tests {
         );
         assert!(matches!(
             f.resolve("hy4").unwrap_err(),
-            DispatchError::ModelCooling(_)
+            DispatchError::ModelCooling(TargetPool::Buddy, _)
         ));
     }
 

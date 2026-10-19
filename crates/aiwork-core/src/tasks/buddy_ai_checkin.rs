@@ -657,6 +657,18 @@ fn process_account(
                     last_status = format!("轮询凭证失效（{e}）");
                     break;
                 }
+                // 审查修复（#4）：其余确定性 4xx（400-499，除 408 超时/429 限流）
+                // 重试也不会成功，早退交 30 分钟冷却，不空转烧满 180s；
+                // 408/429 与 5xx/网络抖动保留 continue 重试语义
+                if let Some(code) = e.rsplit_once("HTTP ").and_then(|(_, tail)| {
+                    let num: String = tail.chars().take_while(|c| c.is_ascii_digit()).collect();
+                    num.parse::<u16>().ok()
+                }) {
+                    if (400..500).contains(&code) && code != 408 && code != 429 {
+                        last_status = format!("轮询确定性失败（{e}）");
+                        break;
+                    }
+                }
                 continue;
             }
         }
@@ -690,7 +702,14 @@ fn process_account(
     //（remove 已三清 token store/vault/锁表）——upsert 语义会把幽灵凭证行复活，
     // 先确认账号仍在池中才落戳
     if !crate::commands::workbuddy::buddy_pool_roster(state).iter().any(|(id, _, _)| id == acct_id) {
-        return fail("账号已在本轮打卡期间被移除，幂等戳不落盘".to_string());
+        // 审查修复（#3）：roster 滤 disabled，停用账号会被误判为「已移除」→
+        // 幂等戳与积分回写全跳过且归因失实。二次按 id 直查池（load_buddy_pool
+        // 纯 DB 读无锁，持刷新锁下调用安全）：仍在池中＝仅停用 → 放行继续
+        // 落戳+回写；真不在池中 → 保留移除保护
+        let still_in_pool = crate::commands::workbuddy::buddy_ai_pool_contains(state, acct_id);
+        if !still_in_pool {
+            return fail("账号已在本轮打卡期间被移除，幂等戳不落盘".to_string());
+        }
     }
     let latest = crate::tasks::wb_common::buddy_ai_token_store_load(&state.data_dir);
     let mut new_rec = latest

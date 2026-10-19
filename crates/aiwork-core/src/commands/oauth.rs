@@ -72,18 +72,28 @@ fn default_exchange_url() -> String {
     OAUTH_EXCHANGE_URL.to_string()
 }
 
+/// 数据目录解析（审查修复：原实现只读 %APPDATA%，Docker/Linux 容器恒为空 →
+/// 外置 OAuth 客户端配置与调试 CA 静默读不到、回落内置值且无任何提示）：
+/// `AIWORK_DATA_DIR` 优先（与 AppState::new 同源，容器由 compose 显式注入），
+/// 未设置时回落 Windows 平台目录（%APPDATA%/AIWorkAssistant）保持桌面兼容。
+fn data_dir_of() -> Option<std::path::PathBuf> {
+    if let Ok(v) = std::env::var("AIWORK_DATA_DIR") {
+        let v = v.trim();
+        if !v.is_empty() {
+            return Some(std::path::PathBuf::from(v));
+        }
+    }
+    std::env::var("APPDATA")
+        .ok()
+        .map(|d| std::path::PathBuf::from(d).join(crate::state::DATA_DIR_NAME))
+}
+
 /// 读取外置 OAuth 客户端配置（全局一次；缺失/损坏回退默认值）
 pub fn oauth_client() -> &'static OAuthClientConfig {
     static CFG: std::sync::OnceLock<OAuthClientConfig> = std::sync::OnceLock::new();
     CFG.get_or_init(|| {
-        std::env::var("APPDATA")
-            .ok()
-            .map(|d| {
-                std::path::PathBuf::from(d)
-                    .join(crate::state::DATA_DIR_NAME)
-                    .join("conf")
-                    .join("oauth_client.json")
-            })
+        data_dir_of()
+            .map(|d| d.join("conf").join("oauth_client.json"))
             .map(|p| fs_utils::read_json::<OAuthClientConfig>(&p))
             .unwrap_or_default()
     })
@@ -151,9 +161,7 @@ fn exchange_agent() -> Result<ureq::Agent, String> {
     };
     // 调试代理容错（2026-09-16 实测）：设置了调试代理但尚未启动过代理（CA 未生成）
     // 时降级直连并记日志，不阻断登录闭环；只有 CA 存在但损坏才视为错误
-    let dir = std::env::var("APPDATA")
-        .ok()
-        .map(|d| std::path::PathBuf::from(d).join(crate::state::DATA_DIR_NAME));
+    let dir = data_dir_of();
     let ca_path = dir.as_ref().map(|d| d.join("certs").join("ca.crt"));
     let ca_pem = match ca_path.as_deref().and_then(|p| std::fs::read_to_string(p).ok()) {
         Some(p) => p,

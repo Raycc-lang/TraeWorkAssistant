@@ -951,12 +951,30 @@ fn quota_probe_port(agent: &ureq::Agent, port: u16) -> Option<Value> {
     quota_looks_valid(&v, 0).then_some(v)
 }
 
+/// 本地 quota 探测总开关（审查修复）：容器/远端部署无本机客户端，`*.port` 声明
+/// 恒为空 → 退化为「4 固定候选 + 16 端口段」全段串行探测（每端口 0.8s 超时，
+/// 最坏 ~16s 阻塞积分查询与调度线程）。Docker 镜像默认置 `AIWORK_DISABLE_LOCAL_QUOTA=1`
+/// 关闭该兜底；桌面版不受影响（未设该变量 = 保持现状）。
+fn local_quota_enabled() -> bool {
+    !matches!(
+        std::env::var("AIWORK_DISABLE_LOCAL_QUOTA")
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase()
+            .as_str(),
+        "1" | "true" | "yes" | "on"
+    )
+}
+
 /// 发现本机 quota 服务：*.port 声明端口 → 固定候选 → 有界端口段。
 /// 返回已确认可用的 (port, 响应)（按发现序，至多 limit 个）。
 pub fn discover_local_quota_services(
     agent: &ureq::Agent,
     limit: usize,
 ) -> Vec<(u16, Value)> {
+    if !local_quota_enabled() {
+        return vec![];
+    }
     let mut found: Vec<(u16, Value)> = vec![];
     let mut seen: std::collections::HashSet<u16> = Default::default();
     let mut ports: Vec<u16> = vec![];

@@ -215,7 +215,7 @@ export default function BuddyCheckin() {
 
   const startCheckin = async () => {
     if (accounts.length === 0) {
-      pushToast('warn', '账号池为空：请先在「账号管理」扫描本机账号');
+      pushToast('warn', '账号池为空：请先在「账号管理」OAuth 登录入池，或扫描已挂载的 auth 文件');
       return;
     }
     setRunning(true);
@@ -231,7 +231,7 @@ export default function BuddyCheckin() {
 
   const runGrowth = async () => {
     if (accounts.length === 0) {
-      pushToast('warn', '账号池为空：请先在「账号管理」扫描本机账号');
+      pushToast('warn', '账号池为空：请先在「账号管理」OAuth 登录入池，或扫描已挂载的 auth 文件');
       return;
     }
     setGrowthRunning(true);

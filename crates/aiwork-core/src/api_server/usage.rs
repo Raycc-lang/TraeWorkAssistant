@@ -401,12 +401,13 @@ impl UsageFile {
         d.record_credits(model, credits, original);
     }
 
-    /// 按桶记录一次缓存读 tokens 测量到当日 entry（M4 审查修复：
-    /// DayStats.cached_tokens 维度的旁路入口，不扩 record 系列签名）
-    pub fn record_cached_in(&mut self, bucket: UsageBucket, cached: u64) {
-        let day = today_key();
+    /// 按桶记录一次缓存读 tokens（M4 审查修复：DayStats.cached_tokens 维度的
+    /// 旁路入口，不扩 record 系列签名）。
+    /// `day` 由调用方在持锁期间一次取定（审查修复：原实现在写入路径二次取当日，
+    /// 跨零点时 cached_tokens 会与同请求的请求统计落在不同日期行）
+    pub fn record_cached_in_on(&mut self, bucket: UsageBucket, day: &str, cached: u64) {
         self.bucket_mut(bucket)
-            .entry(day)
+            .entry(day.to_string())
             .or_default()
             .record_cached(cached);
     }

@@ -333,8 +333,9 @@ impl ApiSharedState {
             .usage
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        guard.record_cached_in(bucket, cached);
+        // 入口取日（审查修复）：同请求的 cached_tokens 与请求统计落同一日期行
         let day = usage::today_key();
+        guard.record_cached_in_on(bucket, &day, cached);
         drop(guard);
         self.usage_dirty
             .lock()

@@ -156,8 +156,13 @@ pub(super) async fn auth_middleware(
     if req.uri().path() == "/api/login" {
         return next.run(req).await;
     }
-    // 免令牌开关：每请求读 kv（无缓存），设置页切换后无需重启
-    if admin.state.settings().web_auth_disabled {
+    // 免令牌开关：每请求读 kv（无缓存），设置页切换后无需重启。
+    // 审查修复（第二轮，双门禁对齐网关 auth.rs）：非环回监听时忽略该开关——
+    // 容器/公网部署下 0.0.0.0 监听会让整张 /api/* 写命令表（账号导入/删除、
+    // api_keys_save、pool_set…）免鉴权，仅剩 IP 白名单一道防线
+    if admin.state.settings().web_auth_disabled
+        && aiwork_core::api_server::auth::listen_is_loopback()
+    {
         return next.run(req).await;
     }
     let authorized = req

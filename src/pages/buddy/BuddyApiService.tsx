@@ -546,7 +546,7 @@ export default function BuddyApiService() {
                 </p>
               ) : (
                 <p className="py-4 text-center text-xs text-slate-400">
-                  暂无含凭证账号：请先在「账号管理」扫描本机账号或 OAuth 登录入池（凭证写入本地 token store）。
+                  暂无含凭证账号：请先在「账号管理」OAuth 登录入池，或扫描已挂载的 auth 文件（凭证写入服务端 token store）。
                 </p>
               )
             ) : (

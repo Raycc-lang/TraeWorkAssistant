@@ -136,7 +136,9 @@ pub(crate) fn open_payload(
 
 /// 识别载荷是否加密信封：`data` 字段 base64 解码后以魔数开头 → 返回信封字节；
 /// 其余形态（明文导出 JSON）返回 None，走原明文导入路径（向后兼容）。
-fn envelope_data_of(payload: &Value) -> Option<Vec<u8>> {
+/// pub(crate)：buddy-ai 池导出复用同一信封（审查修复第二轮：国际池含凭证导出
+/// 此前为明文，与 Qoder 侧「含凭证必须加密」口径不一致）
+pub(crate) fn envelope_data_of(payload: &Value) -> Option<Vec<u8>> {
     let data = payload.get("data")?.as_str()?;
     let raw = base64::engine::general_purpose::STANDARD.decode(data).ok()?;
     raw.starts_with(EXPORT_MAGIC).then_some(raw)
@@ -148,7 +150,7 @@ fn envelope_data_of(payload: &Value) -> Option<Vec<u8>> {
 /// - 缺失：旧版 sha256 时代的首版加密文件，按旧默认轮数回退
 /// - 其他前缀 / 轮数越界（0 或超 1000 万，防伪造大轮数拖死导入线程）=
 ///   更新版本格式，明确报错引导升级，不静默降级
-fn kdf_scheme_of(payload: &Value) -> Result<KdfScheme, String> {
+pub(crate) fn kdf_scheme_of(payload: &Value) -> Result<KdfScheme, String> {
     const MAX_KDF_ITERS: u32 = 10_000_000;
     let raw = match payload.get("kdf").and_then(Value::as_str) {
         None => return Ok(KdfScheme::Sha256Iters(KDF_ITERATIONS)),

@@ -183,7 +183,7 @@ fn sched_plan(st: &AppState, cfg: &Value, t: &SchedTask) -> SchedPlan {
             "every_days" => SchedPlan::EveryDays(
                 s.buddy_ai_credits_sync_days.trim().parse::<i64>().unwrap_or(1).clamp(1, 30),
             ),
-            _ => SchedPlan::Daily(effective_hhmm_from(cfg, t)),
+            _ => SchedPlan::Daily(effective_hhmm_from(st, cfg, t)),
         }
     } else if HOURLY_CAPABLE.contains(&t.key) {
         match effective_task_mode_from(cfg, t.key).as_str() {
@@ -191,10 +191,10 @@ fn sched_plan(st: &AppState, cfg: &Value, t: &SchedTask) -> SchedPlan {
             // （N 可手工设置，默认 2）/ daily（含非法值）按每日时刻
             "hourly" => SchedPlan::Hourly,
             "every_hours" => SchedPlan::EveryHours(effective_task_hours_from(cfg, t.key)),
-            _ => SchedPlan::Daily(effective_hhmm_from(cfg, t)),
+            _ => SchedPlan::Daily(effective_hhmm_from(st, cfg, t)),
         }
     } else {
-        SchedPlan::Daily(effective_hhmm_from(cfg, t))
+        SchedPlan::Daily(effective_hhmm_from(st, cfg, t))
     }
 }
 
@@ -464,12 +464,41 @@ fn task_hours(st: &AppState) -> std::collections::HashMap<String, i64> {
         .collect()
 }
 
-/// 任务生效触发时刻：task_times 自定义覆盖 > 内置默认（HH:MM 零填充，字符串比较即时间序）
-fn effective_hhmm_from(cfg: &Value, t: &SchedTask) -> String {
-    task_times_from(cfg)
-        .get(t.key)
-        .cloned()
-        .unwrap_or_else(|| t.hhmm.to_string())
+/// 任务生效触发时刻：task_times 自定义覆盖 > buddy-ai 设置页时刻 > 内置默认
+///（HH:MM 零填充，字符串比较即时间序）。
+///
+/// 审查修复（移植走样）：BuddyAI 设置页暴露了 `buddy_ai_*_hhmm` 四个编辑框并落盘
+/// settings，但本分支调度只读 `scheduler_cfg.task_times`（其余任务的 settings.*_hhmm
+/// 属桌面遗留、本分支未接线，保持现状零行为变化）——buddy-ai 四任务改了时刻不生效，
+/// 与页面承诺不符。此处仅对 buddy-ai 四任务补 settings 二级回退（对齐蓝本
+/// `effective_hhmm`），非法 HH:MM 值回退默认，不阻断调度。
+fn effective_hhmm_from(st: &AppState, cfg: &Value, t: &SchedTask) -> String {
+    if let Some(v) = task_times_from(cfg).get(t.key) {
+        return v.clone();
+    }
+    let s = st.settings();
+    let from_settings: Option<&String> = match t.key {
+        "buddy-ai-checkin" => Some(&s.buddy_ai_checkin_hhmm),
+        "buddy-ai-renew" => Some(&s.buddy_ai_renew_hhmm),
+        "buddy-ai-credits-sync" => Some(&s.buddy_ai_credits_sync_hhmm),
+        "buddy-ai-catalog-sync" => Some(&s.buddy_ai_catalog_sync_hhmm),
+        _ => None,
+    };
+    if let Some(v) = from_settings.filter(|v| hhmm_valid(v)) {
+        return v.trim().to_string();
+    }
+    t.hhmm.to_string()
+}
+
+/// HH:MM 合法性（零填充 5 字符、时 0-23、分 0-59）；非法 → 回退默认时刻
+fn hhmm_valid(v: &str) -> bool {
+    let v = v.trim();
+    let bytes = v.as_bytes();
+    if bytes.len() != 5 || bytes[2] != b':' {
+        return false;
+    }
+    let (h, m) = v.split_at(2);
+    matches!(h.parse::<u32>(), Ok(h) if h < 24) && matches!(m[1..].parse::<u32>(), Ok(m) if m < 60)
 }
 
 fn load_cfg(st: &AppState) -> Value {
@@ -715,8 +744,33 @@ fn run_task(key: &str, st: &AppState) -> Result<Value, String> {
         "wb-renew" => Ok(crate::tasks::wb_checkin::run_renew_only(st, 24)),
         // Buddy 国际版每日活跃打卡（移植 main）：抢轮次锁与 UI 路径互斥。
         // T7/BL-5 定调（移植 main）：buddy-ai 凭证失效可经网关 401 自愈/续期轮换
-        // 新值，无永久剔除——retryable = failed 全量，返 Err 交 30 分钟冷却重试
+        // 新值，无永久剔除——retryable = failed 全量，返 Err 交 30 分钟冷却重试。
+        // 审查修复（第二轮，永久失败门限）：连续 N 次全轮失败时当日暂停自动重试与
+        // 失败通知——失效凭证（封禁/会话失效/refresh 永久拒绝）触发的整轮失败本
+        // 不可自愈，全天 30min 冷却 + 每日首败通知是纯噪声；达门限后改返 Ok + 跳过
+        // 直至次日或用户手动重试（手动 UI 打卡会清零）。跨日重置
         "buddy-ai-checkin" => {
+            const FAIL_STREAK_CAP: i64 = 3;
+            let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+            let fail_v: serde_json::Value = crate::store::db(&st.data_dir).kv_get("buddy_ai_checkin_fail_streak");
+            let streak = if fail_v.get("date").and_then(Value::as_str) == Some(today.as_str()) {
+                fail_v.get("streak").and_then(Value::as_i64).unwrap_or(0)
+            } else {
+                0
+            };
+            if streak >= FAIL_STREAK_CAP {
+                fs_utils::app_log(
+                    &st.data_dir,
+                    &format!(
+                        "buddy-ai: 连续 {streak} 次打卡失败，今日暂停自动重试（多为凭证失效，请到 BuddyAI 账号页重新授权或续期；手动打卡一次可清零）"
+                    ),
+                );
+                return Ok(json!({
+                    "ok": true,
+                    "skipped": format!("连续 {streak} 次打卡失败，今日暂停自动重试"),
+                    "skipped_fail_streak": true,
+                }));
+            }
             let Ok(_round) = crate::commands::workbuddy::try_acquire_buddy_ai_round() else {
                 // skipped_busy：抢不到轮次锁（UI 路径在跑）= 幂等跳过而非失败（对齐
                 // wb-checkin/qoder-checkin）——返 Err 会触发当日首败误报通知
@@ -727,6 +781,20 @@ fn run_task(key: &str, st: &AppState) -> Result<Value, String> {
                 events.push(ev.clone())
             });
             let failed = done.get("failed").and_then(Value::as_i64).unwrap_or(0);
+            let ok = done.get("ok").and_then(Value::as_i64).unwrap_or(0);
+            let already = done.get("already").and_then(Value::as_i64).unwrap_or(0);
+            // streak 更新：任一成功（含 already）→ 清零；全轮失败 → +1；混合视作部分自愈不计数
+            let new_streak = if ok > 0 || already > 0 {
+                0
+            } else if failed > 0 {
+                streak + 1
+            } else {
+                0
+            };
+            let _ = crate::store::db(&st.data_dir).kv_set(
+                "buddy_ai_checkin_fail_streak",
+                &json!({ "date": today, "streak": new_streak }),
+            );
             if failed > 0 {
                 // 失败明细落 app_log（对齐 main 蓝本「定时打卡失败明细」格式）
                 fs_utils::app_log(
@@ -747,10 +815,8 @@ fn run_task(key: &str, st: &AppState) -> Result<Value, String> {
                             .join("; ")
                     ),
                 );
-                let ok = done.get("ok").and_then(Value::as_i64).unwrap_or(0);
-                let already = done.get("already").and_then(Value::as_i64).unwrap_or(0);
                 return Err(format!(
-                    "buddy-ai 打卡：{ok} 成功 / {already} 已完成 / {failed} 失败（稍后自动重试）"
+                    "buddy-ai 打卡：{ok} 成功 / {already} 已完成 / {failed} 失败（稍后自动重试，streak={new_streak}）"
                 ));
             }
             Ok(done)
