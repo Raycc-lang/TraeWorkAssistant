@@ -75,6 +75,10 @@ export default function BuddyAiApiService() {
   // 分组/标签 chip 乐观回滚序号门控（审查修复：慢败旧操作的失败回滚不得覆盖
   // 其后已成功落库并回读的新状态——每次乐观 set 递增序号，回滚仅当序号未变时执行）
   const scopeSeqRef = useRef(0);
+  // flags 慢败回滚序号门控（审查修复 #6）：saveFlags 乐观 setFlags 的失败回滚不得
+  // 覆盖其后已成功落库/已被外部回读覆盖的新状态——saveFlags 入口与 refresh() 外部
+  // 回读均递增，回滚仅当序号未变时执行（与 scopeSeqRef 同法）
+  const flagsSeqRef = useRef(0);
 
   const refreshCatalog = useCallback(async () => {
     const [cat, unified] = await Promise.all([
@@ -113,6 +117,8 @@ export default function BuddyAiApiService() {
       setTagDefs(tags);
       setPendingEnabled({});
       if (pf) {
+        // 外部回读将整体覆盖 flags：递增序号使任何在途保存的慢败回滚失效（#6）
+        flagsSeqRef.current++;
         setFlags({
           buddyAiEnabled: pf.buddy_ai_enabled ?? false,
           buddyAiStickyEnabled: pf.buddy_ai_sticky_enabled ?? false,
@@ -173,6 +179,9 @@ export default function BuddyAiApiService() {
     const prevTags = poolTagScope;
     // 序号门控：入口记录当前序号，回滚仅当此后无新的乐观 set（序号未变）时执行
     const seqAtCall = scopeSeqRef.current;
+    // flags 独立单调序号（#6）：saveFlags 自身做乐观 setFlags 故入口递增，
+    // 其后的并发保存或 refresh() 回读都会使本次慢败回滚失效
+    const flagsSeqAtCall = ++flagsSeqRef.current;
     setFlags(next);
     try {
       await withMinDelay(
@@ -192,13 +201,36 @@ export default function BuddyAiApiService() {
       );
       return true;
     } catch (err) {
-      // 按本次 patch 字段回滚（审查修复）：整份回滚到调用时快照会连带抹掉
-      // 并发已成功落库的其他字段（连续保存时第二次失败回滚覆盖第一次成功值）
-      const revert = { ...flags };
-      for (const k of Object.keys(next) as Array<keyof typeof next>) {
-        (revert as Record<string, unknown>)[k] = prev[k as keyof typeof prev];
+      // 慢败回滚序号门控（审查修复 #6）：本保存失败时若其后已有新的乐观 set/外部
+      // 回读（序号已变），调用时陈旧快照的回滚会把并发已成功落库的新值（如 chip
+      // 保存 A 在途时保存 B 成功的 buddyAiEnabled）抹回旧值，后续保存还会把回退值
+      // 写回后端——仅当序号未变时回滚
+      if (flagsSeqRef.current === flagsSeqAtCall) {
+        // 回滚值优先回读最新池快照（只回滚本次 patch 涉及的 key）：并发保存可能已
+        // 成功写入同 key 新值，最新落库值即应为回滚目标；回读失败退回调用时快照
+        let latest: ApiPoolFile | null = null;
+        try {
+          latest = await api.apiServer.poolList();
+        } catch {
+          /* 回读失败退回调用时快照 */
+        }
+        // 回读期间可能又有新的乐观 set（序号已变）：同样放弃回滚
+        if (flagsSeqRef.current === flagsSeqAtCall) {
+          const revert: typeof flags = latest
+            ? {
+                buddyAiEnabled: latest.buddy_ai_enabled ?? false,
+                buddyAiStickyEnabled: latest.buddy_ai_sticky_enabled ?? false,
+                buddyAiPoolStickyTtlSecs: latest.buddy_ai_pool_sticky_ttl_secs,
+              }
+            : { ...flags };
+          if (!latest) {
+            for (const k of Object.keys(next) as Array<keyof typeof next>) {
+              (revert as Record<string, unknown>)[k] = prev[k as keyof typeof prev];
+            }
+          }
+          setFlags(revert);
+        }
       }
-      setFlags(revert);
       // M10b 修复：chip 乐观高亮随本次 patch 回滚（原只回滚 flags，chip 保持
       // 高亮但后端未落库，展示与实际状态分叉）；序号门控防止慢败回滚覆盖
       // 其后已成功的乐观 set（审查修复）

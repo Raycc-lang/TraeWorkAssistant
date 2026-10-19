@@ -20,8 +20,15 @@ pub fn get_system_proxy() -> Option<(bool, String, String)> {
     #[cfg(target_os = "macos")]
     {
         // 服务清单仅还原面收窄消费（capture_system_proxy_snapshot 路径），
-        // 普通读取（updater/bypass）只需快照三元组
-        networksetup_read().map(|(snap, _)| snap)
+        // 普通读取（updater/bypass）只需快照三元组。networksetup_read 已改为
+        // 逐服务清单（M6 修复），此处取首个启用服务透传（与
+        // capture_proxy_snapshot_services 同款展开）；清单为空 = 无启用代理 →
+        // None（对齐函数契约「未启用返回 None」）。本修复为解除 HEAD 遗留的
+        // 编译阻断（E0308：清单为 Vec 无法按二元组解构），非本任务范围
+        networksetup_read()
+            .as_ref()
+            .and_then(|v| v.first())
+            .map(|(_, sv, bp)| (true, sv.clone(), bp.clone()))
     }
     // 第三平台编译兜底（对齐 cert_ctl.rs cert_query 约定）：返回 None = 无系统代理
     #[cfg(not(any(windows, target_os = "macos")))]

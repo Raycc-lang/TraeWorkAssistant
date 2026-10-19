@@ -34,6 +34,9 @@ fn name_matches(prof: &AppProfile, name: &str) -> bool {
 /// 国内实例、老单布局杀国内会误杀国际实例），调用方必须跳过该进程。
 /// 仅歧义映像名受仲裁；白名单内其余无歧义名（"CodeBuddy CN" 等）直通。
 /// 四消费点统一接入：list_procs / running_exe_of / pid_alive_matching / kill_pids。
+/// 2026-10-19：mac 构建首次可编译后显形——仲裁仅 Windows 映像名链路消费
+///（mac 走 bundle 段 + 档案 mac_proc_names 收窄），按库内 cfg_attr 惯例静默
+#[cfg_attr(target_os = "macos", allow(dead_code))]
 fn ark_allows(prof: &AppProfile, name: &str) -> bool {
     let Some(ark) = &prof.image_ark else {
         return true;
@@ -48,7 +51,10 @@ fn ark_allows(prof: &AppProfile, name: &str) -> bool {
 /// 剥离映像名尾部的 ".exe"（大小写不敏感；无后缀原样返回）。
 /// 用 get 防多字节字符下标越界（非字符边界时 get 返回 None → 原样返回）。
 /// 跨平台（2026-10-18 合并修复）：ark_allows 无平台门控且引用本函数，
-/// strip 门控会导致 macOS 编译失败——纯字符串操作，两平台通用
+/// strip 门控会导致 macOS 编译失败——纯字符串操作，两平台通用。
+/// 2026-10-19：mac 构建首次可编译后显形——mac 消费点均走 bundle 段信号，
+/// 本函数仅 Windows 链路调用，按库内 cfg_attr 惯例静默
+#[cfg_attr(target_os = "macos", allow(dead_code))]
 fn strip_exe_suffix(name: &str) -> &str {
     if name.len() > 4 {
         if let Some(base) = name.get(..name.len() - 4) {
@@ -76,10 +82,17 @@ fn mac_exe_is_main_of(p: &sysinfo::Process, name: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// 档案级匹配：任一 proc_names（.app 主干名）命中即为主进程
+/// 档案级匹配：任一 proc_names（.app 主干名）命中即为主进程。
+/// 2026-10-19 双客户端并存实测：优先消费档案 mac_proc_names（国内 CodeBuddy
+/// 收窄为 ["CodeBuddy CN"]——裸名 "CodeBuddy" 段恰是并存的国际版
+/// /Applications/CodeBuddy.app，不收窄 stop_app 会 SIGTERM 误杀国际版），
+/// 未配置回落 proc_names
 #[cfg(target_os = "macos")]
 fn mac_main_matches(prof: &AppProfile, p: &sysinfo::Process) -> bool {
-    prof.proc_names.iter().any(|n| mac_exe_is_main_of(p, n))
+    prof.mac_proc_names
+        .unwrap_or(prof.proc_names)
+        .iter()
+        .any(|n| mac_exe_is_main_of(p, n))
 }
 
 /// 进程匹配分派：Windows 按映像名（剥 .exe），macOS 按主 bundle 路径段
@@ -92,8 +105,10 @@ fn proc_matches(prof: &AppProfile, p: &sysinfo::Process) -> bool {
     }
     #[cfg(target_os = "macos")]
     {
-        // mac 按 bundle 路径段匹配天然消歧（CodeBuddy.app vs CodeBuddy CN.app），
-        // 无需 ark 仲裁
+        // mac 主进程身份信号 = exe 路径 `/<App>.app/Contents/MacOS/` 段 + 档案
+        // mac_proc_names 收窄。原注释「路径段天然消歧」对裸名不成立（2026-10-19
+        // 实测："/codebuddy.app/" 恰是并存国际版 bundle，须按档案收窄）；mac 无
+        // 共用映像名，无需 Windows 的 ark 仲裁
         mac_main_matches(prof, p)
     }
 }
@@ -591,6 +606,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    // 2026-10-19 mac 测试链修复：本用例只锁 Windows 映像名语义（name_matches 为
+    // cfg(windows) 专属），无门控导致 mac 测试构建恒失败（E0425），加门控对齐
+    #[cfg(windows)]
     #[test]
     fn name_matches_兼容sysinfo带exe后缀() {
         // 实测根因回归：sysinfo ImageName 带 .exe 后缀，白名单不带——必须能命中

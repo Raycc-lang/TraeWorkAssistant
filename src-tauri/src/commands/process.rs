@@ -217,8 +217,10 @@ pub fn images_for_app(app_kind: &str) -> Vec<&'static str> {
     }
 }
 
-/// macOS：按应用类别返回 .app bundle 目录名候选（与 bundles 真实安装形态一致；
-/// 双形态候选防串台——目录名命中后仍以路径段为准，本身即身份信号）。
+/// macOS：按应用类别返回 .app bundle 目录名候选（与 bundles 真实安装形态一致）。
+/// 目录名即路径段身份信号，但裸名段可能被并存异构 bundle 共享（2026-10-19
+/// 双客户端实测：国际版 bundle 目录名就叫 "CodeBuddy.app"，与国内裸名类目撞段
+/// "/codebuddy.app/"）——撞段类目必须收窄，不得依赖段匹配天然消歧。
 /// Qoder 类目（main 合并引入）：Work 本体 bundle "Qoder CN" + 拆分形态 IDE
 /// bundle "Qoder CN IDE"（qoder/common.rs ide_exe_candidates 同源；Launcher
 /// 形态为 Windows 专属，mac 无对应 bundle）。
@@ -232,8 +234,14 @@ fn bundles_for_app(app_kind: &str) -> Vec<&'static str> {
         // 客户端报「未知的应用类别」）。目录名对齐 env.rs mac 档案表候选；路径段
         // 匹配天然消歧，不含国内 bundle 名（对齐 Windows images_for_app 收窄先例）
         "WorkBuddy AI" => vec!["WorkBuddy AI", "WorkBuddyAI"],
+        // 2026-10-19 双客户端并存实测核对：国际 bundle 目录名就是 "CodeBuddy.app"，
+        // "CodeBuddy" 段恰是本类目自己的目标，与国内 "/codebuddy cn.app/" 互不命中
         "CodeBuddy AI" => vec!["CodeBuddy AI", "CodeBuddy"],
-        "CodeBuddy" => vec!["CodeBuddy", "CodeBuddy CN"],
+        // 2026-10-19 双客户端并存实测收窄：裸名类目原含 "CodeBuddy"——并存布局下
+        // 该段恰是国际版 CodeBuddy.app，chatdata.rs 导入前 graceful_kill 会连带
+        // SIGTERM/SIGKILL 国际版主进程。mac 国内 bundle 目录名恒为 CodeBuddy CN.app，
+        // 收窄为仅 CN（Windows images_for_app 映像名行为不变）
+        "CodeBuddy" => vec!["CodeBuddy CN"],
         "Qoder CN" => vec!["Qoder CN", "Qoder CN IDE"],
         _ => vec![],
     }

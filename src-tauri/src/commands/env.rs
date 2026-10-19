@@ -6,6 +6,8 @@ use std::process::Command;
 // Windows 静默窗口标志（creation_flags）专用 API——非 Windows 平台无此符号
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
+// Windows 直启链 stdio 静默专用（mac 启动走 `open`，不经 Command）
+#[cfg(not(target_os = "macos"))]
 use std::process::Stdio;
 use std::sync::{Mutex, OnceLock};
 // 仅 Windows 探测链兜底缓存消费（mac bundle 链无注册表/进程反查兜底）
@@ -623,7 +625,10 @@ pub fn codebuddy_env_check(state: State<AppState>) -> CodeBuddyEnvCheck {
 /// Windows：sysinfo 进程表一次枚举（main 合并，原逐名 tasklist 子进程 ~520ms）；
 /// 并存布局只认 "CodeBuddy CN"（W8：映像名 "CodeBuddy" 被国际版与国内老单安装共用，
 /// 并存时国际进程在跑会让国内环境检测误报 running=true）；
-/// mac：按 bundle 主进程路径段匹配（M-1 ⑥，CodeBuddy 灰度域，目录名双形态兼容）
+/// mac：按 bundle 主进程路径段匹配（M-1 ⑥），收窄为仅 "CodeBuddy CN"（2026-10-19
+/// 双客户端并存实测，对齐 W8 与 switcher/proc.rs #1：mac 国内 bundle 目录名恒为
+/// CodeBuddy CN.app，裸名 "CodeBuddy" 段恰是并存国际版 CodeBuddy.app，双形态
+/// 兼容会让国内环境检测误报 running=true）
 fn is_running_codebuddy() -> bool {
     #[cfg(windows)]
     {
@@ -635,8 +640,8 @@ fn is_running_codebuddy() -> bool {
     }
     #[cfg(target_os = "macos")]
     {
-        // M-1 ⑥：按 bundle 主进程路径段匹配（CodeBuddy 灰度域，目录名双形态兼容）
-        crate::commands::process::mac_app_running(&["CodeBuddy", "CodeBuddy CN"])
+        // M-1 ⑥：按 bundle 主进程路径段匹配；2026-10-19 实测收窄为仅 CN（同上）
+        crate::commands::process::mac_app_running(&["CodeBuddy CN"])
     }
     #[cfg(not(any(windows, target_os = "macos")))]
     {
@@ -762,22 +767,21 @@ fn app_locate_macos(state: &State<AppState>, app: &str) -> AppLocate {
         ),
         // H-1 修复：BuddyAI 国际版双档案（此前漏配命中 `_` 兜底 → mac 上误定位成
         // Trae 并直开 Trae）。数据目录对齐 switcher/profile.rs（~/.workbuddy-ai 国际
-        // 独立根；~/.codebuddy 与国内双端共享）。CFBundleIdentifier 暂无真机实测
-        // 证据，按国内命名惯例推断（codebuddy→codebuddycn 反推）——推断未校准时
-        // 表现为 fail-safe「未找到」（绝不再误启 Trae）；用户可在环境配置页手动
-        // 指定 .app 路径（手动路径仅校验 bundle 目录形态，不校验 id，必生效）。
-        // 待真机侦察后回填精确 id（对齐 M-1 ⑥流程）。
+        // 独立根；~/.codebuddy 与国内双端共享）。CFBundleIdentifier 2026-10-19 真机
+        // 实测回填（原按国内命名惯例推断的 id 与实测不符，推断未校准时表现为
+        // fail-safe「未找到」；现随 profile.rs 两国际档案 mac_supported 放开同步校正）：
+        // WorkBuddy AI.app = com.workbuddy.workbuddy-ai；CodeBuddy.app = com.tencent.codebuddy
         "workbuddy_ai" => (
             "WorkBuddy AI",
             &["WorkBuddyAI", "WorkBuddy AI"],
-            &["com.tencent.workbuddy.ai", "com.tencent.workbuddy"],
+            &["com.workbuddy.workbuddy-ai"],
             format!("{home}/.workbuddy-ai"),
             Some("workbuddy_ai_path"),
         ),
         "codebuddy_ai" => (
             "CodeBuddy AI",
             &["CodeBuddyAI", "CodeBuddy AI", "CodeBuddy"],
-            &["com.tencent.codebuddy.ai", "com.tencent.codebuddy"],
+            &["com.tencent.codebuddy"],
             format!("{home}/.codebuddy"),
             Some("codebuddy_ai_path"),
         ),

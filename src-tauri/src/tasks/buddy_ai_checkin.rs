@@ -193,10 +193,15 @@ fn web_headers<'a>(
         .set("Accept", "application/json, text/plain, */*")
 }
 
-/// 退避重试的错误分类：HTTP 状态码（区分 4xx 语义失败 / 5xx 瞬时抖动）与消息
+/// 退避重试的错误分类：HTTP 状态码（区分 4xx 语义失败 / 5xx 瞬时抖动）与消息。
+/// 审查 #17：新增 Fatal 变体——请求已产生服务端副作用（或已确认被服务端拒绝）
+/// 时不再重试，直接 fail 交整轮冷却
 enum BackoffErr {
     Status(u16),
     Msg(String),
+    /// 已拿到 HTTP 响应后的确定性失败（解析失败/响应缺字段/非幂等端点已达服务端）：
+    /// 重试会产生重复副作用（如建会话 POST → 孤儿会话），立即失败不重试
+    Fatal(String),
 }
 
 impl From<ureq::Error> for BackoffErr {
@@ -209,7 +214,8 @@ impl From<ureq::Error> for BackoffErr {
 }
 
 /// 带秒级退避的请求执行：4xx 语义性失败不重试直返；网络类 Err 与 5xx 重试
-/// STEP_RETRIES 次（1s 起翻倍封顶 15s，§4.5：避免一次抖动熔断整池）
+/// STEP_RETRIES 次（1s 起翻倍封顶 15s，§4.5：避免一次抖动熔断整池）；
+/// Fatal（已确认副作用/确定性失败）立即直返，不 sleep 不重试
 fn with_backoff<T>(mut f: impl FnMut() -> Result<T, BackoffErr>) -> Result<T, String> {
     let mut last = String::new();
     for attempt in 0..STEP_RETRIES {
@@ -222,6 +228,8 @@ fn with_backoff<T>(mut f: impl FnMut() -> Result<T, BackoffErr>) -> Result<T, St
                 }
             }
             Err(BackoffErr::Msg(m)) => last = m,
+            // 审查 #17：Fatal 立即返回——重试只会重复副作用（孤儿会话）或注定失败
+            Err(BackoffErr::Fatal(m)) => return Err(m),
         }
         if attempt + 1 < STEP_RETRIES {
             backoff_sleep(attempt);
@@ -312,21 +320,58 @@ fn process_account(
         "conversationOrigin": "workbuddy-app",
         "plugins": [{ "name": "weixinpay", "marketplace": "codebuddy-builtin" }],
     });
+    // 审查 #17（非幂等端点）：POST /console/as/conversations/ 建会话非幂等——
+    // 响应已达（拿到 HTTP 响应）后任何失败（4xx/5xx/解析失败/data.id 缺失）都
+    // 可能是「会话已建但结果未确认」，按 Msg/Status 退避重试最多再造 2 个孤儿
+    // 会话。故仅 Transport 类错误（请求未达服务端）走退避重试；拿到响应即
+    // Fatal 不重试，直接 fail 交整轮冷却。步骤② GET /session 只读同一 conv_id、
+    // 无建副作用，维持通用退避重试不受此收敛影响
     let conv_id = with_backoff(|| {
-        let resp = web_headers(agent.post(&format!("{base}/console/as/conversations/")), token, uid)
-            .set("Content-Type", "application/json")
-            .send_string(&body.to_string())?;
-        let v: Value = resp.into_json().map_err(|e| BackoffErr::Msg(e.to_string()))?;
+        let resp = match web_headers(
+            agent.post(&format!("{base}/console/as/conversations/")),
+            token,
+            uid,
+        )
+        .set("Content-Type", "application/json")
+        .send_string(&body.to_string())
+        {
+            Ok(r) => r,
+            // 已拿到 HTTP 响应（无论状态码）：会话可能已建立，不重试；响应体
+            // 脱敏落盘佐证（JSON 结构化脱敏 / 非 JSON 文本正则脱敏，#18）
+            Err(ureq::Error::Status(code, resp)) => {
+                let head = match resp.into_string() {
+                    Ok(b) => match serde_json::from_str::<Value>(&b) {
+                        Ok(v) => trim_json(&v),
+                        Err(_) => sanitize_err_body(&b).chars().take(600).collect(),
+                    },
+                    Err(_) => String::new(),
+                };
+                if !head.is_empty() {
+                    crate::fs_utils::app_log(
+                        &state.data_dir,
+                        &format!("buddy-ai: 建会话 HTTP {code} 响应体：{head}"),
+                    );
+                }
+                return Err(BackoffErr::Fatal(format!("HTTP {code}")));
+            }
+            // Transport 类（连接失败/超时）：请求未达服务端，重试无孤儿风险
+            Err(e) => return Err(BackoffErr::from(e)),
+        };
+        // 响应已达：此后任何失败均为 Fatal（不重试）
+        let v: Value = resp
+            .into_json()
+            .map_err(|e| BackoffErr::Fatal(format!("建会话响应解析失败：{e}")))?;
         // 2026-10-16 实抓修复：dig 是「任意键命中即返回」语义（find_map 逐键全树搜），
         // ["data","id"] 会命中 data 对象本身导致 as_str() 失败——改用 path 严格逐段下钻；
         // id 以字符串为主，兼容数字形态
-        let id = crate::fs_utils::path(&v, &["data", "id"])
-            .ok_or_else(|| BackoffErr::Msg(format!("建会话响应无 data.id：{}", trim_json(&v))))?;
+        let id = crate::fs_utils::path(&v, &["data", "id"]).ok_or_else(|| {
+            BackoffErr::Fatal(format!("建会话响应无 data.id：{}", trim_json(&v)))
+        })?;
         Ok(match id {
             Value::String(s) => s.clone(),
             Value::Number(n) => n.to_string(),
             other => {
-                return Err(BackoffErr::Msg(format!(
+                return Err(BackoffErr::Fatal(format!(
                     "建会话响应 data.id 类型异常（{other}）：{}",
                     trim_json(&v)
                 )))
@@ -338,7 +383,8 @@ fn process_account(
         Err(e) => return fail(format!("建会话失败：{e}")),
     };
 
-    // ② 取沙箱（link + 独立 token + sessionId）
+    // ② 取沙箱（link + 独立 token + sessionId）。GET 只读、无建副作用（#17 核对
+    // 结论）：解析失败重试不会产生重复资源，维持通用退避重试现状
     let sess = with_backoff(|| {
         let resp = web_headers(
             agent.get(&format!("{base}/console/as/conversations/{conv_id}/session")),
@@ -544,13 +590,14 @@ fn process_account(
                 // 4xx 诊断：响应体落 app.log（BackoffErr::Status 只带 code 丢失 body，
                 // Accept/Origin 修复是否命中需原文佐证）
                 Err(ureq::Error::Status(code, resp)) => {
-                    // T6 审查修复：4xx 响应体可能携带沙箱凭证（token/link 等），
-                    // JSON 形态先经 trim_json 脱敏截断再落盘；非 JSON 文本回退原
-                    // 口径（chars().take(600) 按字符截断，无 panic 风险）
+                    // T6 审查修复 + #18：4xx 响应体可能携带沙箱凭证（token/link 等），
+                    // JSON 形态先经 trim_json 脱敏截断再落盘；非 JSON 文本按正则
+                    // 脱敏（token/key/Bearer 后令牌及含 sign/token/sessionId 的
+                    // URL 参数替换 ***）再按字符截断（无 panic 风险），不再原文落盘
                     let head = match resp.into_string() {
                         Ok(body) => match serde_json::from_str::<Value>(&body) {
                             Ok(v) => trim_json(&v),
-                            Err(_) => body.chars().take(600).collect(),
+                            Err(_) => sanitize_err_body(&body).chars().take(600).collect(),
                         },
                         Err(_) => String::new(),
                     };
@@ -571,6 +618,7 @@ fn process_account(
             attempt().map_err(|e| match e {
                 BackoffErr::Status(c) => format!("HTTP {c}"),
                 BackoffErr::Msg(m) => m,
+                BackoffErr::Fatal(m) => m,
             })
         } else {
             with_backoff(attempt)
@@ -828,7 +876,9 @@ fn acp_answer_request(
 /// ② 再截断——serde_json 输出 UTF-8 原文，按字节切片遇非 ASCII（中文错误文案）
 ///    不是字符边界会 panic 且 panic 沿 process_account 展开杀掉整轮打卡线程
 fn trim_json(v: &Value) -> String {
-    const SENSITIVE_KEYS: [&str; 7] = [
+    // 审查 #18：补 sessionId/session_id/stoken——② 步沙箱响应（link/token/sessionId
+    // 三件套）与四连 RPC 参数均携带会话标识，缺键时原值会经诊断摘要泄漏
+    const SENSITIVE_KEYS: [&str; 10] = [
         "token",
         "access_token",
         "accessToken",
@@ -836,6 +886,9 @@ fn trim_json(v: &Value) -> String {
         "refreshToken",
         "authorization",
         "link",
+        "sessionId",
+        "session_id",
+        "stoken",
     ];
     let mut redacted = v.clone();
     redact_sensitive(redacted.as_object_mut(), &SENSITIVE_KEYS);
@@ -870,9 +923,42 @@ fn redact_sensitive(obj: Option<&mut serde_json::Map<String, Value>>, keys: &[&s
     }
 }
 
+/// 非 JSON 错误体脱敏（审查 #18）：文本形态无法结构化 redact，按正则把
+/// Bearer 头令牌、`token/stoken/sessionId/session_id/sign/key` 等键后的
+/// 值（含 URL 查询参数形态 `?token=…`）替换为 `***`。命中即脱敏宁滥勿缺
+/// （误杀只影响诊断可读性，漏杀是凭证泄漏）；普通错误文案原样保留。
+/// 仅用于 4xx 诊断落盘前的最后兜底，JSON 形态仍走 trim_json 结构化脱敏
+fn sanitize_err_body(body: &str) -> String {
+    use std::sync::OnceLock;
+    static BEARER: OnceLock<regex::Regex> = OnceLock::new();
+    static KV: OnceLock<regex::Regex> = OnceLock::new();
+    // 两遍扫描：① `Bearer <token>` 头（键值对扫描覆盖不到的空格分隔形态）；
+    // ② 敏感键 + 分隔符 + 6 字符以上连续令牌（键名不锚定词首——「assign=」类
+    // 子串命中同样是脱敏而非泄漏，宁滥勿缺）
+    let bearer = BEARER.get_or_init(|| {
+        regex::Regex::new(r#"(?i)bearer[\s=:]+[A-Za-z0-9._%+/=-]{6,}"#)
+            .expect("sanitize_err_body bearer 正则编译失败")
+    });
+    let kv = KV.get_or_init(|| {
+        regex::Regex::new(
+            r#"(?i)((?:access[_-]?|refresh[_-]?|s)?token|session_?id|stoken|signature|sign|key|authorization|secret)["']?\s*[:=]\s*["']?[A-Za-z0-9._%+/=-]{6,}"#,
+        )
+        .expect("sanitize_err_body kv 正则编译失败")
+    });
+    let s = bearer.replace_all(body, "Bearer ***").to_string();
+    kv.replace_all(&s, "${1}=***").to_string()
+}
+
 /// 打卡整轮：buddy-ai 池全账号串行（NDJSON 管线复用 wb-checkin 契约）。
 /// 返回 done 事件（ok/already/failed 计数），供调度器/启动钩子直接消费。
-pub fn run_checkin_round(state: &AppState, emit: &mut dyn FnMut(&Value)) -> Value {
+/// `runtime`：GUI 进程内网关运行态句柄（调度器/手动打卡/启动补跑传入，对齐
+/// qoder_checkin::run_checkin_round 先例）——到账增量回写运行期 buddy_ai_pool；
+/// CLI 独立进程传 None 跳过（该进程本就无内存池）
+pub fn run_checkin_round(
+    state: &AppState,
+    runtime: Option<&std::sync::Mutex<Option<crate::commands::api_server::ApiServerRuntime>>>,
+    emit: &mut dyn FnMut(&Value),
+) -> Value {
     let agent = crate::tasks::http_agent(30);
     // 花名册经 buddy_ai.rs 公开 helper（WbPool 字段不对 tasks 暴露）；
     // 仅含凭证账号参与（无凭证跳过——手工导入无 rt 也打不了卡）
@@ -1022,7 +1108,46 @@ pub fn run_checkin_round(state: &AppState, emit: &mut dyn FnMut(&Value)) -> Valu
         }
     }
 
+    // 运行期网关池回写（审查 #4，仿 qoder_checkin 的 apply_credits_delta 先例）：
+    // 到账（success 且 reward>0）是真实积分入账，此前只回写持久池——运行期
+    // buddy_ai_pool 仍钉在旧余额，该账号会被零积分过滤持续排除至下次积分同步
+    // （every_hours 2h / daily 档最长数十小时；若它是池内唯一账号则网关整体不可用）。
+    // 键位复核：buddy-ai 网关装配以账号 id 充当条目 uid（buddy_ai_credits_sync_impl
+    // 同口径），事件 id 即账号 id。CLI 独立进程 runtime=None / 网关未运行（shared=None）
+    // 均跳过；apply_credits_delta 不动 credits_expire_at（打卡奖励不改变包到期）
+    if let Some(rt) = runtime {
+        let shared = rt
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .map(|g| g.shared.clone());
+        if let Some(shared) = shared {
+            for e in &events {
+                if e.get("status").and_then(Value::as_str) != Some("success") {
+                    continue;
+                }
+                let Some(r) = e.get("reward").and_then(Value::as_f64) else {
+                    continue;
+                };
+                if r <= 0.0 {
+                    continue;
+                }
+                if let Some(id) = e.get("id").and_then(Value::as_str) {
+                    shared.buddy_ai_pool.apply_credits_delta(id, r);
+                }
+            }
+        }
+    }
+
     let done = json!({ "type": "done", "ok": ok, "already": already, "failed": failed });
+    // 空轮标记（审查 #15）：本轮无任何账号参与（空池/花名册全被凭证过滤）时，
+    // done 带 skipped_empty 供调度器跳过 mark_run——mark_run 会写 last_run_date=
+    // 今日，吞掉「当日新增账号后的补打窗口」（每日任务当日不再被调度）
+    let done = if accounts.is_empty() {
+        json!({ "type": "done", "ok": ok, "already": already, "failed": failed, "skipped_empty": true })
+    } else {
+        done
+    };
     emit(&done);
     done
 }
@@ -1139,5 +1264,61 @@ mod tests {
             Ok(42)
         });
         assert_eq!((r2.unwrap(), calls2), (42, 1));
+    }
+
+    /// 审查 #17：Fatal（已确认副作用/确定性失败）立即直返不重试——非幂等建会话
+    /// POST 拿到响应后的失败重试会产生孤儿会话
+    #[test]
+    fn backoff_fatal_never_retries() {
+        let mut calls = 0u32;
+        let r: Result<u32, String> = with_backoff(|| {
+            calls += 1;
+            Err::<u32, _>(BackoffErr::Fatal("建会话响应无 data.id".into()))
+        });
+        assert_eq!(r.unwrap_err(), "建会话响应无 data.id", "Fatal 透传原文");
+        assert_eq!(calls, 1, "Fatal 不重试");
+    }
+
+    /// 审查 #18：SENSITIVE_KEYS 补键——sessionId/session_id/stoken（② 步沙箱
+    /// 响应三件套与 RPC 参数）经 trim_json 结构化脱敏
+    #[test]
+    fn trim_json_redacts_session_fields() {
+        let v = json!({
+            "data": {
+                "link": "https://x/secret",
+                "token": "tok-1",
+                "stoken": "st-abcdef",
+                "sessionId": "sess-abcdef",
+                "session_id": "sid-abcdef",
+            }
+        });
+        let s = trim_json(&v);
+        for leak in ["st-abcdef", "sess-abcdef", "sid-abcdef", "tok-1", "https://x/secret"] {
+            assert!(!s.contains(leak), "摘要不应泄漏 {leak}");
+        }
+        assert!(s.matches("***").count() >= 5, "五个敏感键均应置 ***: {s}");
+    }
+
+    /// 审查 #18：非 JSON 错误体脱敏——Bearer 头令牌、token/stoken/sessionId 等
+    /// 键值对（含 URL 查询参数形态）替换 ***；普通错误文案原样保留
+    #[test]
+    fn sanitize_err_body_redacts_plain_text_tokens() {
+        // Bearer 头（空格分隔，键值对扫描覆盖不到的形态）
+        assert_eq!(
+            sanitize_err_body("unauthorized: Bearer eyJhbGciOiJIUzI1NiJ9.abc denied"),
+            "unauthorized: Bearer *** denied"
+        );
+        // 键值对 + URL 查询参数
+        let s = sanitize_err_body("invalid ?token=abcdef123456&x=1 expired");
+        assert!(!s.contains("abcdef123456"), "{s}");
+        assert!(s.contains("token=***"), "{s}");
+        let s2 = sanitize_err_body("bad request: sessionId=abc123def456");
+        assert!(!s2.contains("abc123def456"), "{s2}");
+        assert!(s2.contains("sessionId=***"), "{s2}");
+        // 带引号 JSON 形态的非 JSON 体残留（如截断的 JSON 文本）
+        let s3 = sanitize_err_body(r#"{"stoken": "stokenvalue123"}"#);
+        assert!(!s3.contains("stokenvalue123"), "{s3}");
+        // 普通文案不受影响
+        assert_eq!(sanitize_err_body("not found"), "not found");
     }
 }

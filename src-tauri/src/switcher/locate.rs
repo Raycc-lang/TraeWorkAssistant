@@ -148,8 +148,25 @@ fn find_bundle(sess: &mut Session) -> Option<PathBuf> {
         }
     }
 
-    // 5) 进程缓存兜底
-    sess.exe_cache.clone().filter(|p| p.exists())
+    // 5) 进程缓存兜底（2026-10-19 缓存投毒防护：补 bundle 白名单复检——缓存
+    //    可能来自 stop_app 停前缓存的进程 exe（Contents/MacOS 二进制路径）或
+    //    bundle 定位链的 .app 根，归一到 bundle 根后验身份白名单，防串台 bundle
+    //    缓存被直接放行（仅装国际版机器上国内切换 open 拉起国际客户端））
+    sess.exe_cache.clone().filter(|p| {
+        p.exists() && cached_bundle_ok(p, sess.prof.exe_names, sess.prof.mac_bundle_ids)
+    })
+}
+
+/// 第 5 级缓存兜底的 bundle 白名单复检：缓存形态可为 .app 根（bundle 定位链）
+/// 或主进程二进制路径（stop_app 停前缓存，Contents/MacOS/<exe>），统一归一到
+/// bundle 根后验双信号白名单（CFBundleExecutable / CFBundleIdentifier）
+#[cfg(target_os = "macos")]
+fn cached_bundle_ok(p: &Path, exe_names: &[&str], bundle_ids: &[&str]) -> bool {
+    if is_bundle_dir(p) {
+        bundle_exe_matches(p, exe_names, bundle_ids)
+    } else {
+        bundle_root_of(p).map_or(false, |r| bundle_exe_matches(&r, exe_names, bundle_ids))
+    }
 }
 
 /// 是否为 .app bundle 目录
@@ -384,5 +401,55 @@ mod tests {
         // 任一目录缺失均静默过滤（PS Test-Path continue 语义）
         let dirs = lnk_dirs();
         assert!(dirs.iter().all(|d| d.is_dir()));
+    }
+
+    // ── 第 5 级缓存兜底 bundle 白名单复检（2026-10-19 缓存投毒防护）──
+    #[cfg(target_os = "macos")]
+    mod mac {
+        use super::super::cached_bundle_ok;
+        use crate::switcher::TargetApp;
+        use crate::switcher::profile::profile_for;
+
+        #[test]
+        fn cached_bundle_ok_白名单复检() {
+            // find_bundle 第 5 级兜底对缓存统一归一 bundle 根后验双信号白名单：
+            // 串台 bundle（国内档案缓存了国际 CodeBuddy.app）必须拒绝，防仅装
+            // 国际版机器上国内切换 open 拉起国际客户端
+            let root =
+                std::env::temp_dir().join(format!("sw-locate-test-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&root);
+            let mk = |name: &str, id: &str| {
+                let contents = root.join(name).join("Contents");
+                std::fs::create_dir_all(&contents).unwrap();
+                std::fs::write(
+                    contents.join("Info.plist"),
+                    format!(
+                        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+                         <plist version=\"1.0\"><dict><key>CFBundleIdentifier</key>\
+                         <string>{id}</string></dict></plist>\n"
+                    ),
+                )
+                .unwrap();
+                root.join(name)
+            };
+            let cn = mk("CodeBuddy CN.app", "com.tencent.codebuddycn");
+            let intl = mk("CodeBuddy.app", "com.tencent.codebuddy");
+            let prof = profile_for(TargetApp::CodeBuddy, &root);
+            // .app 根形态（bundle 定位链缓存）
+            assert!(cached_bundle_ok(&cn, prof.exe_names, prof.mac_bundle_ids));
+            assert!(!cached_bundle_ok(&intl, prof.exe_names, prof.mac_bundle_ids));
+            // 主进程二进制形态（stop_app 停前缓存）归一 bundle 根后同样复检
+            assert!(cached_bundle_ok(
+                &cn.join("Contents/MacOS/Electron"),
+                prof.exe_names,
+                prof.mac_bundle_ids
+            ));
+            assert!(!cached_bundle_ok(
+                &intl.join("Contents/MacOS/Electron"),
+                prof.exe_names,
+                prof.mac_bundle_ids
+            ));
+            let _ = std::fs::remove_dir_all(&root);
+        }
     }
 }

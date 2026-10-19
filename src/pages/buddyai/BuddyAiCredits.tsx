@@ -191,9 +191,14 @@ export default function BuddyAiCredits() {
   // 本地 Token 统计（~/.workbuddy-ai/projects 会话扫描；懒加载：Token Tab 首次激活才拉取）
   const [tokenStats, setTokenStats] = useState<BuddyAiTokenStats | null>(null);
   const tokensLoadedRef = useRef(false);
+  // accountsList 竞态序号（审查修复 #22）：在途 load 的旧快照响应到达时若积分同步
+  // 已写入新余额（序号已变），丢弃不再 setAccounts；同步成功同样递增使在途 load 失效
+  const accountsSeqRef = useRef(0);
 
   const load = useCallback(async () => {
     setLoading(true);
+    // 入口递增并捕获：响应到达时序号不符说明期间有更新的余额写入（积分同步），旧快照作废
+    const mySeq = ++accountsSeqRef.current;
     try {
       // 主数据 accountsList 失败仅局部报错，不丢弃其余四路已成功的数据（对齐各路独立容错）
       const [accs, recs, usg, hist, gs] = await Promise.all([
@@ -206,7 +211,9 @@ export default function BuddyAiCredits() {
         api.buddyai.creditsHistory(90).catch(() => [] as CreditSnap[]),
         api.groups.sharedList().catch(() => [] as GroupView[]),
       ]);
-      if (accs) setAccounts(accs);
+      // #22：在途 load 的响应晚于 syncCredits 的 setAccounts 到达时（序号已变），
+      // 旧快照不再覆盖新余额；records/usage 等与余额无关的通路照常落地
+      if (accountsSeqRef.current === mySeq && accs) setAccounts(accs);
       setRecords(recs);
       setGroups(gs);
       setUsage(usg);
@@ -256,6 +263,8 @@ export default function BuddyAiCredits() {
     setSyncing(true);
     try {
       const n = await withMinDelay(api.buddyai.creditsFetch(), 800);
+      // 同步结果为新权威余额（#22）：递增序号使仍在途的 load 旧快照失效
+      accountsSeqRef.current++;
       setAccounts(n);
       const ok = n.filter((a) => a.credits_balance != null).length;
       pushToast('success', `积分已同步（${ok}/${n.length} 个账号取数成功）`);

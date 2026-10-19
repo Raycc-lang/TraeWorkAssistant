@@ -179,6 +179,8 @@ fn ide_aes_keys(_data_dir: &Path) -> Result<Vec<Vec<u8>>, String> {
 /// 惰性解密（审查 L 修复）：mac 上逐 service「读 Keychain → 派生 → 尝试解密」，
 /// 命中即返回——原实现先串行读完全部候选（单次 Keychain 访问可达 90s，最坏
 /// ~270s）再逐个试解；Windows 单候选等价旧路径。
+/// data_dir 仅 Windows 候选密钥读取消费（mac 走 Keychain 派生，无目录入参）
+#[cfg_attr(target_os = "macos", allow(unused_variables))]
 fn decrypt_with_ide_keys(data_dir: &Path, enc: &[u8]) -> Option<String> {
     #[cfg(windows)]
     {
@@ -210,7 +212,9 @@ fn decrypt_with_ide_keys(data_dir: &Path, enc: &[u8]) -> Option<String> {
     }
 }
 
-/// 多候选密钥逐一尝试 v10 解密，命中即返回（Windows 单候选恒一步命中）
+/// 多候选密钥逐一尝试 v10 解密，命中即返回（Windows 单候选恒一步命中；
+/// mac 生产路径为惰性逐 service 解密不经此函数，仅真机探针测试消费）
+#[cfg_attr(target_os = "macos", allow(dead_code))]
 fn decrypt_v10_any(enc: &[u8], keys: &[Vec<u8>]) -> Option<String> {
     for key in keys {
         if let Some(plain) = decrypt_v10(enc, key) {

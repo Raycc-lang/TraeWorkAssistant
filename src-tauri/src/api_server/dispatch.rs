@@ -264,6 +264,10 @@ struct ModelSources {
     /// Buddy 源：四段管线归一化命中（Some(最终模型, effort 提示)）；含 Intl 静态
     /// 目录折入（buddy_intl_only 区分来源域）
     buddy: Option<(String, Option<String>)>,
+    /// BuddyAi 域最终模型（issue #19）：CN 收录模型的 Intl 目录降级候选——目标池
+    /// 为 BuddyAi 时最终模型取本值（候选按 Intl 目录取，上游必存在该 id）；None =
+    /// Intl 专属折入（无降级语义），回落 buddy.0（两域同值）
+    buddy_intl_final: Option<String>,
     /// Intl 专属标记（审查修复）：buddy 源来自 Intl 静态目录而非 CN 目录——
     /// Buddy(CN) 池不服务该模型（available 门控），仅 buddy-ai 池可取号
     buddy_intl_only: bool,
@@ -470,28 +474,40 @@ pub fn resolve_target(
                 // buddy-ai 池上游不存在（审查修复）
                 let whitelist = super::unified_catalog::load_whitelist(&state.data_dir);
                 let in_wl = |m: &str| super::unified_catalog::whitelist_allows(&whitelist, m);
-                let final_model = if !buddy_intl_only
-                    && state
+                // issue #19 修复：降级候选按目标池对应域目录取——BuddyAi 池上游按
+                // Intl 目录提供模型（CN 目录候选 id 在 Intl 上游可能不存在，双收录
+                // 模型的廉价候选常为 CN 专属 id），Buddy 池仍用 CN 目录；两域候选
+                // 均过白名单过滤，候选不存在时回落原模型（不降级）
+                let bg_on = state
                     .wb_bg_downgrade
                     .load(std::sync::atomic::Ordering::Relaxed)
-                    && wb_model_route::is_background_task(body)
-                {
-                    wb_model_route::cheapest_catalog_model_filtered(&catalog, &in_wl)
-                        .unwrap_or_else(|| r.model.clone())
-                } else if !buddy_intl_only
-                    && state.wb_longctx_downgrade.load(std::sync::atomic::Ordering::Relaxed)
+                    && wb_model_route::is_background_task(body);
+                let longctx_on = state
+                    .wb_longctx_downgrade
+                    .load(std::sync::atomic::Ordering::Relaxed)
                     // F-76④ 长上下文降档：输入粗估超阈值（默认 100k token）→ flash 档模型
                     && wb_model_route::estimate_input_tokens(body)
-                        >= wb_model_route::LONGCTX_TOKEN_THRESHOLD
-                {
-                    wb_model_route::flash_catalog_model_filtered(&catalog, &in_wl)
-                        .unwrap_or_else(|| r.model.clone())
-                } else {
-                    r.model.clone()
+                        >= wb_model_route::LONGCTX_TOKEN_THRESHOLD;
+                let domain_candidate = |intl_domain: bool| -> Option<String> {
+                    let dom = if intl_domain {
+                        intl_catalog.as_slice()
+                    } else {
+                        catalog.as_slice()
+                    };
+                    if bg_on {
+                        wb_model_route::cheapest_catalog_model_filtered(dom, &in_wl)
+                    } else if longctx_on {
+                        wb_model_route::flash_catalog_model_filtered(dom, &in_wl)
+                    } else {
+                        None
+                    }
                 };
-                (final_model, r.effort_hint.clone())
+                let cn_final = domain_candidate(false).unwrap_or_else(|| r.model.clone());
+                let intl_final = domain_candidate(true).unwrap_or_else(|| r.model.clone());
+                ((cn_final, r.effort_hint.clone()), intl_final)
             })
-            .or(intl_hit);
+            .map(|(hit, intl_final)| (Some(hit), Some(intl_final)))
+            .unwrap_or((intl_hit, None));
 
     // ③ Trae 源判定：canonical_id 命中 Trae 模型列表；未命中任何目录时保持
     // 透传语义（单源 Trae，与现状一致）。
@@ -516,7 +532,7 @@ pub fn resolve_target(
     // v1 不做路由后缀剥离（-thinking/-max 是 WB/Trae 侧机制），请求素材由执行路径按条目再查
     let qoder_hit = qoder_upstream::resolve(model, qoder_upstream::QoderRegion::Cn)
         .and_then(|entry| entry.get("id").and_then(Value::as_str).map(str::to_string));
-    let trae_final = if buddy_hit.is_none() {
+    let trae_final = if buddy_hit.0.is_none() {
         if in_trae(model) {
             // 整名命中：真模型名透传，不做任何后缀剥离
             (model.to_string(), None, false)
@@ -555,10 +571,12 @@ pub fn resolve_target(
     let canonical = canonical_id(&trae_final.0);
     // Trae 透传语义收窄：Qoder 目录命中的模型不再默认透传 Trae（透传会让
     // Trae 上游报「模型不存在」；显式在 Trae 列表中的仍按双源处理）
-    let trae_hit = (buddy_hit.is_none() && qoder_hit.is_none())
+    let trae_hit = (buddy_hit.0.is_none() && qoder_hit.is_none())
         || trae_list.iter().any(|m| canonical_id(&m.id) == canonical);
     let sources = ModelSources {
-        buddy: buddy_hit,
+        buddy: buddy_hit.0,
+        // issue #19：BuddyAi 域降级候选随源携带（按目标池取域）
+        buddy_intl_final: buddy_hit.1,
         // 审查修复：Intl 专属模型源（CN 目录未命中、Intl 目录命中）
         buddy_intl_only,
         // 审查修复（第2项）：CN+Intl 双收录判定随源携带
@@ -698,7 +716,7 @@ pub fn resolve_target(
         && policy.per_model.get(&canonical).is_none()
         && sources.available_count(trae_enabled, wb_enabled, qoder_enabled, buddy_ai_enabled) >= 2
     {
-        order = smart_pool_order(state, &order, &canonical, &catalog, &sources);
+        order = smart_pool_order(state, &order, &canonical, &catalog, &intl_catalog, &sources);
     }
 
     let preferred = order
@@ -760,15 +778,21 @@ pub fn resolve_target(
                         // 本就按池独立（CN=wb 视图 / Intl=intl 视图 / qoder 独立表）
                         (TargetPool::Buddy, FallbackReason::ModelCooldown) => {
                             let view = super::wb_route::WbView::wb(state.clone());
-                            let secs = super::wb_route::model_cooling_remaining(&view, &final_buddy_model(&sources))
-                                .unwrap_or(0);
+                            let secs = super::wb_route::model_cooling_remaining(
+                                &view,
+                                &final_buddy_model(TargetPool::Buddy, &sources),
+                            )
+                            .unwrap_or(0);
                             DispatchError::ModelCooling(secs, TargetPool::Buddy)
                         }
                         // buddy-ai 模型级冷却同构映射（独立冷却表：同名模型跨区不混轮）
                         (TargetPool::BuddyAi, FallbackReason::ModelCooldown) => {
                             let view = super::wb_route::WbView::intl(state.clone());
-                            let secs = super::wb_route::model_cooling_remaining(&view, &final_buddy_model(&sources))
-                                .unwrap_or(0);
+                            let secs = super::wb_route::model_cooling_remaining(
+                                &view,
+                                &final_buddy_model(TargetPool::BuddyAi, &sources),
+                            )
+                            .unwrap_or(0);
                             DispatchError::ModelCooling(secs, TargetPool::BuddyAi)
                         }
                         // Qoder 模型级冷却同构映射（审查修复）：单源排队冷却显式 429
@@ -833,6 +857,7 @@ fn smart_pool_order(
     order: &[TargetPool],
     canonical: &str,
     catalog: &[super::wb_catalog::WbModel],
+    intl_catalog: &[super::wb_catalog::WbModel],
     sources: &ModelSources,
 ) -> Vec<TargetPool> {
     let trae_stats = state.pool.stats();
@@ -851,6 +876,24 @@ fn smart_pool_order(
         .as_ref()
         .and_then(|(m, _)| catalog.iter().find(|c| c.id == *m))
         .map(|c| c.rate);
+    // issue #20：buddy-ai 档倍率改查 Intl 动态目录（/v3/config 实抓倍率优先，
+    // 此前复用 CN 目录值导致 smart 排序对 buddy-ai 档失准）；该模型未收录 Intl
+    // 目录时回退 CN 目录值。模型取 BuddyAi 域最终模型（与 #19 按池取域同口径，
+    // BuddyAi 池实发模型 = buddy_intl_final）
+    let buddy_ai_rate = if sources.buddy.is_some() {
+        let m = final_buddy_model(TargetPool::BuddyAi, sources);
+        (!m.is_empty())
+            .then_some(m)
+            .and_then(|m| {
+                intl_catalog
+                    .iter()
+                    .find(|c| c.id == m)
+                    .or_else(|| catalog.iter().find(|c| c.id == m))
+            })
+            .map(|c| c.rate)
+    } else {
+        None
+    };
     let qoder_rate = sources
         .qoder
         .as_ref()
@@ -874,8 +917,9 @@ fn smart_pool_order(
         let ((earliest, total), rate) = match p {
             TargetPool::Trae => (trae_stats, trae_rate),
             TargetPool::Buddy => (wb_stats, buddy_rate),
-            // buddy-ai：同目录倍率（R-9 同账号体系定价同构），积分快照取国际池
-            TargetPool::BuddyAi => (buddy_ai_stats, buddy_rate),
+            // buddy-ai：Intl 动态目录倍率（issue #20：/v3/config 实抓值优先，
+            // 未收录 Intl 目录回退 CN 目录值；R-9 同账号体系定价同构），积分快照取国际池
+            TargetPool::BuddyAi => (buddy_ai_stats, buddy_ai_rate),
             TargetPool::Qoder => (qoder_stats, qoder_rate),
             TargetPool::Custom => ((None, 0.0), None),
         };
@@ -906,7 +950,7 @@ fn pool_health(
 ) -> Result<(), FallbackReason> {
     match pool {
         TargetPool::Buddy => {
-            let model = final_buddy_model(sources);
+            let model = final_buddy_model(TargetPool::Buddy, sources);
             let view = super::wb_route::WbView::wb(state.clone());
             if super::wb_route::model_cooling_remaining(&view, &model).is_some() {
                 return Err(FallbackReason::ModelCooldown);
@@ -918,7 +962,8 @@ fn pool_health(
         }
         TargetPool::BuddyAi => {
             // 与 Buddy 同构：独立模型冷却表 + 独立池账号健康预检（§3.1 失败域隔离）
-            let model = final_buddy_model(sources);
+            // issue #19：冷却/预检模型取 BuddyAi 域最终模型（Intl 目录候选）
+            let model = final_buddy_model(TargetPool::BuddyAi, sources);
             let view = super::wb_route::WbView::intl(state.clone());
             if super::wb_route::model_cooling_remaining(&view, &model).is_some() {
                 return Err(FallbackReason::ModelCooldown);
@@ -983,7 +1028,15 @@ fn pool_healthy(
     pool_health(state, pool, sources, wb_enabled, allowed).is_ok()
 }
 
-fn final_buddy_model(sources: &ModelSources) -> String {
+/// Buddy 源最终模型（issue #19 按目标池取域）：BuddyAi 池取 Intl 目录降级候选
+/// （buddy_intl_final，候选 id 在 Intl 上游必存在），Buddy 池取 CN 目录候选
+///（buddy.0）；Intl 专属折入与未降级场景两域同值
+fn final_buddy_model(pool: TargetPool, sources: &ModelSources) -> String {
+    if pool == TargetPool::BuddyAi {
+        if let Some(m) = &sources.buddy_intl_final {
+            return m.clone();
+        }
+    }
     sources
         .buddy
         .as_ref()
@@ -993,7 +1046,7 @@ fn final_buddy_model(sources: &ModelSources) -> String {
 
 fn final_model_for(pool: TargetPool, sources: &ModelSources, request_model: &str) -> String {
     match pool {
-        TargetPool::Buddy | TargetPool::BuddyAi => final_buddy_model(sources),
+        TargetPool::Buddy | TargetPool::BuddyAi => final_buddy_model(pool, sources),
         // Trae：后缀剥离后的基名（issue #31 T3.1；无后缀/透传语义 = 原名）
         TargetPool::Trae => sources.trae_final.0.clone(),
         // Qoder：目录归一化 id（去空白形态，执行路径据此 resolve 请求素材）

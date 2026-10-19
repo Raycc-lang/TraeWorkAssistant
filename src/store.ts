@@ -332,6 +332,10 @@ function armCheckinWatchdog() {
   }, CHECKIN_WATCHDOG_MS);
 }
 
+/** BuddyAI Tab 可见性「用户已显式决定」标记（审查修复 #10，localStorage）：
+ *  store init 的一次性自动放开与设置面板手动开关共用——标记落盘后自动逻辑永久退避 */
+export const BUDDY_AI_VIS_DECIDED_KEY = 'buddy_ai_vis_decided';
+
 export const useAppStore = create<AppState>((set, get) => ({
   ready: false,
   // 初始兜底用 UA 猜测（mac = "Macintosh; Intel Mac OS X"），platform_info 成功后覆盖
@@ -527,6 +531,35 @@ export const useAppStore = create<AppState>((set, get) => ({
     } catch {
       /* 静默失败 */
     }
+    // BuddyAI Tab 一次性自动放开（审查修复 #10）：buddy_ai_visible 此前仅能手动勾选，
+    // 装了国际客户端的用户默认看不到入口。首次使用（localStorage 无 decided 标记，
+    // 视为用户从未显式决定过）时经现有 env locate 探测国际客户端（workbuddy_ai /
+    // codebuddy_ai，与 BuddyAiTopBar 同款调用），任一安装即自动放开显示；未安装仅落
+    // 标记（本机只探测一次，避免每次启动重复探测开销）。用户在设置面板显式切换过开关
+    // 同样落标记（onChange 写入），自动逻辑此后永久退避、不与用户显式选择打架。
+    // 失败静默，不阻塞启动
+    void (async () => {
+      try {
+        if (localStorage.getItem(BUDDY_AI_VIS_DECIDED_KEY)) return;
+        if (!get().settingsLoaded) return;
+        const [wb, cb] = await Promise.all([
+          api.env.locate('workbuddy_ai').catch(() => null),
+          api.env.locate('codebuddy_ai').catch(() => null),
+        ]);
+        // 探测期间用户可能在设置面板显式开启（onChange 已落标记）：以其选择为准不覆盖
+        if (get().settings?.buddy_ai_visible === true) {
+          localStorage.setItem(BUDDY_AI_VIS_DECIDED_KEY, '1');
+          return;
+        }
+        // 探测完成即落标记：无论是否安装，本机只自动探测一次
+        localStorage.setItem(BUDDY_AI_VIS_DECIDED_KEY, '1');
+        if (wb?.exe || cb?.exe) {
+          await get().saveSettings({ buddy_ai_visible: true }).catch(() => {});
+        }
+      } catch {
+        /* 静默失败：下次启动满足条件时重试 */
+      }
+    })();
   },
 
   setView: (v) => set({ view: v }),
@@ -816,10 +849,14 @@ export const useAppStore = create<AppState>((set, get) => ({
       }
       settings.buddy_ai_catalog_sync_enabled = settings.buddy_ai_catalog_sync_enabled !== false;
       if (!settings.buddy_ai_catalog_sync_hhmm?.trim()) settings.buddy_ai_catalog_sync_hhmm = '05:55';
-      // 自定义图标兜底：非法应用 key / 空图标名丢弃（非法图标名由渲染层 resolveAppIcon 回退默认）
+      // 自定义图标兜底：非法应用 key / 空图标名丢弃（非法图标名由渲染层 resolveAppIcon 回退默认）。
+      // 图标清理用独立白名单（审查修复 #7）：buddy-ai 的自定义图标合法——后端 state.rs:388
+      // 的 retain 同样放行 'buddy-ai'；原复用上方 hidden_apps 的 validApps 会在每次
+      // settingsGet 后剥除 buddy-ai 图标并随保存写回丢失
+      const iconApps: AppKey[] = ['trae', 'buddy', 'qoder', 'doubao', 'buddy-ai'];
       const cleanIcons: Partial<Record<AppKey, string>> = {};
       for (const [k, v] of Object.entries(settings.app_icons ?? {})) {
-        if (validApps.includes(k as AppKey) && typeof v === 'string' && v.trim()) {
+        if (iconApps.includes(k as AppKey) && typeof v === 'string' && v.trim()) {
           cleanIcons[k as AppKey] = v.trim();
         }
       }

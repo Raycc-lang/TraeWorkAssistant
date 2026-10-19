@@ -452,16 +452,23 @@ function BuddyAiTopBar() {
 
   useEffect(() => {
     let alive = true;
-    api.env
-      .locate('workbuddy_ai')
-      .then((r) => alive && setWbLocate(r))
-      .catch(() => {});
-    api.env
-      .locate('codebuddy_ai')
-      .then((r) => alive && setCbLocate(r))
-      .catch(() => {});
+    // 探测抽成函数（审查修复 #23）：mount 即探一次 + 30s 低频轮询重探——窗口内
+    // 安装/卸载国际客户端徽标可自动刷新；locate 失败时下次轮询自然重试
+    const probe = () => {
+      api.env
+        .locate('workbuddy_ai')
+        .then((r) => alive && setWbLocate(r))
+        .catch(() => {});
+      api.env
+        .locate('codebuddy_ai')
+        .then((r) => alive && setCbLocate(r))
+        .catch(() => {});
+    };
+    probe();
+    const timer = setInterval(probe, 30_000);
     return () => {
       alive = false;
+      clearInterval(timer);
     };
   }, []);
 

@@ -93,7 +93,10 @@ impl Layout {
 ///     跳过杀（防并存时误杀国际实例）；国际 exe 不在盘 → 老单布局 → 归国内
 ///   - 国际档案 owner_is_self=true：国际 exe 在盘 → 归国际版 → 允许杀；
 ///     不在盘 → 跳过（防误杀国内老单布局下的同名国内进程）
+/// 2026-10-19：mac 构建首次可编译后显形——字段仅 Windows 映像名仲裁消费
+///（mac 无共用映像名），按库内 cfg_attr 惯例静默
 #[derive(Clone, Debug)]
+#[cfg_attr(target_os = "macos", allow(dead_code))]
 pub struct ImageArk {
     /// 归属标记路径（国际版 exe 存在性即「并存布局」的判据）
     pub marker: PathBuf,
@@ -118,6 +121,15 @@ pub struct AppProfile {
     pub graceful_wait_secs: u64,
     /// 进程名白名单（不带 .exe，精确匹配 = Get-Process -Name 语义；Stop 用）
     pub proc_names: &'static [&'static str],
+    /// mac 专属进程名白名单（2026-10-19 双客户端并存实测新增）：.app 主干名，
+    /// mac 进程匹配（proc.rs mac_main_matches）优先消费，None 回落 proc_names。
+    /// 国内 CodeBuddy 档案收窄为 ["CodeBuddy CN"]——mac 主进程身份信号是
+    /// `/<App>.app/Contents/MacOS/` 路径段，裸名 "CodeBuddy" 段恰是并存的国际版
+    /// /Applications/CodeBuddy.app（国际 bundle 目录名就叫 CodeBuddy.app），
+    /// 不收窄 stop_app 会 SIGTERM 误杀国际版；mac 国内 bundle 目录名恒为
+    /// CodeBuddy CN.app。Windows 不消费本字段（映像名白名单行为零变化）
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    pub mac_proc_names: Option<&'static [&'static str]>,
     /// 进程名通配组（**exe 发现第 5 级专用**，比 Stop 的精确组更宽，再经
     /// exe_names 白名单过滤防串台；PS $Script:ProcPatterns，双轨刻意保留）
     #[cfg_attr(target_os = "macos", allow(dead_code))] // mac bundle 定位链不消费（Windows 专用）
@@ -158,7 +170,8 @@ pub struct AppProfile {
     /// 打开 IDE 窗口。2026-10-14 实测，见 switcher/icube.rs apply_agent_window_fixup）
     pub force_agent_window: bool,
     /// 仅 CodeBuddy 系：共用映像名 "CodeBuddy" 的归属仲裁（None = 档案进程名
-    /// 无歧义，无需仲裁）
+    /// 无歧义，无需仲裁）。mac 构建不消费（同 ImageArk，cfg_attr 惯例静默）
+    #[cfg_attr(target_os = "macos", allow(dead_code))]
     pub image_ark: Option<ImageArk>,
 }
 
@@ -175,13 +188,20 @@ impl AppProfile {
 /// 文件名匹配恒不命中——改以路径 bundle 段匹配：路径含 `/<App主干>.app`
 ///（bundle 根或其内部 Contents/MacOS/ 可执行均命中；Helper 内层 bundle 路径
 /// 同样含外层 `/<App>.app` 段，归属判定正确）。
+/// 2026-10-19 缓存投毒修复：段命中后二次校验所在 bundle 的 CFBundleIdentifier
+/// ∈ 档案 mac_bundle_ids——裸名 "CodeBuddy" 段恰是并存国际版 CodeBuddy.app，
+/// stop_app 停前把该 exe 缓存进 sess.exe_cache、locate 第 5 级兜底直接放行，
+/// 仅装国际版机器上国内切换会 open 拉起国际客户端。
 pub fn exe_matches(path: &std::path::Path, prof: &AppProfile) -> bool {
     #[cfg(target_os = "macos")]
     {
         let s = path.to_string_lossy().to_lowercase();
         prof.exe_names.iter().any(|e| {
             e.strip_suffix(".exe")
-                .map(|stem| s.contains(&format!("/{}.app", stem.to_lowercase())))
+                .map(|stem| {
+                    s.contains(&format!("/{}.app", stem.to_lowercase()))
+                        && bundle_id_allows(path, stem, prof.mac_bundle_ids)
+                })
                 .unwrap_or(false)
         })
     }
@@ -192,6 +212,27 @@ pub fn exe_matches(path: &std::path::Path, prof: &AppProfile) -> bool {
             None => false,
         }
     }
+}
+
+/// exe_matches mac 分支的 bundle 身份二次校验：定位路径中 `/{stem}.app` 段对应的
+/// bundle 根（主进程 exe / bundle 根 / Helper 内层路径均归属外层应用 bundle，
+/// Helper 内层 bundle 名带 " Helper" 后缀不会抢先命中），读 Info.plist
+/// CFBundleIdentifier ∈ bundle_ids。plist 不可读/无 bundle 根 → fail-closed 拒绝
+///（与 locate.rs bundle 白名单同语义）；bundle_ids 为空（档案未配置）退回纯段匹配
+#[cfg(target_os = "macos")]
+fn bundle_id_allows(path: &std::path::Path, stem: &str, bundle_ids: &[&str]) -> bool {
+    if bundle_ids.is_empty() {
+        return true;
+    }
+    let suffix = format!("/{}.app", stem.to_lowercase());
+    path.ancestors()
+        .find(|a| a.to_string_lossy().to_lowercase().ends_with(&suffix))
+        .map(|app| {
+            crate::switcher::locate::read_info_plist_value(app, "CFBundleIdentifier")
+                .map(|id| bundle_ids.iter().any(|b| b.eq_ignore_ascii_case(&id)))
+                .unwrap_or(false)
+        })
+        .unwrap_or(false)
 }
 
 /// 档案表（PS switch 块逐项对译；参数顺序见各分支注释）
@@ -211,6 +252,7 @@ pub fn profile_for(app: TargetApp, app_data_dir: &std::path::Path) -> AppProfile
             // 被客户端启动重放导致旧账号复活（与豆包 8s 同理：落盘/退出需要时间）
             graceful_wait_secs: 8,
             proc_names: &["Trae CN"],
+            mac_proc_names: None,
             proc_patterns: &["Trae*", "TRAE*"],
             exe_names: &["Trae CN.exe"],
             lnk_patterns: &["*TRAE*", "*Trae*"],
@@ -241,6 +283,7 @@ pub fn profile_for(app: TargetApp, app_data_dir: &std::path::Path) -> AppProfile
             // 文件锁 → 备份静默缺文件 → 恢复后登录态丢失）
             graceful_wait_secs: 8,
             proc_names: &["Doubao"],
+            mac_proc_names: None,
             proc_patterns: &["Doubao*"],
             exe_names: &["Doubao.exe"],
             lnk_patterns: &["*Doubao*", "*豆包*"],
@@ -272,6 +315,7 @@ pub fn profile_for(app: TargetApp, app_data_dir: &std::path::Path) -> AppProfile
             // CodeBuddy 从不回写共享 auth 文件（登录真源在自身 vscdb）——
             // 切/存 WorkBuddy 不关停 CodeBuddy，两端完全独立（ProcNames 仅本端）
             proc_names: &["WorkBuddy"],
+            mac_proc_names: None,
             // 审查修复（2026-10-17 双客户端并存实测）："WorkBuddy*" 通配会命中国际版
             // WorkBuddyAI.exe——第 5 级 exe 发现/进程列表会把国际进程误认作国内在跑；
             // 收窄为本名精确 glob（与 proc_names 精确组语义对齐）
@@ -304,6 +348,11 @@ pub fn profile_for(app: TargetApp, app_data_dir: &std::path::Path) -> AppProfile
             // F2-1 进程解耦：CodeBuddy 登录真源在自身 state.vscdb（%APPDATA%\CodeBuddy CN），
             // 不消费共享 auth 文件——切/存 CodeBuddy 不关停在跑的 WorkBuddy
             proc_names: &["CodeBuddy", "CodeBuddy CN"],
+            // 2026-10-19 mac 双客户端并存实测收窄：mac 国内 bundle 目录名恒为
+            // CodeBuddy CN.app，裸名 "CodeBuddy" 段恰是并存的国际版
+            // /Applications/CodeBuddy.app（stop_app 会 SIGTERM 误杀国际版）——
+            // mac 进程匹配收窄为仅 "CodeBuddy CN"；Windows proc_names 不变
+            mac_proc_names: Some(&["CodeBuddy CN"]),
             proc_patterns: &["CodeBuddy*"],
             exe_names: &["CodeBuddy.exe", "CodeBuddy CN.exe"],
             lnk_patterns: &["*CodeBuddy*"],
@@ -369,6 +418,7 @@ pub fn profile_for(app: TargetApp, app_data_dir: &std::path::Path) -> AppProfile
             // vs Qoder CN.app）；切换若在 mac 放开需按 bundle 路径段区分进程
             //（参照 commands/process.rs::mac_app_running）
             proc_names: &["Qoder CN IDE"],
+            mac_proc_names: None,
             proc_patterns: &["Qoder CN IDE*"],
             exe_names: &["Qoder CN IDE.exe"],
             lnk_patterns: &["*Qoder*"],
@@ -415,6 +465,9 @@ pub fn profile_for(app: TargetApp, app_data_dir: &std::path::Path) -> AppProfile
             graceful_wait_secs: 5,
             // 精确匹配国际客户端进程（"CodeBuddy"）；不得命中国内 "CodeBuddy CN"
             proc_names: &["CodeBuddy"],
+            // mac 段核对（2026-10-19 双客户端实测）："/codebuddy.app/" 恰是本档案
+            // 自己的国际 bundle，与国内 "/codebuddy cn.app/" 互不命中，无需收窄
+            mac_proc_names: None,
             // 审查修复（W5）：proc_patterns 是 exe 发现第 5 级（running_exe_of）
             // 的通配组，sysinfo 映像名带 .exe——原 "CodeBuddy AI*" 匹配不到国际
             // 客户端映像 "CodeBuddy.exe"，第 5 级发现恒失效。补精确 glob 项；
@@ -432,12 +485,14 @@ pub fn profile_for(app: TargetApp, app_data_dir: &std::path::Path) -> AppProfile
             // 反斜杠硬编码——收口 roaming_dir 跨平台基根（mac 同构布局）
             cb_global_storage_dir: Some(roaming_dir("CodeBuddy").join("User").join("globalStorage")),
             icube_items: &[],
-            // macOS 灰度（合并审查 2026-10-18）：国际版客户端 mac 布局未实测，
-            // 维持 mac_supported=false（run_action 拒绝），实测后按国内 CodeBuddy
-            // 档案同款放开（~/.codebuddy 共享、roaming 下 User/globalStorage 同构）
-            mac_supported: false,
+            // macOS 放开（2026-10-19 本机实测）：国际客户端 CodeBuddy.app
+            //（CFBundleIdentifier=com.tencent.codebuddy）与并存国内 CodeBuddy CN.app
+            // 靠 bundle 白名单隔离；数据目录就绪——~/.codebuddy 双端共享 +
+            // roaming CodeBuddy/User/globalStorage 登录真源同构 → mac_supported
+            // 放开（原灰度 false 旧稿注释随放开更新）
+            mac_supported: true,
             mac_data_dir_guess: Some("~/.codebuddy"),
-            mac_bundle_ids: &[],
+            mac_bundle_ids: &["com.tencent.codebuddy"],
             force_agent_window: false,
             // 审查修复（M5）：映像名 "CodeBuddy" 在老单布局下归国内，国际 exe
             // 不在盘时必须跳过杀（防误杀国内老单实例）
@@ -457,6 +512,10 @@ pub fn profile_for(app: TargetApp, app_data_dir: &std::path::Path) -> AppProfile
             settings_path_key: "workbuddy_ai_path",
             graceful_wait_secs: 5,
             proc_names: &["WorkBuddyAI", "WorkBuddy AI"],
+            // mac 段核对（2026-10-19 双客户端实测）：本档案 bundle 是 WorkBuddy AI.app
+            //（"/workbuddy ai.app/"），裸名 "WorkBuddyAI" 段 "/workbuddyai.app/" 无对应
+            // bundle，与国内 "/workbuddy.app/"（含空格）互不命中，无需收窄
+            mac_proc_names: None,
             proc_patterns: &["WorkBuddyAI*", "WorkBuddy AI*"],
             // 审查修复（2026-10-17 并存实测）：白名单剔除国内专属 "WorkBuddy.exe"——
             // 留着会让 lnk/注册表级把国内 exe 误认成国际客户端（串台）
@@ -475,11 +534,14 @@ pub fn profile_for(app: TargetApp, app_data_dir: &std::path::Path) -> AppProfile
             ],
             cb_global_storage_dir: None,
             icube_items: &[],
-            // macOS 灰度（合并审查 2026-10-18）：国际版客户端 mac 布局未实测，
-            // 维持 mac_supported=false；实测后按国内 WorkBuddy 档案同款放开
-            mac_supported: false,
+            // macOS 放开（2026-10-19 本机实测）：国际客户端 WorkBuddy AI.app
+            //（CFBundleIdentifier=com.workbuddy.workbuddy-ai）与国内 WorkBuddy.app
+            // bundle 段互不命中（"/workbuddy ai.app/" vs "/workbuddy.app/"）；数据
+            // 目录就绪——~/.workbuddy-ai + auth workbuddy-desktop-ai.info →
+            // mac_supported 放开（原灰度 false 旧稿注释随放开更新）
+            mac_supported: true,
             mac_data_dir_guess: Some("~/.workbuddy-ai"),
-            mac_bundle_ids: &[],
+            mac_bundle_ids: &["com.workbuddy.workbuddy-ai"],
             force_agent_window: false,
             image_ark: None,
         },
@@ -500,6 +562,7 @@ pub fn profile_for(app: TargetApp, app_data_dir: &std::path::Path) -> AppProfile
             // 进程名 "Qoder CN" 与 IDE 壳同名（Work 接管了该进程名）：精确匹配
             // 只停 Work 本体，不 wildcard（"Qoder CN*" 会误杀 Qoder CN IDE）
             proc_names: &["Qoder CN"],
+            mac_proc_names: None,
             proc_patterns: &["Qoder CN"],
             exe_names: &["Qoder CN.exe"],
             lnk_patterns: &["*Qoder*"],
@@ -563,7 +626,11 @@ mod tests {
         ))));
 
         let cb = profile_for(TargetApp::CodeBuddy, &data);
+        // 2026-10-19 mac 双客户端并存实测：Windows proc_names 保持双形态；mac 进程
+        // 匹配经 mac_proc_names 收窄为仅 "CodeBuddy CN"（裸名段命中国际版
+        // CodeBuddy.app 会 SIGTERM 误杀国际版）
         assert_eq!(cb.proc_names, &["CodeBuddy", "CodeBuddy CN"]);
+        assert_eq!(cb.mac_proc_names, Some(&["CodeBuddy CN"][..]));
         assert!(cb.cb_global_storage_dir.is_some());
         // M5/W5（2026-10-16 双客户端并存实测）：CodeBuddy 系共用映像名 "CodeBuddy"
         // 的归属仲裁——国内档案 owner_is_self=false（国际在盘时跳过）、国际档案
@@ -682,32 +749,75 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[test]
-    fn exe_matches_mac_bundle段匹配() {
-        // M-1 侦察 ⑥：mac 主进程可执行名同为 Electron，按路径 bundle 段归属
+    fn exe_matches_mac_bundle段匹配_带bundle_id二次校验() {
+        // M-1 侦察 ⑥：mac 主进程可执行名同为 Electron，按路径 bundle 段归属。
+        // 2026-10-19 缓存投毒修复：段命中后须二次校验 CFBundleIdentifier ∈
+        // mac_bundle_ids（裸名 "CodeBuddy" 段恰是并存国际版 CodeBuddy.app）——
+        // 测试改用临时构造 bundle（真实 Info.plist），不再依赖本机真实安装布局
         let data = temp_data();
+        let root = data.join(format!("exe-mac-{}", std::process::id()));
+        let mk = |name: &str, id: &str| {
+            let contents = root.join(name).join("Contents");
+            std::fs::create_dir_all(&contents).unwrap();
+            std::fs::write(
+                contents.join("Info.plist"),
+                format!(
+                    "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+                     <plist version=\"1.0\"><dict><key>CFBundleIdentifier</key>\
+                     <string>{id}</string></dict></plist>\n"
+                ),
+            )
+            .unwrap();
+            root.join(name)
+        };
+        let trae_app = mk("Trae CN.app", "cn.trae.app");
+        let solo_app = mk("TRAE SOLO CN.app", "cn.trae.solo");
+        let doubao_app = mk("Doubao.app", "com.bot.pc.doubao");
         let trae = profile_for(TargetApp::Trae, &data);
-        // 主进程：…/Trae CN.app/Contents/MacOS/Electron
+        // 主进程：…/Trae CN.app/Contents/MacOS/Electron（bundle id 在白名单）
+        assert!(exe_matches(&trae_app.join("Contents/MacOS/Electron"), &trae));
+        // Helper 内层 bundle 路径仍归属外层 /Trae CN.app 段 → 归属正确
         assert!(exe_matches(
-            std::path::Path::new("/Applications/Trae CN.app/Contents/MacOS/Electron"),
-            &trae
-        ));
-        // Helper 内层 bundle 路径仍含外层 /Trae CN.app 段 → 归属正确
-        assert!(exe_matches(
-            std::path::Path::new(
-                "/Applications/Trae CN.app/Contents/Frameworks/Trae CN Helper (GPU).app/Contents/MacOS/Trae CN Helper (GPU)"
+            &trae_app.join(
+                "Contents/Frameworks/Trae CN Helper (GPU).app/Contents/MacOS/Trae CN Helper (GPU)"
             ),
             &trae
         ));
         // bundle 根（locate 语义）
-        assert!(exe_matches(std::path::Path::new("/Applications/Trae CN.app"), &trae));
-        // 串台拒绝：退役的 TRAE SOLO CN bundle 不属于 Trae 档案（防旧客户端残留误归属）
-        assert!(!exe_matches(
-            std::path::Path::new("/Applications/TRAE SOLO CN.app/Contents/MacOS/Electron"),
-            &trae
-        ));
-        assert!(!exe_matches(
-            std::path::Path::new("/Applications/Doubao.app/Contents/MacOS/Electron"),
-            &trae
-        ));
+        assert!(exe_matches(&trae_app, &trae));
+        // 串台拒绝：段不命中（退役 TRAE SOLO CN bundle 名不含 "/trae cn.app" 段）
+        assert!(!exe_matches(&solo_app.join("Contents/MacOS/Electron"), &trae));
+        // 串台拒绝：段不命中（豆包 bundle）
+        assert!(!exe_matches(&doubao_app.join("Contents/MacOS/Electron"), &trae));
+
+        // 投毒路径回归（2026-10-19）：国内 CodeBuddy 档案 exe_names 含裸名
+        // "CodeBuddy.exe"，段 "/codebuddy.app" 恰是并存国际版 bundle——id 不在
+        // 白名单必须拒绝；国内 CN bundle id 在白名单放行
+        let cb_intl = mk("CodeBuddy.app", "com.tencent.codebuddy");
+        let cb_cn = mk("CodeBuddy CN.app", "com.tencent.codebuddycn");
+        let cb = profile_for(TargetApp::CodeBuddy, &data);
+        assert!(!exe_matches(&cb_intl.join("Contents/MacOS/Electron"), &cb));
+        assert!(exe_matches(&cb_cn.join("Contents/MacOS/Electron"), &cb));
+
+        // fail-closed：段命中但 Info.plist 不可读（缺文件）→ 拒绝（与 locate
+        // bundle 白名单同语义，防未知身份 bundle 放行）
+        let noid = root.join("other").join("Trae CN.app");
+        std::fs::create_dir_all(noid.join("Contents/MacOS")).unwrap();
+        assert!(!exe_matches(&noid.join("Contents/MacOS/Electron"), &trae));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn 国际双档案_mac灰度_2026_10_19实测放开() {
+        // 2026-10-19 本机实测：两国际客户端已装且数据目录就绪（~/.workbuddy-ai、
+        // auth workbuddy-desktop-ai.info、CodeBuddy 国际数据目录）→ mac_supported
+        // 放开（原灰度 false），mac_bundle_ids 补实测值（原空表），run_action
+        // mac 灰度门控（switcher/mod.rs）随之放行
+        let wbai = profile_for(TargetApp::WorkBuddyAI, &temp_data());
+        assert!(wbai.mac_supported, "WorkBuddyAI 2026-10-19 实测后应为 true");
+        assert_eq!(wbai.mac_bundle_ids, &["com.workbuddy.workbuddy-ai"]);
+        let cbai = profile_for(TargetApp::CodeBuddyAI, &temp_data());
+        assert!(cbai.mac_supported, "CodeBuddyAI 2026-10-19 实测后应为 true");
+        assert_eq!(cbai.mac_bundle_ids, &["com.tencent.codebuddy"]);
     }
 }

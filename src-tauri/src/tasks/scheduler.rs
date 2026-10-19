@@ -121,9 +121,12 @@ const TASKS: &[SchedTask] = &[
 pub fn start(app: AppHandle) {
     std::thread::spawn(move || {
         std::thread::sleep(std::time::Duration::from_secs(90));
+        // 审查 #14：buddy-ai 打卡逐账号连击内存态——跨 tick 存活于调度线程，
+        // 只在调度线程访问（单线程串行 tick），无需加锁
+        let mut buddy_acct_streaks = BuddyAiAcctFailStreaks::default();
         loop {
             let st = app.state::<AppState>();
-            tick(&app, &st);
+            tick(&app, &st, &mut buddy_acct_streaks);
             std::thread::sleep(std::time::Duration::from_secs(60));
         }
     });
@@ -143,10 +146,15 @@ const HOURLY_INTERVAL_MS: i64 = 60 * 60_000;
 /// qoder-sessions-compact 档位：每 6 小时合并一次「当天之前」的会话流水
 /// （当天数据由查询层读时聚合即时呈现，无等待诉求）
 const COMPACT_INTERVAL_HOURS: i64 = 6;
-/// 审查修复（第6项）：buddy-ai 打卡整轮连续全败暂停阈值——失效凭证（封禁/会话失效/
-/// refresh 永久拒绝）触发的整轮失败不可自愈（T7/BL-5「401 可自愈」只覆盖凭证类瞬时
-/// 失效），全天 30min 冷却重试 + 每日首败通知是纯噪声；达阈值当日暂停，次日自动重置
+/// 审查修复（第6项；#14 起按账号粒度累计）：buddy-ai 打卡单账号连续失败轮数暂停
+/// 阈值——失效凭证（封禁/会话失效/refresh 永久拒绝）触发的账号失败不可自愈
+///（T7/BL-5「401 可自愈」只覆盖凭证类瞬时失效），全天 30min 冷却重试 + 每日首败
+/// 通知是纯噪声；单账号连击达阈值当日暂停，次日自动重置
 const BUDDY_AI_CHECKIN_FAIL_STREAK_LIMIT: i64 = 3;
+/// 审查 #16：buddy-ai-renew 全败轮连击当日暂停阈值（与打卡 LIMIT 同值）。
+/// Intl 刷新失败有意不标 needs_relogin（防误杀真实凭证），永久失效账号会每日 +
+/// 每 30 分钟重试——调度侧熔断：连续 3 轮全败当日暂停，次日自动恢复
+const BUDDY_AI_RENEW_FAIL_STREAK_LIMIT: i64 = 3;
 
 /// 单任务的生效调度计划：Skip=关闭；Daily=每日 HH:MM（到点+当日未跑，启动补跑）；
 /// Hourly=每小时（距上次成功执行 ≥1h，无记录=首次立即跑）；
@@ -245,7 +253,12 @@ fn board_platform(key: &str) -> Option<&'static str> {
 
 /// 单轮 tick：按各任务生效调度计划检查触发条件 → 执行
 /// （AppHandle 仅用于看板数据同步成功后的前端事件联动，任务执行本身不依赖）
-fn tick(app: &AppHandle, st: &AppState) {
+/// `buddy_acct_streaks`：buddy-ai 打卡逐账号连击内存态（审查 #14，调度线程独占）
+fn tick(
+    app: &AppHandle,
+    st: &AppState,
+    buddy_acct_streaks: &mut BuddyAiAcctFailStreaks,
+) {
     let now = chrono::Local::now();
     let today = now.format("%Y-%m-%d").to_string();
     let now_hm = now.format("%H:%M").to_string();
@@ -307,7 +320,7 @@ fn tick(app: &AppHandle, st: &AppState) {
         }
         ran_this_tick += 1;
         let outcome = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            run_task(t.key, st, Some(api_runtime.inner()))
+            run_task(t.key, st, Some(api_runtime.inner()), buddy_acct_streaks)
         })) {
             Ok(Ok(v)) => Ok(v),
             Ok(Err(e)) => Err(e),
@@ -324,6 +337,14 @@ fn tick(app: &AppHandle, st: &AppState) {
                     fs_utils::app_log(
                         &st.data_dir,
                         &format!("[调度器] {}（{}）：{}（不记当日已跑，稍后重试）", t.name, trigger, summary),
+                    );
+                } else if v.get("skipped_empty").is_some() {
+                    // 审查 #15：buddy-ai 打卡空轮（本轮无任何账号参与）同样不 mark_run
+                    // ——mark_run 会写 last_run_date=今日，当日新增账号不再被调度
+                    //（补打窗口被吞）。仅记日志；待账号导入后下一 tick 正常执行并记账
+                    fs_utils::app_log(
+                        &st.data_dir,
+                        &format!("[调度器] {}（{}）：{}（空轮不记当日已跑，保留当日补打窗口）", t.name, trigger, summary),
                     );
                 } else {
                     mark_run(st, t.key, &today, &summary);
@@ -454,11 +475,13 @@ fn enabled(st: &AppState, key: &str) -> bool {
 
 /// 执行单个任务（复用 CLI 任务同款实现，进度静默、结果汇总落日志）。
 /// `runtime`：GUI 进程内的网关运行态句柄（tick 经 AppHandle 取得），
-/// 供积分类任务运行中回写池快照（issue #67）；CLI 侧传 None
+/// 供积分类任务运行中回写池快照（issue #67）；CLI 侧传 None。
+/// `buddy_acct_streaks`：buddy-ai 打卡逐账号连击内存态（审查 #14，仅调度线程读写）
 fn run_task(
     key: &str,
     st: &AppState,
     runtime: Option<&std::sync::Mutex<Option<crate::commands::api_server::ApiServerRuntime>>>,
+    buddy_acct_streaks: &mut BuddyAiAcctFailStreaks,
 ) -> Result<Value, String> {
     match key {
         // Trae 每日签到：与 `--task-run checkin` 同款（vault 全账号单轮，状态核验幂等）。
@@ -569,8 +592,10 @@ fn run_task(
         // Buddy 国际版每日活跃打卡（阶段 3b）：抢轮次锁与 UI 路径互斥（skipped_busy
         // 幂等跳过同 wb-checkin）；失败返 Err 交 30 分钟冷却重试（401 可经网关自愈，
         // 不判永久剔除，见下方 T7/BL-5 定调注释）。
-        // 审查修复（第6项）：瞬时失效之外还存在不可自愈的永久失效（封禁/会话失效/
-        // refresh 永久拒绝），连续 ≥3 整轮全败当日暂停，不再全天冷却空转
+        // 审查修复（第6项；#14 改按账号粒度）：瞬时失效之外还存在不可自愈的永久失效
+        //（封禁/会话失效/refresh 永久拒绝）——原「整轮连击」在混合轮（失效账号混在
+        // 健康账号中）永不达阈值，全天 30min 重试空转；#14 起逐账号累计（内存态），
+        // 任一账号连击达阈值当日暂停（复用整轮暂停标记）
         "buddy-ai-checkin" => {
             let Ok(_round) = crate::commands::workbuddy::try_acquire_buddy_ai_round() else {
                 return Ok(json!({ "ok": true, "skipped": "已有 buddy-ai 打卡任务在执行中，本轮跳过", "skipped_busy": true }));
@@ -585,20 +610,48 @@ fn run_task(
             if prev_streak >= BUDDY_AI_CHECKIN_FAIL_STREAK_LIMIT {
                 return Ok(json!({
                     "ok": true,
-                    "skipped": "连续多轮全部失败（疑似凭证永久失效），当日暂停打卡，次日自动恢复",
+                    "skipped": "连续多轮打卡失败（疑似凭证永久失效），当日暂停打卡，次日自动恢复",
                     "skipped_fail_streak": true,
                 }));
             }
+            // 审查 #14：内存态连击跨日清零（kv 门禁靠 date 字段惰性归零，内存态
+            // 以轮次起点日期为准；date == 今日表示连击延续自本轮次之前）
+            if buddy_acct_streaks.date != today {
+                buddy_acct_streaks.date = today.clone();
+                buddy_acct_streaks.map.clear();
+            }
             let mut events: Vec<Value> = Vec::new();
-            let done = super::buddy_ai_checkin::run_checkin_round(st, &mut |ev| events.push(ev.clone()));
+            // runtime 透传（审查 #4）：打卡到账增量回写运行期 buddy_ai_pool
+            let done = super::buddy_ai_checkin::run_checkin_round(
+                st,
+                runtime,
+                &mut |ev| events.push(ev.clone()),
+            );
             let ok_count = done.get("ok").and_then(Value::as_i64).unwrap_or(0);
             let already_count = done.get("already").and_then(Value::as_i64).unwrap_or(0);
             let failed = done.get("failed").and_then(Value::as_i64).unwrap_or(0);
-            // 审查修复（第6项）：轮末更新连击——任一成功（含 already，混合轮亦然）
-            // 清零；全轮失败 +1；两者皆 0（空池空转）不动。值不变不落库，省一次 kv 写
-            let new_streak = buddy_ai_streak_next(prev_streak, ok_count + already_count, failed);
-            if new_streak != prev_streak {
-                buddy_ai_checkin_streak_save(st, &today, new_streak);
+            // 审查 #14：逐账号连击——本轮事件中该账号既无 success 也无 already 则
+            // +1，有则清零；任一账号达阈值 → 当日暂停（复用整轮暂停标记：kv 连击置
+            // 为阈值，后续 tick 门禁 skipped_fail_streak 生效），日志注明失效账号
+            let dead = buddy_ai_acct_streaks_apply(
+                &mut buddy_acct_streaks.map,
+                &events,
+                BUDDY_AI_CHECKIN_FAIL_STREAK_LIMIT as u32,
+            );
+            if !dead.is_empty() {
+                buddy_ai_checkin_streak_save(st, &today, BUDDY_AI_CHECKIN_FAIL_STREAK_LIMIT);
+                let uids = dead.join(", ");
+                crate::fs_utils::app_log(
+                    &st.data_dir,
+                    &format!(
+                        "buddy-ai: 账号 {uids} 连续 {BUDDY_AI_CHECKIN_FAIL_STREAK_LIMIT} 轮打卡失败（疑似永久失效），当日暂停打卡，次日自动恢复"
+                    ),
+                );
+                return Ok(json!({
+                    "ok": true,
+                    "skipped": format!("账号 {uids} 连续多轮打卡失败（疑似永久失效），当日暂停打卡，次日自动恢复"),
+                    "skipped_fail_streak": true,
+                }));
             }
             // 逐账号失败明细落 app_log（与 UI 路径 buddy_ai_checkin_start 同口径）：
             // 定时路径此前只记计数——「2 失败」无原因，180s 超时/401/ACP 挂死不可辨
@@ -694,8 +747,43 @@ fn run_task(
         // Qoder 模型目录同步：与 `--task-run qoder-catalog-sync` 同款（真签名拉
         // model/list → adopt_remote；空池/无凭证空转，网络失败返 Err 冷却重试）
         "qoder-catalog-sync" => super::qoder_catalog::run_task(st),
-        // Buddy 国际版凭证兜底续期（lazy 48h）：无临期账号空转，全失败返 Err 冷却重试
-        "buddy-ai-renew" => crate::commands::workbuddy::buddy_ai_renew_task(st),
+        // Buddy 国际版凭证兜底续期（lazy 48h）：无临期账号空转，全失败返 Err 冷却重试。
+        // 审查 #16：Intl 刷新失败有意不标 needs_relogin（防误杀真实凭证），永久失效
+        // 账号会每日 + 每 30 分钟重试——调度侧熔断：连续 3 轮全败当日暂停（kv 与打卡
+        // 连击同款 {streak, date} 文档，跨日自动归零），成功/空转轮清零连击
+        "buddy-ai-renew" => {
+            let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+            let prev = day_scoped_streak(st, BUDDY_AI_RENEW_STREAK_KEY, &today);
+            if prev >= BUDDY_AI_RENEW_FAIL_STREAK_LIMIT {
+                return Ok(json!({
+                    "ok": true,
+                    "skipped": "buddy-ai 续期连续多轮全部失败，当日暂停续期，次日自动恢复",
+                    "skipped_fail_streak": true,
+                }));
+            }
+            match crate::commands::workbuddy::buddy_ai_renew_task(st) {
+                Err(e) => {
+                    let next = prev + 1;
+                    day_scoped_streak_save(st, BUDDY_AI_RENEW_STREAK_KEY, &today, next);
+                    if next >= BUDDY_AI_RENEW_FAIL_STREAK_LIMIT {
+                        fs_utils::app_log(
+                            &st.data_dir,
+                            &format!(
+                                "buddy-ai: 凭证续期连续 {next} 轮全部失败（{e}），当日暂停续期，次日自动恢复"
+                            ),
+                        );
+                    }
+                    Err(e)
+                }
+                Ok(v) => {
+                    // 成功（含「无临期账号」空转轮）清零连击；值不变不写库
+                    if prev != 0 {
+                        day_scoped_streak_save(st, BUDDY_AI_RENEW_STREAK_KEY, &today, 0);
+                    }
+                    Ok(v)
+                }
+            }
+        }
         // Buddy 国际版积分数据同步（get-user-resource 全池取数 → 池回写 + 快照）：
         // 空池自然空转；runtime 传网关运行态（运行池三键拨新，issue #109 同类）。
         // 顺带官网用量聚合刷新（force 跳过 10min 缓存，国内 wb-credits-snapshot 同款）——
@@ -862,43 +950,95 @@ fn retry_cooldown_ms(st: &AppState, key: &str) -> i64 {
     RETRY_COOLDOWN_MS << shift
 }
 
-// ── 审查修复（第6项）：buddy-ai 打卡整轮失败连击（kv 持久化，跨日重置）────────
+// ── 审查修复（第6项）+ #14/#16：buddy-ai 打卡/续期失败连击 ──────────────────
 // scheduler_state 的 fail_streak 服务于退避冷却且被 mark_run 整体覆盖清零，无法表达
-// 「跨冷却周期的连续整轮失败」，故用独立 kv 文档承载（阈值见
-// BUDDY_AI_CHECKIN_FAIL_STREAK_LIMIT）
+// 「跨冷却周期的连续失败」，故用独立 kv 文档承载（阈值见
+// BUDDY_AI_CHECKIN_FAIL_STREAK_LIMIT / BUDDY_AI_RENEW_FAIL_STREAK_LIMIT）。
+// #14 起打卡连击改为逐账号内存态累计（BuddyAiAcctFailStreaks），kv 文档退化为
+// 「当日暂停闩锁」：任一账号连击达阈值时置为 LIMIT，后续 tick 门禁据此跳过
 
-/// kv 键：`{ "streak": 连续整轮全败次数, "date": 计数日期 }`——计数与日期同文档
-/// 单次 kv_set 写入（无半写分叉）；跨日（date ≠ 今日）读时惰性归零
+/// 逐账号连击内存态（审查 #14）：uid → 连续失败轮数；date 门槛跨日清零
+///（内存态无日期字段，以最近一次打卡轮的日期为准；仅调度线程访问，无需加锁）
+#[derive(Default)]
+struct BuddyAiAcctFailStreaks {
+    date: String,
+    map: std::collections::HashMap<String, u32>,
+}
+
+/// 通用当日连击 kv：`{ "streak": 连续失败次数, "date": 计数日期 }`——计数与日期
+/// 同文档单次 kv_set 写入（无半写分叉）；跨日（date ≠ 今日）读时惰性归零
 const BUDDY_AI_CHECKIN_STREAK_KEY: &str = "buddy_ai_checkin_fail_streak";
+/// 审查 #16：buddy-ai-renew 全败轮连击 kv 键（与打卡连击同款文档，独立计数互不干扰）
+const BUDDY_AI_RENEW_STREAK_KEY: &str = "buddy_ai_renew_fail_streak";
 
-/// 读当前连击数：date ≠ 今日（跨日/无记录/损坏）→ 从 0 起；date == 今日 → 计数值
-fn buddy_ai_checkin_streak(st: &AppState, today: &str) -> i64 {
-    let v: Value = crate::store::db(&st.data_dir).kv_get(BUDDY_AI_CHECKIN_STREAK_KEY);
+/// 读当日连击：date ≠ 今日（跨日/无记录/损坏）→ 从 0 起；date == 今日 → 计数值
+fn day_scoped_streak(st: &AppState, kv_key: &str, today: &str) -> i64 {
+    let v: Value = crate::store::db(&st.data_dir).kv_get(kv_key);
     if v.get("date").and_then(Value::as_str) != Some(today) {
         return 0;
     }
     v.get("streak").and_then(Value::as_i64).unwrap_or(0).max(0)
 }
 
-/// 持久化连击数（计数与日期同一把 kv 写入）。落库失败静默：连击丢失仅回到
+/// 持久化当日连击（计数与日期同一把 kv 写入）。落库失败静默：连击丢失仅回到
 /// 多试几轮的自愈起点，无重试风暴/重复执行风险（严重度远低于 write_entry 的 C6）
-fn buddy_ai_checkin_streak_save(st: &AppState, today: &str, streak: i64) {
+fn day_scoped_streak_save(st: &AppState, kv_key: &str, today: &str, streak: i64) {
     let _ = crate::store::db(&st.data_dir).kv_set(
-        BUDDY_AI_CHECKIN_STREAK_KEY,
+        kv_key,
         &json!({ "streak": streak, "date": today }),
     );
 }
 
-/// 纯函数：按本轮 成功数（含 already）/失败数 推导新连击值（独立便于单测）。
-/// 任一成功（含 already）→ 清零；混合轮不计数（随任一成功一并清零，绝不 +1）；
-/// 全轮失败 → +1；两者皆 0（空池空转）→ 原值不动
-fn buddy_ai_streak_next(prev: i64, ok_count: i64, failed_count: i64) -> i64 {
-    if ok_count > 0 {
+/// buddy-ai 打卡连击 kv 门禁读写包装（沿用旧键名，升级前的持久化数据自然延续）
+fn buddy_ai_checkin_streak(st: &AppState, today: &str) -> i64 {
+    day_scoped_streak(st, BUDDY_AI_CHECKIN_STREAK_KEY, today)
+}
+
+fn buddy_ai_checkin_streak_save(st: &AppState, today: &str, streak: i64) {
+    day_scoped_streak_save(st, BUDDY_AI_CHECKIN_STREAK_KEY, today, streak);
+}
+
+/// 纯函数（审查 #14）：按本轮事件聚合逐账号连击表，返回达阈值的失效账号 uid。
+/// 事件中该账号既无 success 也无 already → +1，有则清零；不在本轮事件中的账号
+/// 不动。原「整轮连击任一成功清零」语义（buddy_ai_streak_next）在混合轮失效：
+/// 永久失效账号混在健康账号中时连击永不累计，全天 30 分钟重试空转、当日暂停
+/// 永不触发——故改按账号粒度（独立纯函数便于单测）
+fn buddy_ai_acct_streaks_apply(
+    map: &mut std::collections::HashMap<String, u32>,
+    events: &[Value],
+    limit: u32,
+) -> Vec<String> {
+    let mut dead: Vec<String> = Vec::new();
+    for e in events {
+        let Some(uid) = e.get("id").and_then(Value::as_str) else {
+            continue;
+        };
+        if uid.is_empty() {
+            continue;
+        }
+        let ok = matches!(
+            e.get("status").and_then(Value::as_str),
+            Some("success") | Some("already")
+        );
+        let next = buddy_ai_acct_streak_next(map.get(uid).copied().unwrap_or(0), ok);
+        if next == 0 {
+            map.remove(uid);
+        } else {
+            map.insert(uid.to_string(), next);
+            if next >= limit {
+                dead.push(uid.to_string());
+            }
+        }
+    }
+    dead
+}
+
+/// 纯函数（审查 #14）：单账号连击推导——本轮 success/already 清零，否则 +1
+fn buddy_ai_acct_streak_next(prev: u32, ok: bool) -> u32 {
+    if ok {
         0
-    } else if failed_count > 0 {
-        prev + 1
     } else {
-        prev
+        prev + 1
     }
 }
 
@@ -1292,27 +1432,71 @@ mod tests {
         assert_eq!(retry_cooldown_ms(&st, key), 60 * 60_000);
     }
 
-    // ── 审查修复（第6项）：buddy-ai 打卡整轮失败连击 ──────────────────────────
+    // ── 审查修复（第6项）+ #14/#16：buddy-ai 打卡/续期失败连击 ──────────────────
 
-    /// 连击纯函数：任一成功（含 already）清零；全轮失败 +1；混合轮不计数（随任一
-    /// 成功清零，绝不 +1）；两者皆 0（空池空转）原值不动
+    /// 连击纯函数（#14 新语义）：单账号粒度——本轮 success/already 清零，否则 +1。
+    /// 原 buddy_ai_streak_next（整轮粒度、任一成功即清零）单测固化「混合轮清零」，
+    /// 但该语义使永久失效账号混在健康账号中时连击永不达阈值（全天 30 分钟重试
+    /// 空转、当日暂停永不触发）——按账号粒度重写：混合轮中失效账号照常累计，
+    /// 健康账号照常清零，互不影响
     #[test]
-    fn buddy_ai_streak_next_rules() {
-        // 全轮失败：+1
-        assert_eq!(buddy_ai_streak_next(0, 0, 2), 1);
-        assert_eq!(buddy_ai_streak_next(2, 0, 1), 3);
-        // 任一成功（含 already）：清零
-        assert_eq!(buddy_ai_streak_next(2, 1, 0), 0);
-        // 混合（部分成功）：不计数——按「任一成功清零」归零，绝不 +1
-        assert_eq!(buddy_ai_streak_next(2, 1, 1), 0);
-        assert_eq!(buddy_ai_streak_next(2, 3, 2), 0);
-        // 两者皆 0（空池空转）：原值不动
-        assert_eq!(buddy_ai_streak_next(4, 0, 0), 4);
-        assert_eq!(buddy_ai_streak_next(0, 0, 0), 0);
+    fn buddy_ai_acct_streak_next_rules() {
+        // 失败：+1
+        assert_eq!(buddy_ai_acct_streak_next(0, false), 1);
+        assert_eq!(buddy_ai_acct_streak_next(2, false), 3);
+        // 本轮 success/already：清零
+        assert_eq!(buddy_ai_acct_streak_next(2, true), 0);
+        assert_eq!(buddy_ai_acct_streak_next(0, true), 0);
+    }
+
+    /// 连击聚合（#14）：混合轮中失效账号逐轮累计至阈值并列入 dead，健康账号
+    /// 同轮清零互不影响；连击中断（恢复成功）后重新从 0 累计
+    #[test]
+    fn buddy_ai_acct_streaks_apply_mixed_rounds() {
+        let mut map = std::collections::HashMap::new();
+        let ev = |id: &str, status: &str| {
+            json!({ "id": id, "status": status })
+        };
+        // 第 1 轮：A 失败、B 成功 → A=1、B 移除
+        let dead = buddy_ai_acct_streaks_apply(
+            &mut map,
+            &[ev("A", "fail"), ev("B", "success")],
+            BUDDY_AI_CHECKIN_FAIL_STREAK_LIMIT as u32,
+        );
+        assert!(dead.is_empty());
+        assert_eq!(map.get("A"), Some(&1));
+        assert!(!map.contains_key("B"), "健康账号不留在连击表");
+        // 第 2 轮：A 再失败 → A=2；同轮 C already（混合轮失效账号仍累计——旧
+        // 整轮语义在此轮清零，正是 #14 修复点）
+        let dead = buddy_ai_acct_streaks_apply(
+            &mut map,
+            &[ev("A", "fail"), ev("C", "already")],
+            BUDDY_AI_CHECKIN_FAIL_STREAK_LIMIT as u32,
+        );
+        assert!(dead.is_empty());
+        assert_eq!(map.get("A"), Some(&2));
+        // 第 3 轮：A 三连败达阈值 → 进 dead；B 成功事件照常清零
+        let dead = buddy_ai_acct_streaks_apply(
+            &mut map,
+            &[ev("A", "fail"), ev("B", "success")],
+            BUDDY_AI_CHECKIN_FAIL_STREAK_LIMIT as u32,
+        );
+        assert_eq!(dead, vec!["A".to_string()]);
+        // 恢复成功：连击清零，不再进 dead
+        let dead = buddy_ai_acct_streaks_apply(&mut map, &[ev("A", "success")], 3);
+        assert!(dead.is_empty());
+        assert!(!map.contains_key("A"));
+        // 事件缺 id / 空 id：跳过不计
+        let dead = buddy_ai_acct_streaks_apply(
+            &mut map,
+            &[json!({ "status": "fail" }), ev("", "fail")],
+            1,
+        );
+        assert!(dead.is_empty());
     }
 
     /// 连击 kv 持久化 + 跨日重置：date == 今日读回计数值；date ≠ 今日（跨日）从 0 起；
-    /// 无记录/损坏文档兜底 0
+    /// 无记录/损坏文档兜底 0（打卡与 renew 各自独立键位，#16）
     #[test]
     fn buddy_ai_checkin_streak_persist_and_day_reset() {
         let st = temp_state("buddy_streak");
@@ -1342,11 +1526,36 @@ mod tests {
         let st = temp_state("buddy_gate");
         let today = chrono::Local::now().format("%Y-%m-%d").to_string();
         buddy_ai_checkin_streak_save(&st, &today, BUDDY_AI_CHECKIN_FAIL_STREAK_LIMIT);
-        let v = run_task("buddy-ai-checkin", &st, None).expect("门禁跳过应为 Ok");
+        let v = run_task("buddy-ai-checkin", &st, None, &mut BuddyAiAcctFailStreaks::default())
+            .expect("门禁跳过应为 Ok");
         assert_eq!(v.get("skipped_fail_streak").and_then(Value::as_bool), Some(true));
         assert!(
             v.get("skipped").and_then(Value::as_str).unwrap_or("").contains("当日暂停"),
             "跳过文案应说明当日暂停语义"
         );
+    }
+
+    /// 审查 #16：buddy-ai-renew 全败轮连击熔断——Err 轮逐次累计，达阈值后门禁
+    /// 返回 skipped_fail_streak 当日暂停（不执行续期轮）；成功/空转轮清零连击
+    #[test]
+    fn buddy_ai_renew_streak_circuit_breaker() {
+        let st = temp_state("buddy_renew_cb");
+        let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+        // 前两轮全败（模拟：直接写连击值，覆盖 Err 分支的 save 语义）
+        day_scoped_streak_save(&st, BUDDY_AI_RENEW_STREAK_KEY, &today, 2);
+        // 第 3 轮全败：Err 分支累计至 3（门禁阈值）——此后暂停
+        //（不实际执行续期轮：空池 renew 返回 Ok(skipped)，此处仅验连击语义）
+        day_scoped_streak_save(&st, BUDDY_AI_RENEW_STREAK_KEY, &today, 3);
+        assert_eq!(day_scoped_streak(&st, BUDDY_AI_RENEW_STREAK_KEY, &today), 3);
+        // 达阈值 → 门禁跳过（Ok + skipped_fail_streak，不执行任务体）
+        let v = run_task("buddy-ai-renew", &st, None, &mut BuddyAiAcctFailStreaks::default())
+            .expect("熔断门禁应为 Ok");
+        assert_eq!(v.get("skipped_fail_streak").and_then(Value::as_bool), Some(true));
+        // 成功/空转轮清零：Ok 分支 prev != 0 时写 0
+        day_scoped_streak_save(&st, BUDDY_AI_RENEW_STREAK_KEY, &today, 0);
+        assert_eq!(day_scoped_streak(&st, BUDDY_AI_RENEW_STREAK_KEY, &today), 0);
+        // 与打卡连击键位隔离：renew 连击不影响打卡门禁读数
+        day_scoped_streak_save(&st, BUDDY_AI_RENEW_STREAK_KEY, &today, 3);
+        assert_eq!(buddy_ai_checkin_streak(&st, &today), 0);
     }
 }

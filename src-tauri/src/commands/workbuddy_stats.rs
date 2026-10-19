@@ -1060,7 +1060,10 @@ pub(crate) fn buddy_ai_token_stats_impl(state: &AppState, fresh: bool) -> Value 
         }
     }
     let t = Instant::now();
-    let home = std::env::var("USERPROFILE").unwrap_or_default();
+    // #5（macOS 适配）：USERPROFILE 为 Windows 专属环境变量，macOS 恒不存在 →
+    // home="" → 扫描根退化为相对 CWD 的 .workbuddy-ai/projects，本地 Token 统计
+    // 静默恒零。对齐国内 workbuddy_token_stats_impl 改 crate::platform::home_dir()
+    let home = crate::platform::home_dir();
     let cutoff = cutoff_date_str();
     // 重扫体持表级互斥（对齐国内 workbuddy_token_stats_impl）：async 命令并发
     // （Tab 打开 + 手动重扫）load→scan→save 无锁会互相覆盖丢增量文件条目
@@ -1068,13 +1071,19 @@ pub(crate) fn buddy_ai_token_stats_impl(state: &AppState, fresh: bool) -> Value 
     let mut cache: HashMap<String, FileCacheEntry> =
         crate::store::db(&state.data_dir).kv_get("buddy_ai_token_stats_files");
     let mut seen: HashSet<String> = HashSet::new();
+    let scan_root_path = home.join(".workbuddy-ai").join("projects");
     let mut v = scan_root(
-        &Path::new(&home).join(".workbuddy-ai").join("projects"),
+        &scan_root_path,
         "workbuddy-ai",
         &cutoff,
         &mut cache,
         &mut seen,
     );
+    // 扫描根不存在（客户端未安装/未产生会话）→ 全零结果易被误读为「无用量」，
+    // 附 reason 字段便于排查（对齐 buddy_ai_local_scan 的 reason 口径）
+    if !scan_root_path.is_dir() {
+        v["scanned_reason"] = json!("root_missing");
+    }
     // 已删除文件的缓存条目清理（对齐国内）：否则旧 jsonl 的缓存条目永驻 kv 无限增长
     cache.retain(|k, _| seen.contains(k));
     let _ = crate::store::db(&state.data_dir).kv_set("buddy_ai_token_stats_files", &cache);

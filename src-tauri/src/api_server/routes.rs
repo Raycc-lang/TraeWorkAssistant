@@ -104,30 +104,45 @@ fn internal_error_response() -> Response {
         .unwrap()
 }
 
+/// 模型来源域（issue #11）：WB 双目录查表结论——/v1/responses 分流按域判定，
+/// 不再仅凭 wb/buddy-ai 开关（Intl 专属 id 投 CN 上游、CN 专属 id 投 Intl 上游
+/// 都会因对端无此模型而 4001 轮询耗尽）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WbOrigin {
+    /// 仅 CN 目录收录：仅 Buddy(CN) 池可服务
+    CnOnly,
+    /// 仅 Intl 目录收录：仅 buddy-ai 池可服务
+    IntlOnly,
+    /// CN+Intl 双收录：两池皆可，按开关分流（wb 优先、buddy-ai 兜底）
+    Both,
+}
+
 /// T5.2/F-61 四段模型路由解析（别名→规则→系列通配→后缀）+ T5.6③ 后台任务降级。
-/// 返回 (最终模型, 路由级 effort 注入提示)；全未命中目录 → None（走 SOLO 上游）。
+/// 返回 (最终模型, 路由级 effort 注入提示, 来源域)；全未命中目录 → None（走 SOLO 上游）。
 fn resolve_wb_target(
     state: &ApiSharedState,
     model: &str,
     body: &Value,
-) -> Option<(String, Option<String>)> {
+) -> Option<(String, Option<String>, WbOrigin)> {
     let cfg = wb_model_route::load_config(&state.data_dir);
     let catalog = wb_catalog::load(&state.data_dir);
     let r = wb_model_route::resolve(&cfg, &catalog, model);
     // Intl 目录动态化（2026-10-15）：动态抓取结果优先，缺失回落内置静态表
     let intl_catalog = wb_catalog::buddy_ai_load(&state.data_dir);
     // 审查修复：CN 目录未命中并查 Intl 目录（/v1/responses 同 dispatch 源判定，
-    // Intl 专属 id 如 deepseek-v4.1-flash 不得 404）；Intl 专属命中跳过 CN 目录降级
-    //（降级候选发往 buddy-ai 池上游不存在）
-    let intl_only = wb_catalog::find(&catalog, &r.model).is_none()
-        && (wb_catalog::find(&intl_catalog, &r.model).is_some()
-            || wb_catalog::find(&intl_catalog, model).is_some());
-    if wb_catalog::find(&catalog, &r.model).is_none()
-        && wb_catalog::find(&intl_catalog, &r.model).is_none()
-        && wb_catalog::find(&intl_catalog, model).is_none()
-    {
-        return None;
-    }
+    // Intl 专属 id 如 deepseek-v4.1-flash 不得 404）；issue #11：来源域随命中
+    // 结论一并返回，供端点按域分流
+    let found_wb = wb_catalog::find(&catalog, &r.model).is_some();
+    let found_intl = wb_catalog::find(&intl_catalog, &r.model).is_some()
+        || wb_catalog::find(&intl_catalog, model).is_some();
+    let origin = match (found_wb, found_intl) {
+        (true, true) => WbOrigin::Both,
+        (true, false) => WbOrigin::CnOnly,
+        (false, true) => WbOrigin::IntlOnly,
+        (false, false) => return None,
+    };
+    // Intl 专属命中跳过 CN 目录降级（降级候选发往 buddy-ai 池上游不存在）
+    let intl_only = !found_wb;
     // T5.6③ 后台任务降级（显式开启才生效）：标题/摘要类短请求 → 目录最低倍率模型；
     // F-76④ 长上下文降档：输入粗估超阈值 → flash 档模型。
     // issue #26 白名单感知：降级候选 ∩ 白名单为空则跳过降级（原模型已过端点准入）
@@ -147,7 +162,7 @@ fn resolve_wb_target(
     } else {
         r.model
     };
-    Some((final_model, r.effort_hint))
+    Some((final_model, r.effort_hint, origin))
 }
 
 /// T5.3/F-62 默认深度思考：客户端未显式请求 effort 且无路由级提示时默认 high。
@@ -285,8 +300,21 @@ fn inject_trae_outbound(
 }
 
 /// 模型级冷却快速失败（T2.7/F-34：优先级高于 Key 级）
-fn model_cooling_response(state: &ApiSharedState, model: &str, proto: Protocol) -> Response {
-    let rem = wb_route::model_cooling_remaining_wb(state, model).unwrap_or(0);
+/// issue #21：剩余秒数按档位取对应冷却表——buddy-ai 档读 Intl 独立表
+///（WbView::intl → buddy_ai_model_cooldowns），此前恒用 CN 表（model_cooling_
+/// remaining_wb）导致 buddy-ai 模型 429 文案恒为 retry after 0s
+fn model_cooling_response(
+    state: &std::sync::Arc<ApiSharedState>,
+    model: &str,
+    proto: Protocol,
+    buddy_ai: bool,
+) -> Response {
+    let rem = if buddy_ai {
+        wb_route::model_cooling_remaining(&wb_route::WbView::intl(state.clone()), model)
+            .unwrap_or(0)
+    } else {
+        wb_route::model_cooling_remaining_wb(state, model).unwrap_or(0)
+    };
     let msg = format!("model {} cooling down, retry after {}s", model, rem);
     match proto {
         Protocol::Anthropic => anthropic_error(StatusCode::TOO_MANY_REQUESTS, "rate_limit_error", &msg),
@@ -848,11 +876,11 @@ pub async fn chat_completions(
         ),
         Ok(r) => match r.pool {
             // buddy-ai（阶段 2）：与 Buddy 档共用执行内核，视图按池分流
-            // 审查修复备案：/v1/chat 与 /v1/responses 的 Intl 分流存在已知不对称——
-            // 本路径 Intl 专属模型（buddy_intl_only）经 dispatch available 门控
-            // （Buddy(CN) 池不服务该模型）走 buddy-ai 国际池，而 /v1/responses 在
-            // wb 开启时会把同模型投 CN 上游；与蓝本同位一致，属有意设计——
-            // 若要统一需改 resolve_wb_target 签名波及多处调用，暂不处理。
+            // Intl 分流对称性（issue #11 已实现）：本路径 Intl 专属模型经 dispatch
+            // available 门控（Buddy(CN) 池不服务该模型）走 buddy-ai 国际池；
+            // /v1/responses 已同步改为来源域分流（resolve_wb_target 返回 WbOrigin，
+            // Intl 专属 → buddy-ai 路径、CN 专属 → wb 路径、双收录按开关），
+            // 两端点不再存在「wb 开启时 Intl 专属投 CN 上游」的不对称
             TargetPool::Buddy | TargetPool::BuddyAi => {
                 // T5.3 默认深度思考：客户端未带 reasoning_effort 时注入 high
                 let explicit = peek.get("reasoning_effort").and_then(|v| v.as_str()).is_some();
@@ -969,7 +997,7 @@ pub async fn responses_api(
     let guard = state.inflight_guard();
 
     // T5.2/F-61 四段路由解析（Responses 仅支持 WB 上游模型）
-    let (resolved_model, route_hint) = match resolve_wb_target(&state, &model, &chat_body) {
+    let (resolved_model, route_hint, origin) = match resolve_wb_target(&state, &model, &chat_body) {
         Some(t) => t,
         None => {
             return openai_error(
@@ -982,23 +1010,45 @@ pub async fn responses_api(
             );
         }
     };
-    // buddy-ai（阶段 2）：wb 档关闭且国际档开启时走国际池（与 /v1/chat 的
-    // priority 语义一致：buddy 优先、buddy-ai 兜底；wb 开时保持现状 CN 路径）
-    // 审查修复备案：/v1/responses 与 /v1/chat 的 Intl 分流存在已知不对称——wb 开启时
-    // Intl 专属模型（buddy_intl_only；/v1/chat 经 dispatch available 门控不走 CN 池）
-    // 在此处因 `buddy_ai = !wb_enabled && buddy_ai_enabled` 可能投给 CN 上游；
-    // 与蓝本同位一致，属有意设计——若要统一需改 resolve_wb_target 签名波及多处调用，暂不处理。
     let wb_enabled = state.wb_enabled.load(std::sync::atomic::Ordering::Relaxed);
     let buddy_ai_enabled = state
         .buddy_ai_enabled
         .load(std::sync::atomic::Ordering::Relaxed);
-    let buddy_ai = !wb_enabled && buddy_ai_enabled;
-    if !wb_enabled && !buddy_ai_enabled {
-        return openai_error(
-            StatusCode::BAD_REQUEST,
-            "wb_upstream_disabled",
-            "WB 上游未启用（api_pool.json wb_enabled）",
-        );
+    // buddy-ai（阶段 2）分流——issue #11：按模型来源域判定（此前仅看开关）：
+    // Intl 专属模型无论 wb 开关一律走 buddy-ai 路径（CN 上游无该 id，投 CN 池会
+    // 4001 轮询耗尽）；CN 专属一律走 wb 路径（Intl 上游亦无 CN 专属 id）；双收录
+    // 模型维持既有开关语义（wb 优先、buddy-ai 兜底）。与 /v1/chat dispatch
+    // available 门控同口径：Buddy 池拒 Intl 专属、BuddyAi 池放行 Intl 专属与双收录
+    let buddy_ai = match origin {
+        WbOrigin::IntlOnly => true,
+        WbOrigin::CnOnly => false,
+        WbOrigin::Both => !wb_enabled && buddy_ai_enabled,
+    };
+    // 上游开关校验随域走（"关闭"与"不可用"是两个概念，§4.3 同语义）：目标域上游
+    // 未启用时显式 400，不静默投给另一域（另一域无此模型 id，只会 4001 轮询耗尽）
+    match origin {
+        WbOrigin::CnOnly if !wb_enabled => {
+            return openai_error(
+                StatusCode::BAD_REQUEST,
+                "wb_upstream_disabled",
+                "WB 上游未启用（api_pool.json wb_enabled）",
+            );
+        }
+        WbOrigin::IntlOnly if !buddy_ai_enabled => {
+            return openai_error(
+                StatusCode::BAD_REQUEST,
+                "buddy_ai_upstream_disabled",
+                "buddy-ai 上游未启用（api_pool.json buddy_ai_enabled）",
+            );
+        }
+        WbOrigin::Both if !wb_enabled && !buddy_ai_enabled => {
+            return openai_error(
+                StatusCode::BAD_REQUEST,
+                "wb_upstream_disabled",
+                "WB 上游未启用（api_pool.json wb_enabled）",
+            );
+        }
+        _ => {}
     }
     {
         let view = if buddy_ai {
@@ -1007,7 +1057,9 @@ pub async fn responses_api(
             wb_route::WbView::wb(state.clone())
         };
         if wb_route::model_cooling_remaining(&view, &resolved_model).is_some() {
-            return model_cooling_response(&state, &resolved_model, Protocol::Responses);
+            // issue #21：档位随分流传入，429 剩余秒数取同档冷却表
+            //（buddy-ai 档 = Intl 独立表，与上方 view 感知判定同源）
+            return model_cooling_response(&state, &resolved_model, Protocol::Responses, buddy_ai);
         }
     }
 

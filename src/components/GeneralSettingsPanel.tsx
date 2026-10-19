@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react';
 import { Save, RotateCcw, Bell, Send } from 'lucide-react';
-import { useAppStore } from '../store';
+import { useAppStore, BUDDY_AI_VIS_DECIDED_KEY } from '../store';
 import { withMinDelay } from '../lib/delay';
 import { api } from '../lib/tauri';
 import { THEMES } from '../lib/themes';
@@ -222,9 +222,16 @@ export default function GeneralSettingsPanel() {
                       type="checkbox"
                       checked={visible}
                       disabled={pinned}
-                      onChange={() =>
-                        isBuddyAi ? update('buddy_ai_visible', !(form.buddy_ai_visible === true)) : toggleAppVisible(tab.key)
-                      }
+                      onChange={() => {
+                        if (isBuddyAi) {
+                          // 用户显式选择 buddy-ai 可见性即落 decided 标记：store 的一次性
+                          // 自动放开逻辑此后永久退避，不与用户显式选择打架
+                          localStorage.setItem(BUDDY_AI_VIS_DECIDED_KEY, '1');
+                          update('buddy_ai_visible', !(form.buddy_ai_visible === true));
+                        } else {
+                          toggleAppVisible(tab.key);
+                        }
+                      }}
                     />
                     {tab.label}
                     {pinned ? <span className="text-xs text-slate-400">（固定应用，不可隐藏）</span> : null}
