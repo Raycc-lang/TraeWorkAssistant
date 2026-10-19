@@ -359,12 +359,6 @@ pub fn buddy_ai_account_import_creds(
         .and_then(|t| t.get(&target_id))
         .cloned()
         .unwrap_or_default();
-    // L2 修复：持锁后复查账号仍在池中——导入「先落池后落凭证」与并发删除号
-    // 之间存在竞态（删号只删池、不回收 token 行），防止写入幽灵凭证行
-    // （孤儿 rec 永驻 store 且后续 credits_sync 会读到）
-    if !load_pool(&state).accounts.iter().any(|a| a.id == target_id) {
-        return Err(format!("账号 {target_id} 已被移除，取消凭证写入"));
-    }
     let new_rt = refresh_token.as_deref().filter(|t| !t.trim().is_empty());
     let old_rt = existing.get("refresh_token").and_then(Value::as_str);
     let mut creds = json!({

@@ -72,6 +72,9 @@ export default function BuddyAiApiService() {
   // 调度参数最近一次落库值（审查修复 P3 同源：onBlur 未改动不重复保存——原实现每次
   // 失焦都触发 poolSet + 「已保存」toast，用户仅点击路过输入框也会弹保存噪音）
   const savedParamsRef = useRef<Record<string, number>>({});
+  // 分组/标签 chip 乐观回滚序号门控（审查修复：慢败旧操作的失败回滚不得覆盖
+  // 其后已成功落库并回读的新状态——每次乐观 set 递增序号，回滚仅当序号未变时执行）
+  const scopeSeqRef = useRef(0);
 
   const refreshCatalog = useCallback(async () => {
     const [cat, unified] = await Promise.all([
@@ -168,6 +171,8 @@ export default function BuddyAiApiService() {
     // M10b：分组/标签 chip 是独立 state，失败回滚需各自的调用时快照
     const prevGroups = poolGroupScope;
     const prevTags = poolTagScope;
+    // 序号门控：入口记录当前序号，回滚仅当此后无新的乐观 set（序号未变）时执行
+    const seqAtCall = scopeSeqRef.current;
     setFlags(next);
     try {
       await withMinDelay(
@@ -195,9 +200,10 @@ export default function BuddyAiApiService() {
       }
       setFlags(revert);
       // M10b 修复：chip 乐观高亮随本次 patch 回滚（原只回滚 flags，chip 保持
-      // 高亮但后端未落库，展示与实际状态分叉）
-      if (next.buddyAiGroupIds !== undefined) setPoolGroupScope(prevGroups);
-      if (next.buddyAiTagIds !== undefined) setPoolTagScope(prevTags);
+      // 高亮但后端未落库，展示与实际状态分叉）；序号门控防止慢败回滚覆盖
+      // 其后已成功的乐观 set（审查修复）
+      if (next.buddyAiGroupIds !== undefined && scopeSeqRef.current === seqAtCall) setPoolGroupScope(prevGroups);
+      if (next.buddyAiTagIds !== undefined && scopeSeqRef.current === seqAtCall) setPoolTagScope(prevTags);
       pushToast('error', `保存失败：${String(err).slice(0, 160)}`);
       return false;
     } finally {
@@ -420,11 +426,13 @@ export default function BuddyAiApiService() {
                           const next = active
                             ? poolGroupScope.filter((x) => x !== g.id)
                             : [...poolGroupScope, g.id];
-                          // 审查修复（L28）：调用前捕获快照，保存失败按 patch 回滚乐观高亮
+                          // 审查修复（L28）：调用前捕获快照，保存失败按 patch 回滚乐观高亮；
+                          // 序号门控防止慢败回滚覆盖其后已成功的乐观 set
                           const prev = poolGroupScope;
+                          const mySeq = ++scopeSeqRef.current;
                           setPoolGroupScope(next);
                           void saveFlags({ ...flags, buddyAiGroupIds: next }).then((ok) => {
-                            if (!ok) setPoolGroupScope(prev);
+                            if (!ok && scopeSeqRef.current === mySeq) setPoolGroupScope(prev);
                           });
                         }}
                       >
@@ -436,11 +444,13 @@ export default function BuddyAiApiService() {
                     <button
                       className="btn-ghost px-1.5 py-0.5 text-[11px] text-slate-400"
                       onClick={() => {
-                        // 审查修复（L28）：调用前捕获快照，保存失败按 patch 回滚乐观高亮
+                        // 审查修复（L28）：调用前捕获快照，保存失败按 patch 回滚乐观高亮；
+                        // 序号门控防止慢败回滚覆盖其后已成功的乐观 set
                         const prev = poolGroupScope;
+                        const mySeq = ++scopeSeqRef.current;
                         setPoolGroupScope([]);
                         void saveFlags({ ...flags, buddyAiGroupIds: [] }).then((ok) => {
-                          if (!ok) setPoolGroupScope(prev);
+                          if (!ok && scopeSeqRef.current === mySeq) setPoolGroupScope(prev);
                         });
                       }}
                     >
@@ -468,11 +478,13 @@ export default function BuddyAiApiService() {
                             const next = active
                               ? poolTagScope.filter((x) => x !== t.id)
                               : [...poolTagScope, t.id];
-                            // 审查修复（L28）：调用前捕获快照，保存失败按 patch 回滚乐观高亮
+                            // 审查修复（L28）：调用前捕获快照，保存失败按 patch 回滚乐观高亮；
+                            // 序号门控防止慢败回滚覆盖其后已成功的乐观 set
                             const prev = poolTagScope;
+                            const mySeq = ++scopeSeqRef.current;
                             setPoolTagScope(next);
                             void saveFlags({ ...flags, buddyAiTagIds: next }).then((ok) => {
-                              if (!ok) setPoolTagScope(prev);
+                              if (!ok && scopeSeqRef.current === mySeq) setPoolTagScope(prev);
                             });
                           }}
                         >
@@ -484,11 +496,13 @@ export default function BuddyAiApiService() {
                       <button
                         className="btn-ghost px-1.5 py-0.5 text-[11px] text-slate-400"
                         onClick={() => {
-                        // 审查修复（L28）：调用前捕获快照，保存失败按 patch 回滚乐观高亮
+                        // 审查修复（L28）：调用前捕获快照，保存失败按 patch 回滚乐观高亮；
+                        // 序号门控防止慢败回滚覆盖其后已成功的乐观 set
                         const prev = poolTagScope;
+                        const mySeq = ++scopeSeqRef.current;
                         setPoolTagScope([]);
                         void saveFlags({ ...flags, buddyAiTagIds: [] }).then((ok) => {
-                          if (!ok) setPoolTagScope(prev);
+                          if (!ok && scopeSeqRef.current === mySeq) setPoolTagScope(prev);
                         });
                       }}
                       >

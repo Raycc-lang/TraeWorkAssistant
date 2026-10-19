@@ -374,7 +374,10 @@ export default function BuddyAiAccounts() {
         return;
       }
       await api.misc.writeTextFile(filePath, JSON.stringify(payload, null, 2));
-      pushToast('success', `已导出 ${exportedCount} 个账号到 ${filePath}${exportWithCreds ? '（凭证已 AES-256-GCM 加密，请牢记导出密码）' : ''}`);
+      // 加密提示按后端实际返回形态判定：池内无任何凭证时后端原样明文导出（无 encrypted 字段），
+      // 勾选「含凭证」但实际无凭证时不应误导用户「已加密」
+      const sealed = payload.encrypted === true;
+      pushToast('success', `已导出 ${exportedCount} 个账号到 ${filePath}${sealed ? '（凭证已 AES-256-GCM 加密，请牢记导出密码）' : ''}`);
       setExportOpen(false);
     } catch (err) {
       pushToast('error', `导出失败：${String(err).slice(0, 160)}`);
