@@ -342,8 +342,8 @@ impl ApiSharedState {
         if cached == 0 {
             return;
         }
-        // 入口取定 day（G3 对齐）：记账与脏标记共用同一 day，防跨零点时
-        // cached_tokens 落旧日行、脏标新日行导致旧行修改永不被 flush
+        // 入口取定 day（G3 对齐，用量跨日归行修复）：记账与脏标记共用同一日期键，
+        // 防跨零点时 cached_tokens 落旧日行、脏标新日行导致旧行修改永不被 flush
         let day = usage::today_key();
         let mut guard = self
             .usage

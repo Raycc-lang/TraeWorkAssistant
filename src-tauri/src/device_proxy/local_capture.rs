@@ -283,11 +283,9 @@ impl Drop for TempDirGuard {
 /// 复制 Cookies 库到临时目录后只读打开（规避客户端运行时文件锁；
 /// -wal/-shm 一并复制避免读到未 checkpoint 的空库），返回命中的账号数
 fn scan_cookies_db(ctx: &ProxyCtx, db: &Path, key: Option<&[u8]>) -> Result<usize, String> {
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    let td = std::env::temp_dir().join(format!("aw_trae_ck_{}_{nanos}", std::process::id()));
+    // 审查修复（L7）：临时目录名改用 uuid 随机——原 pid+纳秒时间戳可被推测，
+    // 存在抢先创建/植入文件的竞态；uuid v4 不可预测，TempDirGuard 清理与名字无关
+    let td = std::env::temp_dir().join(format!("aw_trae_ck_{}", uuid::Uuid::new_v4()));
     // 审查 L1：目录权限收紧 0700（内容为用户 Cookies 库副本，敏感）+ 清理挂 Drop
     // guard——中途 panic/线程中断也保证删除，不再依赖正常路径的 remove_dir_all
     #[cfg(unix)]

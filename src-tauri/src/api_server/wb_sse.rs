@@ -160,8 +160,9 @@ fn parse_data(data: &str) -> Option<WbEvent> {
             .and_then(|m| m.as_str())
             .unwrap_or("upstream error")
             .to_string();
-        // code 宽口径：上游可能以字符串形态下发（"code":"4001"），as_i64 落 0 会
-        // 误入 ErrKind::Server 兜底（30m 熔断）——字符串可 parse 时取值（对齐 token_number 风格）
+        // 审查修复（M1）：错误码宽口径提取——code 宽口径：上游可能以字符串形态
+        // 下发（"code":"4001"），as_i64 落 0 会误入 ErrKind::Server 兜底（30m 熔断），
+        // 丢失 classify_wb_error 的模型级豁免判定依据——字符串可 parse 时取值
         let code = err
             .get("code")
             .and_then(|c| {

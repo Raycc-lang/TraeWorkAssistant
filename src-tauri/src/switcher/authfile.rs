@@ -31,12 +31,13 @@ const WB_AUTH_DIR_REL: &str = "CodeBuddyExtension\\Data\\Public\\auth";
 const WB_AUTH_FILE_NAME: &str = "workbuddy-desktop.info";
 
 pub(crate) fn wb_auth_dir() -> PathBuf {
+    // 审查修复（L14）：LOCALAPPDATA 缺失（如计划任务/服务上下文）时原实现退化为
+    // 随进程 CWD 漂移的相对路径——Windows 侧改从 USERPROFILE 推导绝对路径兜底，
+    // 两者皆缺失才保留相对路径作最后回退；macOS 侧走 Application Support 基根
     #[cfg(windows)]
     {
         std::env::var("LOCALAPPDATA")
             .map(|l| PathBuf::from(l).join(WB_AUTH_DIR_REL))
-            // L 修复：LOCALAPPDATA 缺失（计划任务/服务上下文）时从 USERPROFILE 推导
-            // 标准绝对路径——原兜底退化相对路径，相对 CWD 解析会读写到错误位置
             .or_else(|_| {
                 std::env::var("USERPROFILE")
                     .map(|p| PathBuf::from(p).join("AppData").join("Local").join(WB_AUTH_DIR_REL))

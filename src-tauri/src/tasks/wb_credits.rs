@@ -284,9 +284,10 @@ pub(crate) fn balance_from_summary(body: &Value) -> Option<f64> {
         let mut s = 0.0;
         let mut has = false;
         for item in items {
-            // 逐项走 remaining_of 完整键链（含 CycleCapacityRemainPrecise 等实测首选
-            // 字段 + total-used 倒推）——此前仅识别 3 键，字段变体上会静默跌回全量和，
-            // issue #120 的父/子翻倍形态原样复发
+            // 审查修复（M3）：逐项走 remaining_of 宽键链（含 CycleCapacityRemainPrecise
+            // 等实测首选字段 + used/total 倒推）——此前仅识别 3 键，明细仅携带
+            // CycleCapacityRemainPrecise 时 coded 求和落空、静默跌回全量和，
+            // issue #120 父/子翻倍形态复发
             if let Some(v) = remaining_of(item, total_of(item)) {
                 s += v;
                 has = true;
@@ -308,8 +309,9 @@ pub(crate) fn balance_from_summary(body: &Value) -> Option<f64> {
             return Some(s);
         }
     }
-    // 无可解析剩余时不做总量字段兜底：CycleCapacitySizePrecise/CycleTotalCapacity/
-    // CapacitySize 是周期**总量**而非剩余（见 remaining_of 注释），当余额会虚报
+    // 审查修复（M3）：删除「总量键」回退分支——CycleCapacitySizePrecise/
+    // CycleTotalCapacity/CapacitySize 是周期**总量**而非剩余（见 remaining_of
+    // 注释），末级把总量当余额会凭空虚报（宁缺勿错，交由调用方按失败处理）
     sum_of(&found)
 }
 

@@ -367,10 +367,10 @@ pub fn load_templates(state: &WbView) -> Vec<(String, String)> {
 /// WB 流内错误 → ErrKind：WB 无 SOLO 业务码体系，按类 HTTP 状态码 +
 /// message 关键词判定（积分耗尽标记词表集中维护，F-33）
 pub fn classify_wb_error(code: i64, msg: &str) -> ErrKind {
-    // 模型级错误豁免（对齐 HTTP 路径 classify_error / SOLO 路径 4001 口径）：
-    // 4001/model config is empty 是「模型在该 function 下不可用」而非账号问题——
-    // 落 Client/Server 会给每个账号打冷却/熔断，换号遍历全池后 no_healthy_account。
-    // ErrKind::None：不冷却账号，仅按 inline_error_action 换号重试。
+    // 审查修复（M1）：模型级错误豁免（对齐 HTTP 路径 classify_error / SOLO 路径
+    // 4001 口径）——4001/model config is empty 是「模型在该 function 下不可用」
+    // 而非账号问题——落 Client/Server 会给每个账号打冷却/熔断，换号遍历全池后
+    // no_healthy_account。ErrKind::None：不冷却账号，仅按 inline_error_action 换号重试。
     if code == 4001 || is_model_config_mismatch(msg) {
         return ErrKind::None;
     }
@@ -439,6 +439,10 @@ struct RaceWin {
     hedge: Option<HedgeLease>,
     /// 对冲接管（对冲请求先出首字）
     takeover: bool,
+    /// 审查修复（L2）：竞速败者已死标记（EOF/IO/超窗，随 RaceOutcome 透传），
+    /// settle_hedge 据此对败者补记错误/冷却，账单可解释
+    primary_failed: bool,
+    hedge_failed: bool,
 }
 
 /// 首字竞速（F-76③）：对冲关闭（阈值 0）时与纯首字超时语义完全一致；开启时
@@ -464,6 +468,8 @@ fn race_first_byte(
                 uid: primary_uid.to_string(),
                 hedge: None,
                 takeover: false,
+                primary_failed: false,
+                hedge_failed: false,
             })
             .map_err(|_| vec![primary_uid.to_string()]);
     }
@@ -472,7 +478,8 @@ fn race_first_byte(
     let allowed2 = allowed.cloned();
     let dedicated2 = dedicated.map(str::to_string);
     let body = converted.to_vec();
-    // 双败归因：闭包内记录实际取得的对冲账号 uid（建连失败/双败路径据此上报）
+    // 双败归因（审查 L2）：闭包内记录实际取得的对冲账号 uid（租约获取即记录，
+    // 建连失败/双败路径据此上报，交由调用方对 failed 列表统一记账）
     let hedge_spawned = std::rc::Rc::new(std::cell::RefCell::new(Option::<String>::None));
     let hedge_spawned2 = hedge_spawned.clone();
     let spawn_backup = move || -> Option<(Box<dyn Read + Send>, HedgeLease)> {
@@ -508,11 +515,20 @@ fn race_first_byte(
             } else {
                 primary_uid.to_string()
             };
-            Ok(RaceWin { uid, lines: out.lines, hedge: out.hedge, takeover: out.takeover })
+            Ok(RaceWin {
+                uid,
+                lines: out.lines,
+                hedge: out.hedge,
+                takeover: out.takeover,
+                primary_failed: out.primary_failed,
+                hedge_failed: out.hedge_failed,
+            })
         }
         Err(()) => {
-            // 双败归因修复：主/对冲两侧账号都上报——此前只记主账号，对冲账号的
-            // 上游故障无 note_error/冷却，可被反复选中消耗真实上游请求
+            // 双败归因修复（审查 L2）：主/对冲两侧账号都上报——此前只记主账号，
+            // 对冲账号的上游故障无 note_error/冷却，可被反复选中消耗真实上游请求。
+            // 记账由调用方对返回的 failed 列表统一执行（本函数不就地 note_error，
+            // 防与调用方重复记账）
             let mut failed = vec![primary_uid.to_string()];
             if let Some(h) = hedge_spawned.borrow().as_ref() {
                 if failed.last().map(|u| u != h).unwrap_or(true) {
@@ -527,13 +543,23 @@ fn race_first_byte(
 /// 竞速结束后处理对冲计数与日志（F-76③/F-77）：
 /// - 释放对冲账号竞速窗口的在途占用（租约 Drop，-1 恰好一次）；
 /// - 接管时 guard 重绑到对冲账号（原账号解绑 -1、对冲账号 +1，流计数随流存续）；
-/// - [SCHED] 日志记录 hedge_takeover / hedge_lost。
+/// - [SCHED] 日志记录 hedge_takeover / hedge_lost；
+/// - 审查修复（L2）：竞速败者记账——已死一侧（EOF/IO/超窗）补记 Server 错误
+///   触发冷却；仅「输竞速但未死」一侧不记（账号健康，防误伤）
 fn settle_hedge(
     state: &WbView,
     win: &mut RaceWin,
     mut guard: InflightGuard,
     primary_uid: &str,
 ) -> InflightGuard {
+    if win.primary_failed {
+        state.route_pool().note_error(primary_uid, ErrKind::Server);
+    }
+    if win.hedge_failed {
+        if let Some(lease) = win.hedge.as_ref() {
+            state.route_pool().note_error(&lease.uid, ErrKind::Server);
+        }
+    }
     // take 移交所有权：本函数返回前 Drop（竞速窗口计数 -1 恰好一次）
     let Some(lease) = win.hedge.take() else {
         return guard;
@@ -727,8 +753,9 @@ fn run_wb_stream(
     // 虚大 rotated 分母，稀释「空完成主导」判定，审查 2026-10-07）
     let mut attempts: usize = 0;
     let mut last_11128_sample: Option<String> = None; // 11128 诊断样本按请求去重
-    // L1 修复：记录最近一次真实绑定的账号——外层断连终局用它归因（此前恒 "none"，
-    // 轮换过账号后上游已真实消耗 tokens，用量页却无法归因到账号）
+    // 审查修复（L1）：最近绑定账号（绑定成功才更新）——外层断连终局用它归因
+    //（此前恒 "none"，轮换过账号后上游已真实消耗 tokens，用量页却无法归因到
+    // 账号），防换号重试期间断连落 "none" 致账单排查失据
     let mut last_bound_uid: Option<String> = None;
 
     loop {
@@ -737,11 +764,9 @@ fn run_wb_stream(
         // 轮换耗尽收尾同口径），防用量页 requests 缺口
         if tx.is_closed() {
             let duration_ms = start_ts.elapsed().as_millis() as u64;
-            state.record_usage_bucket(
-                state.usage_bucket(), model,
-                last_bound_uid.as_deref().unwrap_or("none"), key_id,
-                false, true, duration_ms, 0, 0,
-            );
+            // 审查修复（L1）：归因复用最近绑定账号（从未绑定才落 "none"）
+            let uid = last_bound_uid.as_deref().unwrap_or("none");
+            state.record_usage_bucket(state.usage_bucket(), model, uid, key_id, false, true, duration_ms, 0, 0);
             return;
         }
         // ── 取号：粘性/专一命中优先，否则按 Key 约束 + 调度策略；换号后仅走策略 ──
@@ -822,6 +847,7 @@ fn run_wb_stream(
         }
         attempts += 1; // 绑定成功即真实消耗一个候选（CAS 拒绝不计入分母）
         *safe_lock(&state.active_uid) = Some(picked.uid.clone());
+        // 审查修复（L1）：绑定成功才更新「最近绑定账号」（CAS 拒绝的候选不算）
         last_bound_uid = Some(picked.uid.clone());
 
         // 上游会话 id：粘性命中复用，否则新生成（成功后绑定）

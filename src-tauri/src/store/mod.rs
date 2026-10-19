@@ -213,10 +213,11 @@ impl Store {
         })
     }
 
-    /// 行表整表替换 + KV 写入的**同事务**原语（审查 M4）：`rows_replace` 与
-    /// `kv_set` 分属两个独立事务，两步之间崩溃/写失败会留下「表已更新而 kv
+    /// 行表整表替换 + KV 写入的**同事务**原语（审查 M4/M7）：`rows_replace` 与
+    /// `kv_set` 分属两个独立事务，进程崩溃/并发竞争下会留下「表已更新而 kv
     /// 元数据未更新（或反之）」的永久分叉——最敏感的是 api_keys 表与鉴权开关 kv。
-    /// `kv_content` 为 None 时仅执行行替换（kv 与行表同事务更新）。
+    /// `kv_content` 为最终入库字符串（与 kv_set_raw 同语义），Value 形态由调用方
+    /// 在事务外先序列化（对齐 rows_replace 时机）；为 None 时仅执行行替换。
     pub fn rows_replace_with_kv(
         &self,
         table: &str,

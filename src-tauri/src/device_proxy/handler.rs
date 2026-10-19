@@ -304,32 +304,30 @@ async fn read_chunked_body<R: AsyncRead + Unpin>(r: &mut R, mut buf: BytesMut) -
         let size = usize::from_str_radix(size_str.trim().split(';').next().unwrap_or("").trim(), 16)
             .map_err(|_| format!("非法 chunk size: {size_str}"))?;
         if size == 0 {
-            // L 修复：消费终结块后的 CRLF 与可选 trailer 行直至空行——原实现直接
-            // 返回，keep-alive 复用连接时残留字节会被下一请求解析为请求行 → 解析
-            // 错误断连。EOF 容忍（连接即将关闭，body 已完整）
+            // 审查修复（L6）：终结块后的 CRLF 与可选 trailer 行必须消费完再返回——
+            // 原实现直接返回，keep-alive 复用连接时残留字节会被下一请求解析为
+            // 请求行 → 解析错误断连。逐行消费直至空行；EOF 视为段结束（body 已
+            // 完整，宽松对齐既有容错）；trailer 段超 1MB 视为异常，报错断连
             loop {
-                let mut line = Vec::new();
-                let eof = loop {
-                    if let Some(pos) = buf.iter().position(|&b| b == b'\n') {
-                        line = buf.split_to(pos + 1).to_vec();
-                        break false;
+                if let Some(pos) = buf.iter().position(|&b| b == b'\n') {
+                    let line = buf.split_to(pos + 1);
+                    if !String::from_utf8_lossy(&line).trim_end_matches(['\r', '\n']).is_empty() {
+                        continue;
                     }
-                    let mut chunk = [0u8; 1024];
-                    let n = r
-                        .read(&mut chunk)
-                        .await
-                        .map_err(|e| format!("读取 trailer 失败: {e}"))?;
-                    if n == 0 {
-                        break true;
-                    }
-                    buf.extend_from_slice(&chunk[..n]);
-                };
-                if eof {
                     break;
                 }
-                if String::from_utf8_lossy(&line).trim_end().is_empty() {
+                if buf.len() > 1024 * 1024 {
+                    return Err("chunked trailer 段超限".to_string());
+                }
+                let mut chunk = [0u8; 4096];
+                let n = r
+                    .read(&mut chunk)
+                    .await
+                    .map_err(|e| format!("读取 chunked trailer 失败: {e}"))?;
+                if n == 0 {
                     break;
                 }
+                buf.extend_from_slice(&chunk[..n]);
             }
             return Ok(out.freeze());
         }
@@ -1080,10 +1078,10 @@ pub async fn serve_mitm<S: AsyncRead + AsyncWrite + Unpin>(
             if let Some(auth) = auth_header_value(&req) {
                 let raw = auth.strip_prefix("Cloud-IDE-JWT ").unwrap_or(auth);
                 static AUTH_HINT: OnceLock<Mutex<std::collections::HashSet<String>>> = OnceLock::new();
-                // L 修复：JWT 解析一次复用（此前 is_valid 与捕获分支各验一次，
-                // 每请求双重 base64 解码开销）
-                let valid_jwt = valid_cloud_ide_jwt(raw);
-                let is_valid = valid_jwt.is_some();
+                // 审查修复（L6）：同一 JWT 只验证一次——原 is_valid 判定与捕获分支
+                // 各调一次 valid_cloud_ide_jwt（base64 解码+字段校验 ×2），复用结果
+                let validated = valid_cloud_ide_jwt(raw);
+                let is_valid = validated.is_some();
                 let seen = AUTH_HINT.get_or_init(|| Mutex::new(std::collections::HashSet::new()));
                 let inserted = seen
                     .lock()
@@ -1096,7 +1094,7 @@ pub async fn serve_mitm<S: AsyncRead + AsyncWrite + Unpin>(
                         "  [JWT-DEBUG] 在 {host} 发现鉴权头 (类型: {marker}: {prefix}…)"
                     ));
                 }
-                if let Some(valid) = valid_jwt {
+                if let Some(valid) = validated {
                     if let Some(uid) = extract_user_id(&valid) {
                         // 重 DB 写盘（SQLite 全量账号读写）移出 async worker
                         let ctx2 = Arc::clone(&ctx);

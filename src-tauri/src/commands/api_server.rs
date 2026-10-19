@@ -466,6 +466,17 @@ async fn do_start_inner(
         .qoder_sticky
         .set_explicit_ttl(pool_file.qoder_sticky_ttl_secs as i64);
 
+    // 审查修复（L10）：启动闸门内二次检查——首次检查（函数开头）后即释放锁，
+    // 至此处的池装配/配置装载均为耗时操作，期间并发 do_start（页面命令/托盘菜单/
+    // 自启动路径）可能都通过首检导致重复启动尝试；bind 前持锁复查，已被并发
+    // 实例抢先则直接报「已在运行」退出
+    {
+        let guard = safe_lock(runtime);
+        if guard.is_some() {
+            return Err("API 服务已在运行".into());
+        }
+    }
+
     let handle = start_api_server(port, shared.clone()).await?;
 
     fs_utils::app_log(
@@ -1288,7 +1299,7 @@ pub fn pool_set(
         pool_file.qoder_tag_ids = v;
     }
     // buddy-ai 开关在 merge 后追加应用（对齐 tag_ids 先例：merge_pool_set 纯函数
-    // 签名不动，存量单测零改动）；运行中热应用移到配置锁外（M12 修复：此前持
+    // 签名不动，存量单测零改动）；运行中热应用移到配置锁外（M12/M8 修复：此前持
     // POOL_CFG_LOCK 叶子锁期间嵌套取 runtime 锁，违反「持锁期间不再取其他锁」纪律）
     let mut buddy_ai_enabled_applied: Option<bool> = None;
     if let Some(v) = buddy_ai_enabled {
@@ -1320,7 +1331,8 @@ pub fn pool_set(
     crate::store::db(&state.data_dir).kv_set("api_pool", &pool_file)?;
     drop(_cfg);
     // 热应用（配置锁外）：运行中即改内存池策略（Buddy 池空值沿用 Trae 池策略，与启动逻辑一致）
-    // buddy-ai 开关热应用（M12：随本段移出配置锁外）
+    // buddy-ai 开关热应用（M12/M8：随本段移出配置锁外，避免临界区内嵌套取 runtime
+    // 锁放大持锁时长；None = 存原值不触碰，与旧行为等价）
     if let Some(v) = buddy_ai_enabled_applied {
         if let Some(rt) = safe_lock(&runtime).as_ref() {
             rt.shared
@@ -1409,6 +1421,8 @@ pub fn pool_set(
             pool_file.buddy_ai_hedge_threshold_ms,
             std::sync::atomic::Ordering::Relaxed,
         );
+        // buddy-ai 池上游开关热应用已在上方配置锁外段统一执行（M12/M8，见
+        // buddy_ai_enabled_applied），此处不再重复 store
         // Buddy 资源开关热应用（此前仅启动时读取，改动需重启服务生效）
         rt.shared
             .wb_enabled

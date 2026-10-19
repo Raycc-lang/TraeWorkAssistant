@@ -112,12 +112,13 @@ export default function GeneralSettingsPanel() {
   };
 
   const save = async () => {
-    if (!form) return;
+    if (!form || !settings) return;
     setSaving(true);
     try {
-      // Low 修复（patch 纪律）：只发送相对当前 store 快照**有变化**的字段——
-      // 面板常驻期间他端（其他页/其他端）改过的设置不再被整份表单静默覆盖。
-      // 逐字段 JSON 串比较（Settings 含数组/对象，浅比较不适用于对象字段）
+      // Low 修复（patch 纪律，审查 L35）：逐字段 diff，只把与 store 当前快照**有变化**的
+      // 字段提交（saveSettings 即 patch 语义，不回传整份表单快照）——面板常驻期间他端
+      // （其他页/其他端）改过的设置不再被静默覆盖；逐字段 JSON 串比较（Settings 含数组/对象，
+      // 浅比较不适用于对象字段）
       const cur = useAppStore.getState().settings;
       const patch: Record<string, unknown> = {};
       if (cur) {

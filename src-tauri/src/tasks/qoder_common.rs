@@ -393,10 +393,11 @@ pub fn save_token_store(state: &AppState, id: &str, creds: &QoderCreds) -> Resul
     // 敏感字段收敛进 vault（慢 IO）——期间其他进程可能已写库；vault 写入后落库
     // 走逐行 UPSERT（仅覆盖目标行，见下方说明），进程间并发保存互不丢行
     //（审查 H-1 第②步 + P2 修复；进程内并发由 TOKEN_STORE_LOCK + 每账号刷新锁防护）。
-    // version 闸门（审查 L 修复，前移）：在 vault 收敛（慢 IO）**之前**判定——原
-    // 位置在 vault 写入之后，版本不识别时 vault 已被收敛成半迁移态，拒绝写入留下
-    // 孤儿 vault 记录。直接读 kv qoder_tokens_meta 判定（非 1 拒写；缺失视为初始库
-    // 放行，与 qoder_token_store_load 口径一致）
+    // version 闸门（审查 L 修复，前移；对齐 main 侧 M22 意图）：在 vault 收敛
+    //（慢 IO）**之前**判定——原位置在 vault 写入之后，版本不识别时 vault 已被
+    // 收敛成半迁移态，拒绝写入留下「vault 有凭证、DB 无行」的孤儿 vault 记录。
+    // 直接读 kv qoder_tokens_meta 判定（非 1 拒写；缺失视为初始库放行，与
+    // qoder_token_store_load 口径一致；qoder_token_store_load 合成 version 亦源于此 kv）
     let cur_version = crate::store::db(&state.data_dir)
         .kv_get_raw("qoder_tokens_meta")
         .and_then(|v| v.parse::<i64>().ok());

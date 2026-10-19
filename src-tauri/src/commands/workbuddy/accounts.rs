@@ -668,18 +668,12 @@ pub fn workbuddy_refresh_token(
         "expires_at_ms": exp_ms,
         "refresh_expires_at_ms": rexp_ms,
     });
-    if new_refresh.as_deref().map(str::is_empty).unwrap_or(true) {
-        // L3 修复：上游未回发 rt 时保留存储中旧 rt——空串覆盖会把仍有效的 rt
-        // 清空，下轮刷新必失败（与 buddy_ai OAuth 合并写回同款语义）
-        if let Some(old_rt) = crate::tasks::wb_common::load_token_store(&state)
-            .get("tokens")
-            .and_then(|t| t.get(&acct.id))
-            .and_then(|r| r.get("refresh_token"))
-            .and_then(|v| v.as_str())
-            .filter(|s| !s.is_empty())
-        {
-            creds["refresh_token"] = serde_json::json!(old_rt);
-        }
+    // 审查修复（M19，融合 L3）：上游未回发新 refreshToken（缺失/空串）时保留本次刷新
+    // 成功所用的旧 rt——upsert_token_store 是「非 null 才覆盖」的合并语义，空串非 null
+    // 会穿透覆盖 store 旧 rt，导致下轮刷新拿已作废的空串必然失败（被迫重登）。
+    // refresh 即本次刷新成功所用旧 rt（入口已保证非空），语义比回读 store 更直接
+    if new_refresh.as_deref().map(str::trim).unwrap_or("").is_empty() {
+        creds["refresh_token"] = serde_json::json!(refresh);
     }
     upsert_token_store(&state, &acct.id, &creds)?;
     // 短临界区写回：重读最新池 → 按 id 更新仍存在的账号；窗口内账号已被删除

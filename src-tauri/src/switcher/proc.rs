@@ -33,7 +33,7 @@ fn name_matches(prof: &AppProfile, name: &str) -> bool {
 /// 返回 false = 本档案在当前安装布局下无权操作该映像（并存布局杀国际会误杀
 /// 国内实例、老单布局杀国内会误杀国际实例），调用方必须跳过该进程。
 /// 仅歧义映像名受仲裁；白名单内其余无歧义名（"CodeBuddy CN" 等）直通。
-/// 四消费点统一接入：list_procs / running_exe_of / pid_alive_matching / kill_all。
+/// 四消费点统一接入：list_procs / running_exe_of / pid_alive_matching / kill_pids。
 fn ark_allows(prof: &AppProfile, name: &str) -> bool {
     let Some(ark) = &prof.image_ark else {
         return true;
@@ -282,12 +282,12 @@ pub fn stop_app(sess: &mut Session, sink: &dyn ProgressSink) -> Result<(), Strin
             sess.prof.graceful_wait_secs
         ),
     );
-    // L 修复：优雅等待与强杀收窄到 stop 前捕获的 PID 集合（原 wait_gone/kill_all
+    // L12 修复：优雅等待与强杀收窄到 stop 前捕获的 PID 集合（原 wait_gone/kill_all
     // 按「映像名全量匹配」——等待窗口内用户新启的同应用实例会被当作未退出的旧
-    // 实例误杀；对齐 stop_spawned 的 PID+身份双重防护）
+    // 实例误杀；对齐 stop_spawned 的 PID 精确语义，含 PID 复用防护）
     let stop_pids: Vec<u32> = procs.iter().map(|(pid, _)| *pid).collect();
     if !wait_gone_pids(&sess.prof, &stop_pids, Duration::from_secs(sess.prof.graceful_wait_secs)) {
-        // 二级：仍有存活进程 → 强杀
+        // 二级：仍有存活进程 → 强杀（仅限捕获的 PID）
         sink.step("stop", super::StepStatus::Warn, "优雅关闭超时，强制结束进程");
         kill_pids(&sess.prof, &stop_pids);
     }
@@ -385,7 +385,8 @@ fn pid_alive_matching(sys: &System, pid: u32, prof: &AppProfile) -> bool {
 }
 
 /// 在 deadline 内等待给定 PID 全部退出（1s 轮询；PID 存在但身份不匹配视为已退出，
-/// 与 pid_alive_matching 同口径，防 PID 复用导致无谓超时）
+/// 与 pid_alive_matching 同口径——审查 L12 PID 复用防护：原进程退出后 PID 被
+/// 无关进程复用时身份不匹配视同已退出，不再无谓等满超时）
 fn wait_gone_pids(prof: &AppProfile, pids: &[u32], timeout: Duration) -> bool {
     let start = Instant::now();
     loop {
@@ -400,15 +401,16 @@ fn wait_gone_pids(prof: &AppProfile, pids: &[u32], timeout: Duration) -> bool {
     }
 }
 
-/// 按 PID 强杀（sysinfo TerminateProcess；PID 已退出或身份不匹配时静默跳过，
-/// 防 PID 复用误杀无关进程）
+/// 按 PID 强杀（sysinfo TerminateProcess；审查 L12 PID 复用防护：PID 已退出或
+/// 身份不匹配——复用为无关进程——时静默跳过，绝不误杀）
 fn kill_pids(prof: &AppProfile, pids: &[u32]) {
     let sys = snapshot();
     for pid in pids {
+        if !pid_alive_matching(&sys, *pid, prof) {
+            continue;
+        }
         if let Some(p) = sys.process(sysinfo::Pid::from_u32(*pid)) {
-            if proc_matches(prof, p) {
-                let _ = p.kill();
-            }
+            let _ = p.kill();
         }
     }
 }
@@ -757,7 +759,7 @@ mod tests {
 
     #[test]
     fn wait_gone_pids_不存在pid立即返回true() {
-        // 第一轮枚举即无命中 → 立即 true，不做 1s 轮询空转
+        // 第一轮枚举即无命中（PID 不存在 → 身份匹配 false）→ 立即 true，不做 1s 轮询空转
         assert!(wait_gone_pids(
             &prof(TargetApp::Doubao),
             &[u32::MAX - 1, u32::MAX - 2],
@@ -771,6 +773,9 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn wait_gone_pids_存活pid超时返回false() {
+        // 身份匹配口径引入后，「存活」必须同时映像名匹配：白名单临时替换为本测试
+        // 进程映像名（leak 成 'static 适配 &'static [&'static str]，同
+        // pid_alive_matching_白名单命中存活pid返回true）
         let stem = std::env::current_exe()
             .ok()
             .and_then(|p| p.file_stem().map(|s| s.to_string_lossy().into_owned()))

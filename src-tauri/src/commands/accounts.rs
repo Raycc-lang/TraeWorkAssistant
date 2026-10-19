@@ -716,8 +716,8 @@ pub fn account_delete(
         // P0 防目录逃逸：user_id 直接拼进 profiles/ 路径并整目录删除，先做字符集白名单校验
         fs_utils::ensure_uid_safe(&user_id)?;
         let p = state.path("profiles").join(&user_id);
-        // M11 修复：登录态快照属敏感数据，删除失败（Windows 文件被客户端占用是
-        // 常态）必须留痕——用户「以为已删其实还在」的安全语义不能静默
+        // M11/审查修复（M13）：登录态快照属敏感数据，删除失败（Windows 文件被客户端
+        // 占用是常态）必须留痕——用户「以为已删其实还在」的安全语义不能静默
         if let Err(e) = std::fs::remove_dir_all(&p) {
             fs_utils::app_log(
                 &state.data_dir,

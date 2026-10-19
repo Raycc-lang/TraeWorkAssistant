@@ -168,7 +168,9 @@ export default function UsageStatsPanel() {
   const [customUsage, setCustomUsage] = useState<UsageDayView[]>([]);
   const [qoderUsage, setQoderUsage] = useState<UsageDayView[]>([]);
   const [loading, setLoading] = useState(false);
-  // M9 修复：加载序号门控——快速切换 7/30 天时，慢的旧响应不得覆盖新结果
+  // M9 修复（审查 L30）：加载序号门控——快速切换 7/14/30 天时并发 load 的旧响应
+  // 可能晚于新响应到达，用序号门控：响应到达时仅当仍是最新一次发起才 setState，
+  // 防止旧数据覆盖新结果
   const loadSeqRef = useRef(0);
 
   const load = async (d: number) => {

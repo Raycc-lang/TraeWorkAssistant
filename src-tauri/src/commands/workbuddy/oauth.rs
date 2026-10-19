@@ -20,7 +20,18 @@ use crate::state::AppState;
 
 use super::common::{account_id_of, as_str, load_pool, save_pool, upsert_token_store, WorkBuddyAccount, WbPool};
 
+/// OAuth 防重入（CN/Intl 共享闸门，一次仅允许一个流程）
 static OAUTH_RUNNING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// 闸门 RAII 守卫（对齐 qoder OAuthGuard 同款）：drop 自动复位 OAUTH_RUNNING，
+/// 覆盖线程内 panic 与一切提前退出路径——防共享闸门永久卡死（前端弹框永挂
+/// loading，CN/Intl 后续登录全被拒）
+struct OAuthGuard;
+impl Drop for OAuthGuard {
+    fn drop(&mut self) {
+        OAUTH_RUNNING.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+}
 
 /// 捕获响应 Set-Cookie 到独立 jar（简化：保留 name=value，忽略 Path/Expires 等属性）
 fn oauth_capture_cookies(jar: &mut std::collections::HashMap<String, String>, resp: &ureq::Response) {
@@ -442,9 +453,10 @@ pub(super) fn oauth_flow(
     // last_daily_chat（当日打卡幂等失效→重复跑六步链）/uid/domain 等既有键——
     // 与导入路径 BL-2 同类缺陷。新键优先，旧键缺省补齐；新码未回发 rt 时保留旧 rt
     if matches!(sink, PoolSink::BuddyAi) {
-        // M4 修复：读-合并-写全程持每账号刷新锁（对齐导入路径 buddy_ai.rs:334——
-        // 并发续期/网关 401 国际档轮换 rt 时，锁外读到的 stale rt 会整行覆盖新 rt，
-        // 账号须重登）。与续期/打卡写段同锁域
+        // M4/M14 修复：凭证读-合并-写全程持每账号刷新锁（对齐导入路径
+        // buddy_ai_account_import_creds 同款锁域）——与续期/网关 401 国际档
+        // 轮换 rt 并发时，锁外读到的 stale rt 再整行 upsert 会覆盖刚轮换落库
+        // 的新 rt（账号被迫重登）。与续期/打卡写段同锁域
         let refresh_lock = crate::tasks::wb_common::refresh_lock_for(&target_id);
         let _refresh_guard = refresh_lock.lock().unwrap_or_else(|e| e.into_inner());
         let existing = sink.load_token(state, &target_id);
@@ -482,16 +494,6 @@ pub fn workbuddy_oauth_login(app: AppHandle) -> Result<(), String> {
     oauth_login_async(app, &crate::tasks::wb_common::REGION_CN, PoolSink::Cn)
 }
 
-/// RAII 闸门守护（对齐 qoder 侧 OAuthGuard）：闭包存活期间持有闸门，
-/// 任何退出路径（正常结束/panic/事件发送失败）经 Drop 自动复位，
-/// 杜绝 OAUTH_RUNNING 永久卡死导致后续登录被拒。
-struct OAuthGuard;
-impl Drop for OAuthGuard {
-    fn drop(&mut self) {
-        OAUTH_RUNNING.store(false, std::sync::atomic::Ordering::SeqCst);
-    }
-}
-
 /// 通用异步启动器（CN/Intl 共用 OAUTH_RUNNING 全局闸门，一次仅允许一个流程；
 /// 进度/终态事件按池前缀分流：wb-oauth-* / buddy-ai-oauth-*）
 pub(super) fn oauth_login_async(
@@ -509,13 +511,13 @@ pub(super) fn oauth_login_async(
     // 原 AppState::new() 在本线程构造全新实例，锁域互不相干 → OAuth 写池与
     // 命令/调度写池并发时失去互斥，可能整池覆盖丢账号。
     let st = app.state::<AppState>().inner().clone();
-    // 审查修复（闸门 RAII 化，对齐 qoder 侧）：裸 std::thread::spawn 失败即 panic，
-    // panic 点在下方 catch_unwind 之外 → 闸门永久 true 且 done 事件永不发出。
-    // 改用命名 Builder 线程并处理 spawn 结果；闭包内以 OAuthGuard 兜底复位。
+    // 审查修复（闸门 RAII 化，对齐 qoder 侧）：裸 thread::spawn 线程创建失败即 panic
+    // 且发生在闸门复位之外 → OAUTH_RUNNING 永久 true、done 事件永不发出，
+    // CN/Intl 共享闸门后续登录全被拒。改为 Builder 命名线程 + spawn 返回 io::Result：
+    // 失败复位闸门并返回 Err；线程内闸门复位统一由 OAuthGuard RAII 承担（含 panic 路径）
     let spawned = std::thread::Builder::new()
         .name("wb-oauth".into())
         .spawn(move || {
-            // RAII 守护：闭包内任何路径退出（含 panic/emit 失败）经 Drop 自动复位闸门
             let _guard = OAuthGuard;
             // panic 兜底（审查修复）：oauth_flow panic 原实现会让 OAUTH_RUNNING 永久卡死
             //（CN/Intl 共享闸门）且 done 事件永不发出 → 前端弹框永远 loading 直到重启。
@@ -538,6 +540,7 @@ pub(super) fn oauth_login_async(
             };
             // 终态事件：emit 失败落日志（issue #44 遗留项——前端 OAuth 弹框依赖此事件收尾）
             crate::events::emit_logged(&app, &done_event, payload, None);
+            // OAUTH_RUNNING 复位由 _guard drop 承担（含 panic 路径）
         });
     if spawned.is_err() {
         OAUTH_RUNNING.store(false, Ordering::SeqCst);

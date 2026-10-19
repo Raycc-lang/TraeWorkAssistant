@@ -52,6 +52,8 @@ pub fn capture_point() -> Result<(i32, i32), String> {
 }
 
 /// 坐标是否落在 Windows 虚拟屏幕范围内（多显示器含主屏左侧负坐标副屏）。
+/// M5/M11 同源修复：GetSystemMetrics 异常返回 0 时边界退化为 [0,0) 空区间，
+/// 任何坐标均判越界 → fail-closed，不注入。
 #[cfg(windows)]
 fn in_virtual_screen(x: i32, y: i32) -> bool {
     unsafe {
@@ -64,8 +66,9 @@ fn in_virtual_screen(x: i32, y: i32) -> bool {
 }
 
 /// 移动到坐标并左键单击一次（对齐 python --click）。
-/// M5 修复：按 Windows 虚拟屏幕边界校验——原 `x/y <= 0` 一刀切把主屏左侧
-/// 显示器的合法负坐标判为非法，左副屏用户取点/点击不可用。
+/// M5/M11 同源修复：坐标校验从「<=0 一刀切拒绝」改为 Windows 虚拟屏幕边界校验——
+/// 多显示器布局下主屏左侧/上方的副屏坐标为负（SM_XVIRTUALSCREEN 可为负），
+/// 原校验会让左侧副屏永远不可用；越出虚拟屏幕范围仍拒绝，防误触。
 pub fn click_at(x: i32, y: i32) -> Result<(), String> {
     #[cfg(windows)]
     if !in_virtual_screen(x, y) {
@@ -92,7 +95,8 @@ pub fn click_at(x: i32, y: i32) -> Result<(), String> {
 }
 
 /// 注入单次鼠标事件（down/up 各调一次，等价 python mouse_event 两次调用）。
-/// M5 修复：校验 SendInput 返回值——原实现忽略返回值，注入失败静默当成功。
+/// M5/M11 同源修复：校验 SendInput 返回值——返回 0 表示注入被拦截/失败
+///（如 UIPI/安全软件），原实现忽略返回值把失败静默当成功，现透传报错。
 #[cfg(windows)]
 fn send_mouse_flag(dw_flags: u32) -> Result<(), String> {
     let input = INPUT {
@@ -122,13 +126,13 @@ mod ui_click_tests {
     use super::*;
 
     #[test]
-    fn click_rejects_out_of_virtual_screen() {
-        // 不触达真实鼠标 API：坐标校验前置失败（两平台共享的校验路径）。
-        // M5 修复后校验口径为 Windows 虚拟屏幕边界（左副屏负坐标合法），
-        // 取远超虚拟屏的坐标断言被拒
-        assert!(click_at(i32::MAX / 2, 100).is_err());
-        assert!(click_at(100, i32::MAX / 2).is_err());
-        assert!(click_at(i32::MIN / 2, 100).is_err());
-        assert!(click_at(-1, -1).is_err());
+    fn click_rejects_out_of_virtual_screen_coords() {
+        // 不触达真实鼠标 API：虚拟屏幕边界校验前置失败（macOS 平台则由
+        // not(windows) 分支统一报错，同样 is_err）。
+        // M5/M11 同源修复后校验口径为 Windows 虚拟屏幕边界，负坐标/零坐标可能
+        // 合法（多屏负象限），测试改用任何机器上必然越界的极值坐标
+        assert!(click_at(i32::MAX, 100).is_err());
+        assert!(click_at(100, i32::MIN).is_err());
+        assert!(click_at(i32::MIN, i32::MAX).is_err());
     }
 }

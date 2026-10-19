@@ -703,33 +703,40 @@ where
             }
             return (kind2, msg2);
         }
-        // 凭证失效才标记重登录；网络故障/响应异常/他方进程刷新中不误标（下次调度自然重试）
-        if fail_reason == Some(wb_common::RefreshFail::Auth) {
+        // 审查修复（M16）：按 RefreshFail 枚举区分文案——仅 Auth/NoRefreshToken 归为
+        // 登录态问题（前者标 needs_relogin，后者无 rt 永不自愈同样标）；Network/
+        // BadResponse/Busy 属瞬时失败（下次调度自然重试），如实报瞬时失败，
+        // 不再渲染成「登录态失效」误导用户去重登
+        let auth_dead = matches!(
+            fail_reason,
+            Some(wb_common::RefreshFail::Auth) | Some(wb_common::RefreshFail::NoRefreshToken)
+        );
+        if auth_dead {
             // issue #118：透传上游错误细节，便于区分会话失效与账号封禁
             let mut reason = format!("refresh 失败: {msg}");
             if let Some(d) = fail_detail.as_deref() {
                 reason.push_str(&format!("；上游: {d}（{}）", wb_common::refresh_fail_hint(d)));
             }
             wb_common::mark_needs_relogin(state, acct_id, &reason);
-        } else if fail_reason == Some(wb_common::RefreshFail::NoRefreshToken) {
-            // M6 修复：无 rt 永不自愈（重试必然同样失败），与 Auth 同样标记
-            // needs_relogin 让网关池同步/调度跳过生效
-            wb_common::mark_needs_relogin(state, acct_id, "无 refresh_token，需重新登录");
-        }
-        // M6 修复：文案按失败类型如实区分——原实现把 Network/BadResponse/Busy
-        //（瞬时故障，下次自动重试）也渲染成「登录态失效」，误导用户重登
-        let msg_fail = if fail_reason == Some(wb_common::RefreshFail::Auth)
-            || fail_reason == Some(wb_common::RefreshFail::NoRefreshToken)
-        {
-            match fail_detail.as_deref() {
+            // main 侧 M16：auth_dead 内构造登录态失效文案并直接 return（覆盖 HEAD 侧
+            // M6 意图——NoRefreshToken 已含于 auth_dead 同样标 needs_relogin，且原
+            // else if 分支在 auth_dead 判定下不可达；瞬时失败文案以 refresh 真实
+            // 失败原因 fail_detail 呈现，替代 HEAD 侧误用首次 401 消息 {msg} 的写法）
+            let msg_fail = match fail_detail.as_deref() {
                 Some(d) => format!(
                     "登录态失效且刷新失败；上游: {d}（{}）",
                     wb_common::refresh_fail_hint(d)
                 ),
                 None => "登录态失效且刷新失败".into(),
-            }
-        } else {
-            format!("refresh 暂时失败（{msg}），将自动重试，无需重新登录")
+            };
+            return ("fail".into(), msg_fail);
+        }
+        let msg_fail = match fail_detail.as_deref() {
+            Some(d) => format!(
+                "刷新暂时失败（网络/响应异常或他方进程刷新中），稍后自动重试；上游: {d}（{}）",
+                wb_common::refresh_fail_hint(d)
+            ),
+            None => "刷新暂时失败（网络/响应异常或他方进程刷新中），稍后自动重试".into(),
         };
         return ("fail".into(), msg_fail);
     }

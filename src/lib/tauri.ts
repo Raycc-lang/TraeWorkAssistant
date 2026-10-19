@@ -505,16 +505,17 @@ export const api = {
         'buddy_ai_credits_history',
         { days: days ?? null },
       ),
-    /** 账号池导出（includeCredentials=true 附带凭证明文副本，前端强确认） */
-    accountsExport: (includeCredentials?: boolean) =>
+    /** 账号池导出（includeCredentials=true 时须提供 password：凭证以 AIWQENC1 信封加密写入导出文件，不回传明文） */
+    accountsExport: (includeCredentials?: boolean, password?: string) =>
       invoke<Record<string, unknown>>('buddy_ai_accounts_export', {
         includeCredentials: includeCredentials ?? null,
+        password: password ?? null,
       }),
-    /** 账号池导入（accounts_export 回导；合并语义：同 id 跳过，凭证副本仅回灌缺失账号） */
-    accountsImport: (poolJson: Record<string, unknown>) =>
+    /** 账号池导入（accounts_export 回导；加密信封文件须传 password 解密，明文旧文件 password 传 null 兼容） */
+    accountsImport: (poolJson: Record<string, unknown>, password?: string | null) =>
       invoke<{ added: number; skipped: number; invalid: number; tokens_added: number }>(
         'buddy_ai_accounts_import',
-        { poolJson },
+        { poolJson, password: password ?? null },
       ),
     /** 扫描本机 WorkBuddy AI 客户端登录账号（account-snapshot.json；识别+池内匹配） */
     localScan: () =>
@@ -1187,7 +1188,14 @@ export async function setupListeners(
     await registerAll(handlers, unsubs);
     return unsubs;
   } catch (err) {
-    for (const u of unsubs) u();
+    // 审查修复（L31）：单个注销失败不阻断清理，继续注销其余监听
+    for (const u of unsubs) {
+      try {
+        u();
+      } catch {
+        /* ignore */
+      }
+    }
     throw err;
   }
 }

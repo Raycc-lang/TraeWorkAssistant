@@ -252,10 +252,10 @@ export default function BuddyAiApiService() {
         buddy_ai_catalog_sync_enabled: next.enabled,
         buddy_ai_catalog_sync_hhmm: next.hhmm || '05:55',
       });
-      // M10a 修复：写操作成功可见反馈（UX 硬标准）——原只有失败 toast
+      // 写操作成功可见反馈（M10a，审查 L27）：原只有失败 toast；文案含触发时刻
       pushToast(
         'success',
-        next.enabled ? `每日定时同步已开启（每日 ${next.hhmm || '05:55'}）` : '每日定时同步已关闭',
+        next.enabled ? `每日定时同步已保存（每天 ${next.hhmm || '05:55'} 触发）` : '每日定时同步已关闭',
       );
       await useAppStore.getState().refreshSettings().catch(() => {
         /* 全局设置快照刷新失败不阻塞本地保存结果，下次刷新自愈 */
@@ -420,8 +420,12 @@ export default function BuddyAiApiService() {
                           const next = active
                             ? poolGroupScope.filter((x) => x !== g.id)
                             : [...poolGroupScope, g.id];
+                          // 审查修复（L28）：调用前捕获快照，保存失败按 patch 回滚乐观高亮
+                          const prev = poolGroupScope;
                           setPoolGroupScope(next);
-                          void saveFlags({ ...flags, buddyAiGroupIds: next });
+                          void saveFlags({ ...flags, buddyAiGroupIds: next }).then((ok) => {
+                            if (!ok) setPoolGroupScope(prev);
+                          });
                         }}
                       >
                         {g.name}
@@ -432,8 +436,12 @@ export default function BuddyAiApiService() {
                     <button
                       className="btn-ghost px-1.5 py-0.5 text-[11px] text-slate-400"
                       onClick={() => {
+                        // 审查修复（L28）：调用前捕获快照，保存失败按 patch 回滚乐观高亮
+                        const prev = poolGroupScope;
                         setPoolGroupScope([]);
-                        void saveFlags({ ...flags, buddyAiGroupIds: [] });
+                        void saveFlags({ ...flags, buddyAiGroupIds: [] }).then((ok) => {
+                          if (!ok) setPoolGroupScope(prev);
+                        });
                       }}
                     >
                       清空
@@ -460,8 +468,12 @@ export default function BuddyAiApiService() {
                             const next = active
                               ? poolTagScope.filter((x) => x !== t.id)
                               : [...poolTagScope, t.id];
+                            // 审查修复（L28）：调用前捕获快照，保存失败按 patch 回滚乐观高亮
+                            const prev = poolTagScope;
                             setPoolTagScope(next);
-                            void saveFlags({ ...flags, buddyAiTagIds: next });
+                            void saveFlags({ ...flags, buddyAiTagIds: next }).then((ok) => {
+                              if (!ok) setPoolTagScope(prev);
+                            });
                           }}
                         >
                           {t.name}
@@ -472,9 +484,13 @@ export default function BuddyAiApiService() {
                       <button
                         className="btn-ghost px-1.5 py-0.5 text-[11px] text-slate-400"
                         onClick={() => {
-                          setPoolTagScope([]);
-                          void saveFlags({ ...flags, buddyAiTagIds: [] });
-                        }}
+                        // 审查修复（L28）：调用前捕获快照，保存失败按 patch 回滚乐观高亮
+                        const prev = poolTagScope;
+                        setPoolTagScope([]);
+                        void saveFlags({ ...flags, buddyAiTagIds: [] }).then((ok) => {
+                          if (!ok) setPoolTagScope(prev);
+                        });
+                      }}
                       >
                         清空
                       </button>
@@ -618,6 +634,7 @@ export default function BuddyAiApiService() {
                       max: 86400,
                       value: poolTtl,
                       setValue: setPoolTtl,
+                      // 审查修复（L29）：原文案「60s–24h」与输入框 min=0 矛盾，改为对齐 0 值语义
                       desc: '0 = 关闭池粘性；否则 TTL 内同会话路由同一账号（上游 KV cache 复用），有效范围 60–86400 秒',
                       save: (v: number) => ({ buddyAiPoolStickyTtlSecs: v }),
                     },

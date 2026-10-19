@@ -278,9 +278,12 @@ pub async fn do_start(
     let server = crate::device_proxy::ProxyServer::start(cfg, Some(app.clone()))
         .await
         .map_err(|e| {
-            // 启动失败：系统代理尚未被我们改动（set_win_proxy 在启动成功后才执行），
-            // 清掉启动前捕获的快照防残留——否则下次 proxy_stop 会把该快照当「曾接管」消费
-            *PREV_SYSTEM_PROXY.lock().unwrap_or_else(|e| e.into_inner()) = None;
+            // 审查修复（H2，融合 ours 快照清理）：启动失败路径清理本轮已捕获的系统代理
+            // 快照，不留脏状态——此时尚未接管系统代理（set_proxy 在启动成功后才执行），
+            // 快照残留会让下次 proxy_stop 把该快照当「曾接管」消费（用「别人的快照」还原）
+            *PREV_SYSTEM_PROXY
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()) = None;
             fs_utils::app_log(&state.data_dir, &format!("代理启动失败: {e}"));
             e
         })?;
@@ -376,7 +379,7 @@ pub async fn proxy_start(
 
 #[tauri::command]
 pub fn proxy_stop(
-    _app: AppHandle,
+    app: AppHandle,
     state: State<AppState>,
     proxy_state: State<Mutex<Option<ProxyHandle>>>,
 ) -> Result<ProxyStatus, String> {
@@ -385,9 +388,8 @@ pub fn proxy_stop(
         Some(h) => (h.server.port, h.server.captured.load(Ordering::Relaxed)),
         None => (0, 0),
     };
-    let mut had_handle = false;
+    let was_running = g.is_some();
     if let Some(h) = g.take() {
-        had_handle = true;
         // 标记「主动停止」，避免看门狗把正常停止误判为崩溃而重复还原代理
         PROXY_INTENTIONAL_STOP.store(true, Ordering::Relaxed);
         let c = h.server.captured.load(Ordering::Relaxed);
@@ -395,23 +397,27 @@ pub fn proxy_stop(
         h.server.stop();
         fs_utils::app_log(&state.data_dir, &format!("代理已停止: 共捕获 {c} 个账号"));
     }
-    // H-2 修复：仅当本轮确曾接管（句柄命中）或留有未消费快照（看门狗崩溃路径
-    // consume=false 保留给本路径还原）才执行还原——代理未运行且无快照时的重复
-    // 停止调用不再触发还原，避免把用户自己的 VPN 系统代理静默清空
+    // H-2 修复（融合 main H2）：仅当本轮确曾接管（句柄命中）或留有未消费快照（看门狗
+    // 崩溃路径 consume=false 保留给本路径还原）才执行还原——代理未运行且无快照时的
+    // 重复停止调用不再触发还原，避免把用户自己的 VPN 系统代理静默清空
     // （还原语义不变：启动前存在外部代理(VPN)则还原之，否则清空避免全局断网）
     let snapshot_pending = PREV_SYSTEM_PROXY
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .is_some();
-    if had_handle || snapshot_pending {
+    if was_running || snapshot_pending {
+        // 还原系统代理（#14 共用）：若启动前存在外部代理(VPN)，则还原之；否则清空，
+        // 避免本机全局断网（consume=true 取走快照，本轮还原一次性）
         if let Err(e) = restore_system_proxy(true) {
             fs_utils::app_log(
                 &state.data_dir,
                 &format!("还原系统代理失败(可手动在设置中关闭): {e}"),
             );
         }
+    } else {
+        let _ = app.emit("proxy-log", "代理未在运行，系统代理无需还原");
     }
-    sync_tray_proxy_text(&_app, false);
+    sync_tray_proxy_text(&app, false);
     Ok(ProxyStatus {
         running: false,
         port,

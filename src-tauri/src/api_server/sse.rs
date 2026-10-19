@@ -486,14 +486,16 @@ fn stream_convert_text_src(
     (error_info, sent_any, pending_usage)
 }
 
-/// 纯文本收集器：output/thought 文本 + usage + error + 跨事件合并的 tool_calls
-/// （M3 修复：此前非流式聚合静默丢弃上游 tool_calls，客户端拿到空 content）
+/// 纯文本收集器：output/thought 文本 + tool_calls 跨事件合并 + usage + error
+///（审查修复 M3/M6：此前非流式聚合静默丢弃上游 tool_calls，stream=false 客户端
+/// 拿到空 content 丢工具调用）
 struct PlainCollect {
     content: String,
     reasoning: String,
     finish_reason: String,
     usage: Option<Value>,
     error_info: Option<(i64, String)>,
+    /// 按 index（缺省回退 id）分段合并后的 tool_calls（与流式侧对称）
     tool_calls: Vec<Value>,
 }
 
@@ -585,6 +587,8 @@ fn collect_plain<R: Read + Send>(reader: R) -> PlainCollect {
                 "output" | "thought" => {
                     out.content.push_str(&ev.response);
                     out.reasoning.push_str(&ev.reasoning);
+                    // 审查修复（M6）：非流式聚合补 tool_calls 跨事件合并——按
+                    // index（缺省回退 id）归桶，arguments 字符串追加
                     if let Some(tc) = &ev.tool_calls {
                         if let Some(arr) = tc.as_array() {
                             merge_tool_calls(&mut out.tool_calls, arr);
@@ -626,6 +630,7 @@ pub fn aggregate<R: Read + Send>(
     if !c.reasoning.is_empty() {
         message["reasoning_content"] = json!(c.reasoning);
     }
+    // 审查修复（M6）：非流式聚合补发合并后的 tool_calls（与流式侧对称）
     if !c.tool_calls.is_empty() {
         message["tool_calls"] = json!(c.tool_calls);
     }
@@ -1406,6 +1411,34 @@ mod tests {
         let joined = collect_events(rx).join("\n");
         assert!(joined.contains("hi"), "output 文本应已转发");
         assert!(joined.ends_with("data: [DONE]"));
+    }
+
+    // ==================== 非流式聚合 tool_calls 合并（审查修复 M6）====================
+
+    #[test]
+    fn aggregate_merges_tool_call_fragments_across_events() {
+        // 上游 tool_calls 分片下发（首片 id+name+半截 arguments，次片补余下）：
+        // 非流式聚合必须按 index 合并为单条目，否则 stream=false 客户端丢工具调用
+        let input = concat!(
+            "event: output\ndata: {\"response\":\"\",\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"get_weather\",\"arguments\":\"{\\\"city\\\":\"}}]}\n\n",
+            "event: output\ndata: {\"response\":\"\",\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"\\\"北京\\\"}\"}}]}\n\n",
+            "event: done\ndata: {\"finish_reason\":\"tool_calls\"}\n\n",
+        );
+        let (resp, err) = aggregate(std::io::Cursor::new(input), "c1");
+        assert!(err.is_none());
+        let resp = resp.expect("tool_calls 流必须产出聚合结果");
+        let msg = &resp["choices"][0]["message"];
+        let tools = msg["tool_calls"].as_array().expect("tool_calls 必须下发");
+        assert_eq!(tools.len(), 1, "同 index 分片合并为单条目");
+        assert_eq!(tools[0]["id"], "call_1");
+        assert_eq!(tools[0]["type"], "function");
+        assert_eq!(tools[0]["function"]["name"], "get_weather");
+        assert_eq!(
+            tools[0]["function"]["arguments"].as_str().unwrap(),
+            "{\"city\":\"北京\"}",
+            "arguments 跨事件字符串追加"
+        );
+        assert_eq!(resp["choices"][0]["finish_reason"], "tool_calls");
     }
 
     #[test]

@@ -1107,8 +1107,8 @@ fn switch_flow(
         restore_profile(sess, "last", sink).map_err(|re| {
             format!("恢复账号 {uid} 登录态失败（{e}），且回滚到切换前状态也失败: {re}")
         })?;
-        // L 修复：回滚已完成，重启失败不掩盖回滚结果（原 `?` 传播会丢失
-        // 「已回滚」上下文，用户重试会重复整套切换流程）
+        // L 修复（L11）：回滚已完成，重启失败不应 `?` 短路丢失回滚上下文——
+        // Warn 后继续原 fatal 收尾，重启结果并入提示（回滚成果不掩盖）
         let restart_note = match proc::start_app(sess, sink) {
             Ok(()) => "并重启客户端".to_string(),
             Err(se) => {
@@ -1180,7 +1180,8 @@ fn switch_flow(
             ),
         );
         restore_profile(sess, "last", sink)?;
-        // L 修复：同上——回滚已完成，重启失败并入提示（原 `?` 传播丢失回滚上下文）
+        // L 修复（L11）：同上——回滚已完成，重启失败不应 `?` 短路丢失回滚上下文，
+        // 重启结果并入提示后继续原 fatal 收尾
         let restart_note = if proc::start_app(sess, sink).is_err() {
             sink.step(
                 "restore",

@@ -964,8 +964,11 @@ export default function QoderAccounts() {
                           void api.qoder.accountMove(a.id, gid).then(() => {
                             setAccounts((prev) => prev.map((x) => (x.id === a.id ? { ...x, group_id: gid ?? '' } : x)));
                             reloadGroups();
-                            // Low 修复：写操作成功可见反馈（UX 硬标准；原仅失败有 toast）
-                            pushToast('success', gid ? '分组已调整' : '已移出分组');
+                            // Low 修复（审查 L38）：写操作成功可见反馈（原先仅失败有提示）
+                            pushToast(
+                              'success',
+                              gid ? `「${a.nickname || a.id}」分组已调整` : `「${a.nickname || a.id}」已移出分组`,
+                            );
                           }).catch((err) => pushToast('error', `分组调整失败：${String(err)}`));
                         }}
                       />
