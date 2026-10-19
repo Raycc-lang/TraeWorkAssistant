@@ -10,6 +10,8 @@ logs/
 # 临时文件
 tmp/
 temp
+# 移植参考副本（桌面版 main 分支蓝本快照，仅供对照查阅，严禁提交）
+_tmp_*/
 scripts/.doubao_sample.local.json
 .tmp_research
 
