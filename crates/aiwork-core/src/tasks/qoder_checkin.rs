@@ -1446,31 +1446,36 @@ fn process_account(
     //   （1~3s）会误判未到账 → 降级 fail 触发整轮重签；改最多 3 次回读，到账
     //  （post > pre）即提前采信，3 轮成功回读均未增长才降级
     // - 回读失败（None）不判负——余额端点故障不应推翻已成功的领取
-    if kind == "success" && pre_balance.is_some() {
-        let mut flat_reads: u32 = 0; // 成功回读且未增长的次数
-        let mut arrived = false;
-        for _attempt in 0..3 {
-            jitter_sleep();
-            let Some(post) = super::qoder_credits::fetch_usage_balance(agent, &headers) else {
-                continue; // 回读失败：本轮作废重试；3 轮全失败则 flat_reads=0 不判负
-            };
-            let Some(pre) = pre_balance else { break; };
-            if reward.is_none() && post > pre {
-                reward = Some(post - pre);
+    if kind == "success" {
+        // 审查修复（L18）：原循环内 `let Some(pre) = pre_balance else { break; }` 是
+        // 不可达守卫（外层条件已保证 pre_balance 为 Some），死代码在日后重构外层
+        // 条件时会静默退化——改为安全绑定：不变量破坏时跳过整个到账校验
+        //（不判到账，维持 success），不依赖不可达分支兜底
+        if let Some(pre) = pre_balance {
+            let mut flat_reads: u32 = 0; // 成功回读且未增长的次数
+            let mut arrived = false;
+            for _attempt in 0..3 {
+                jitter_sleep();
+                let Some(post) = super::qoder_credits::fetch_usage_balance(agent, &headers) else {
+                    continue; // 回读失败：本轮作废重试；3 轮全失败则 flat_reads=0 不判负
+                };
+                if reward.is_none() && post > pre {
+                    reward = Some(post - pre);
+                }
+                if post > pre {
+                    arrived = true;
+                    break;
+                }
+                flat_reads += 1;
+                if !all_credits {
+                    break; // 余额无法归因非 CREDITS 奖励：不判负，无需重读（原口径）
+                }
             }
-            if post > pre {
-                arrived = true;
-                break;
+            if all_credits && !arrived && flat_reads > 0 {
+                kind = "fail".into();
+                message = format!("{message}；但余额未增长（未到账），保留自动重试");
+                reward = None;
             }
-            flat_reads += 1;
-            if !all_credits {
-                break; // 余额无法归因非 CREDITS 奖励：不判负，无需重读（原口径）
-            }
-        }
-        if all_credits && !arrived && flat_reads > 0 {
-            kind = "fail".into();
-            message = format!("{message}；但余额未增长（未到账），保留自动重试");
-            reward = None;
         }
     }
     // 签到奖励运行期回写（对齐 qoder_credits::run_snapshot_task 的 issue #102 口径）：

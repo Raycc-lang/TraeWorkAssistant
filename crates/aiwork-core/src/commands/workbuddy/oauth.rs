@@ -418,6 +418,11 @@ fn oauth_flow(
     // last_daily_chat（当日打卡幂等失效→重复跑六步链）/uid/domain 等既有键——
     // 与导入路径 BL-2 同类缺陷。新键优先，旧键缺省补齐；新码未回发 rt 时保留旧 rt
     if matches!(sink, PoolSink::BuddyAi) {
+        // 审查修复（M14）：凭证读-合并-写全程持每账号刷新锁（对齐导入路径
+        // buddy_ai_account_import_creds 同款锁域）——与网关 401 自愈轮换并发时，
+        // 锁外读旧 rec 再整行 upsert 会覆盖刚轮换落库的新 rt（账号被迫重登）
+        let refresh_lock = crate::tasks::wb_common::refresh_lock_for(&target_id);
+        let _refresh_guard = refresh_lock.lock().unwrap_or_else(|e| e.into_inner());
         let existing = sink.load_token(state, &target_id);
         let mut creds = creds;
         if let (Some(obj), Some(eobj)) = (creds.as_object_mut(), existing.as_object()) {
@@ -466,7 +471,7 @@ pub(super) fn oauth_login_async(
         return Err("已有 OAuth 扫码流程进行中".into());
     }
     let done_event = format!("{}-oauth-done", sink.event_prefix());
-    std::thread::spawn(move || {
+    let spawned = std::thread::Builder::new().name("wb-oauth".into()).spawn(move || {
         // panic 兜底（审查修复）：oauth_flow panic 会让 OAUTH_RUNNING 永久卡死
         //（CN/Intl 共享闸门）且 done 事件永不发出 → 前端弹框永远 loading 直到重启。
         // catch_unwind 确保复位 + 补发失败终态
@@ -490,6 +495,11 @@ pub(super) fn oauth_login_async(
         let _ = emit(&done_event, payload);
         OAUTH_RUNNING.store(false, Ordering::SeqCst);
     });
+    // spawn 失败兜底：线程未创建时闸门必须复位，否则 OAUTH_RUNNING 永久卡死
+    if let Err(e) = spawned {
+        OAUTH_RUNNING.store(false, Ordering::SeqCst);
+        return Err(format!("OAuth 后台线程创建失败: {e}"));
+    }
     Ok(())
 }
 

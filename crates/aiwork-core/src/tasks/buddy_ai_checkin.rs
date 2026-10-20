@@ -259,6 +259,7 @@ fn process_account(
     token: &str,
     uid: &str,
     base: &str,
+    shared: Option<&std::sync::Arc<crate::api_server::ApiSharedState>>,
     emit: &mut dyn FnMut(&Value),
 ) -> Value {
     // T7 审查修复：fail 文案统一改写「HTTP 401/403」→「凭证401/403」。调度器
@@ -312,7 +313,10 @@ fn process_account(
         "conversationOrigin": "workbuddy-app",
         "plugins": [{ "name": "weixinpay", "marketplace": "codebuddy-builtin" }],
     });
-    let conv_id = with_backoff(|| {
+    // ① 建会话（审查 #17：POST 非幂等，不走 with_backoff——请求已达但响应解析
+    // 失败（Msg 类：into_json 失败/data.id 缺失）时重发会在服务端再建一个会话 →
+    // 孤儿会话累积；失败直接 fail 交整轮冷却由下一轮重打。对齐 session/prompt 不重试口径）
+    let conv_id = (|| {
         let resp = web_headers(agent.post(&format!("{base}/console/as/conversations/")), token, uid)
             .set("Content-Type", "application/json")
             .send_string(&body.to_string())?;
@@ -332,6 +336,10 @@ fn process_account(
                 )))
             }
         })
+    })()
+    .map_err(|e| match e {
+        BackoffErr::Status(c) => format!("HTTP {c}"),
+        BackoffErr::Msg(m) => m,
     });
     let conv_id = match conv_id {
         Ok(v) => v,
@@ -550,7 +558,22 @@ fn process_account(
                     let head = match resp.into_string() {
                         Ok(body) => match serde_json::from_str::<Value>(&body) {
                             Ok(v) => trim_json(&v),
-                            Err(_) => body.chars().take(600).collect(),
+                            // 审查 #18a：非 JSON 响应体无法走键级脱敏，含任一敏感键
+                            //（大小写不敏感）即整段隐去，防沙箱凭据明文进日志/事件流
+                            Err(_) => {
+                                let lower = body.to_lowercase();
+                                if SENSITIVE_KEYS
+                                    .iter()
+                                    .any(|k| lower.contains(&k.to_lowercase()))
+                                {
+                                    format!(
+                                        "[非 JSON 响应体 {} 字节，含敏感字段已整段隐去]",
+                                        body.len()
+                                    )
+                                } else {
+                                    body.chars().take(600).collect()
+                                }
+                            }
                         },
                         Err(_) => String::new(),
                     };
@@ -741,6 +764,24 @@ fn process_account(
             crate::fs_utils::app_log(&state.data_dir, &format!("buddy-ai: 打卡积分回写失败 {acct_id}: {err}"));
         }
     }
+    // 审查 #4：打卡到账同步拨进运行期网关 buddy_ai_pool（qoder/wb 先例）——
+    // 键位口径：buddy-ai 网关装配以账号 id 充当条目 uid，按 acct_id 拨新即命中；
+    // expire None 不抹池内旧值（update_credits_snapshot 是无条件覆盖语义，故
+    // expire 缺失时先从池内现状补取，防「先到期优先」口径被 None 误压）
+    if let (Some(shared), Some(info)) = (shared, &after) {
+        let expire = match info.expire_secs {
+            Some(e) => Some(e),
+            None => shared
+                .buddy_ai_pool
+                .status_list()
+                .into_iter()
+                .find(|s| s.uid == acct_id)
+                .and_then(|s| s.credits_expire_at),
+        };
+        let m: std::collections::HashMap<String, (f64, Option<i64>)> =
+            std::collections::HashMap::from([(acct_id.to_string(), (info.total, expire))]);
+        shared.buddy_ai_pool.update_credits_snapshot(&m);
+    }
     let msg = match gain {
         Some(g) => format!("活跃打卡完成，积分 +{g:.0}（{:.0} → {:.0}）",
             before.as_ref().map(|b| b.total).unwrap_or(0.0),
@@ -817,21 +858,26 @@ fn acp_answer_request(
     format!("{method} ← 已代答（HTTP {status}）")
 }
 
+/// 失败诊断敏感键（审查 #18：补 sessionId/session_id——② 步沙箱会话凭据；
+/// 升模块级供 trim_json 与 4xx 非 JSON 整段隐去判定共用）
+const SENSITIVE_KEYS: [&str; 9] = [
+    "token",
+    "access_token",
+    "accessToken",
+    "refresh_token",
+    "refreshToken",
+    "authorization",
+    "link",
+    "sessionId",
+    "session_id",
+];
+
 /// 失败诊断用的响应摘要（审查 H5/H6 修复）：
 /// ① 先脱敏——响应可能携带沙箱凭证（② 步的 token/link 等），原样序列化会经
 ///    NDJSON 进度事件广播 + app_log 明文落盘（长期存储泄漏面）；
 /// ② 再截断——serde_json 输出 UTF-8 原文，按字节切片遇非 ASCII（中文错误文案）
 ///    不是字符边界会 panic 且 panic 沿 process_account 展开杀掉整轮打卡线程
 fn trim_json(v: &Value) -> String {
-    const SENSITIVE_KEYS: [&str; 7] = [
-        "token",
-        "access_token",
-        "accessToken",
-        "refresh_token",
-        "refreshToken",
-        "authorization",
-        "link",
-    ];
     let mut redacted = v.clone();
     redact_sensitive(redacted.as_object_mut(), &SENSITIVE_KEYS);
     let s = redacted.to_string();
@@ -885,9 +931,25 @@ pub fn run_checkin_round(state: &AppState, emit: &mut dyn FnMut(&Value)) -> Valu
                 .unwrap_or(false)
         })
         .collect();
+    // 审查 #15：空池空轮打 skipped_empty_pool 标记——调度器 tick 据此不 mark_run
+    //（mark_run 固化「当日已跑」，当日新增账号会失去调度补打）；事件流契约不变
+    //（start/done 齐备，UI/CLI 零改动），结果落库亦跳过（无事件可记）
+    if accounts.is_empty() {
+        emit(&json!({ "type": "start", "total": 0 }));
+        let done = json!({
+            "type": "done", "ok": 0, "already": 0, "failed": 0,
+            "skipped": "buddy-ai 池无可用账号，本轮空跑跳过（不固化当日已跑）",
+            "skipped_empty_pool": true,
+        });
+        emit(&done);
+        return done;
+    }
     emit(&json!({ "type": "start", "total": accounts.len() }));
 
     let gap_secs = crate::models::effective_checkin_gap(state.settings().buddy_ai_checkin_gap_secs);
+    // 网关运行态共享句柄（审查 #4 运行期回写）：网关未启动/未注册时为 None，
+    // 打卡到账的运行池拨新跳过（持久池回写不受影响）
+    let shared = crate::api_server::runtime::gateway_shared();
     let mut events: Vec<Value> = Vec::new();
     for (i, (id, name, pool_uid)) in accounts.iter().enumerate() {
         if i > 0 && gap_secs > 0 {
@@ -916,7 +978,7 @@ pub fn run_checkin_round(state: &AppState, emit: &mut dyn FnMut(&Value)) -> Valu
             "name": name,
             "message": format!("开始处理（{}/{}），六步链预计 1-3 分钟…", i + 1, accounts.len()),
         }));
-        let mut ev = process_account(state, &agent, id, name, &token, &uid, base, &mut *emit);
+        let mut ev = process_account(state, &agent, id, name, &token, &uid, base, shared.as_ref(), &mut *emit);
         ev["index"] = json!(i + 1);
         emit(&ev);
         events.push(ev);

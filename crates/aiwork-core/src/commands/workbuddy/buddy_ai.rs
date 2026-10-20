@@ -291,6 +291,16 @@ pub fn buddy_ai_account_import_creds(
             ));
         }
     }
+    // 审查 #13：反向门控（国内侧 is_intl_credential 先例的镜像）——domain 缺省回落
+    // www.workbuddy.ai 只能挡显式传入的国内 domain，挡不住 CN token 不带 domain 直入
+    // 国际池。凭证 iss 才是真源，显式传国际 domain 不豁免；判定为非国际凭证一律拒绝
+    //（国际池 fail-closed，非 JWT 垃圾串同样挡下，与国内池「拒绝国际账号」双向隔离）
+    if !super::accounts::is_intl_credential(None, Some(&token)) {
+        return Err(
+            "区域校验失败：该凭证非国际版（token 签发域非 workbuddy.ai）；国内账号请走 Buddy 页导入"
+                .into(),
+        );
+    }
     let domain = intl_domain_or(domain);
     let id = account_id_of(&token);
     let uid = super::oauth::jwt_claims(&token)
@@ -339,6 +349,13 @@ pub fn buddy_ai_account_import_creds(
     // 锁外读到的 stale rt 会整行覆盖新 rt（账号须重登）——与续期/打卡写段同锁域
     let refresh_lock = crate::tasks::wb_common::refresh_lock_for(&target_id);
     let _refresh_guard = refresh_lock.lock().unwrap_or_else(|e| e.into_inner());
+    // 审查修复（M18）：写回前复查账号仍在池中——导入与删号并发时，慢路径
+    // 可能给已移除账号写入幽灵凭证（登录态/token store 残留脏数据）。
+    // 纯 DB 读（load_buddy_pool 无锁），持刷新锁内调用安全（既有模式）
+    let still_in_pool = buddy_ai_pool_contains(state, &target_id);
+    if !still_in_pool {
+        return Err(format!("账号 {target_id} 已被移除，取消凭证写入（防幽灵凭证残留）"));
+    }
     let existing = crate::tasks::wb_common::buddy_ai_token_store_load(&state.data_dir)
         .get("tokens")
         .and_then(|t| t.get(&target_id))
@@ -461,9 +478,9 @@ pub fn buddy_ai_accounts_list(state: &AppState) -> Result<Vec<Value>, String> {
 
 /// 移除 buddy-ai 账号（池条目 + token store 行 + buddy-ai vault 条目三清 + 标签绑定清理）
 pub fn buddy_ai_account_remove(state: &AppState, user_id: String) -> Result<(), String> {
-    if user_id.is_empty() || user_id.len() > 64 {
-        return Err(format!("非法账号标识: {user_id}"));
-    }
+    // 审查 #12：字符白名单（ensure_uid_safe 统一入口）——user_id 作路径组件
+    //（vault ns / token store / 快照槽位），仅长度校验放行了 `..`、分隔符注入
+    fs_utils::ensure_uid_safe(&user_id)?;
     let _guard = state.buddy_ai_pool_lock.lock().unwrap_or_else(|e| e.into_inner());
     let mut pool = load_buddy_pool(&state);
     let before = pool.accounts.len();
@@ -655,11 +672,30 @@ pub(crate) fn buddy_ai_refresh_impl(state: &AppState, user_id: &str) -> Result<S
 
 // ── 定时任务（2026-10-16 六页对齐批 3）：凭证兜底续期 + 模型目录同步 ──────────
 
+/// 账号级兜底续期失败连击 kv 键（审查 #16）：`{ "<id>": { "streak": n, "date": d } }`
+/// ——Intl 刷新失败有意按暂态处理不标 needs_relogin（防误杀，见 buddy_ai_refresh_impl），
+/// 但永久失效账号每轮必败且 renewed==0 拖任务 Err 全天退避空转；连击达阈值当日熔断
+/// 跳过，成功清零，跨日重置（服务端故障自愈后次日自动恢复探测，对齐打卡连击语义）
+const BUDDY_AI_RENEW_STREAK_KEY: &str = "buddy_ai_renew_fail_streak";
+/// 熔断阈值：同日连续失败 3 轮（首轮 + 退避重试）即熔断当日剩余重试
+const BUDDY_AI_RENEW_STREAK_LIMIT: i64 = 3;
+
 /// buddy-ai 凭证兜底续期任务（对齐国内 wb-renew lazy 口径）：仅刷新 AT 剩余 ≤48h
 /// 的启用账号；全部失败返 Err 交调度器 30 分钟冷却重试，部分失败按暂态容忍
 pub fn buddy_ai_renew_task(state: &AppState) -> Result<Value, String> {
     let pool = load_buddy_pool(state);
     let now = chrono::Utc::now().timestamp();
+    let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
+    let streaks: Value = crate::store::db(&state.data_dir).kv_get(BUDDY_AI_RENEW_STREAK_KEY);
+    let streak_of = |id: &str| -> i64 {
+        match streaks.get(id) {
+            Some(s) if s.get("date").and_then(Value::as_str) == Some(today.as_str()) => {
+                s.get("streak").and_then(Value::as_i64).unwrap_or(0).max(0)
+            }
+            _ => 0,
+        }
+    };
+    let mut fused = 0usize;
     let due: Vec<String> = pool
         .accounts
         .iter()
@@ -667,34 +703,59 @@ pub fn buddy_ai_renew_task(state: &AppState) -> Result<Value, String> {
             if a.disabled {
                 return false;
             }
-            match a.access_token_expires_at {
+            let due_by_expiry = match a.access_token_expires_at {
                 // 有到期记录：剩余 ≤48h 纳入
                 Some(e) => e <= now + 48 * 3600,
                 // 无到期记录（导入未带 expiresIn 等）：凭证落盘超 48h 也纳入兜底，
                 // 否则这类账号永不触发兜底续期（auth_saved_at 在续期成功时刷新节流）
                 None => a.auth_saved_at.map(|s| s <= now - 48 * 3600).unwrap_or(false),
+            };
+            due_by_expiry && {
+                // 审查 #16：连击达阈值的账号当日熔断跳过（fused 计数供返回值观测）
+                if streak_of(&a.id) >= BUDDY_AI_RENEW_STREAK_LIMIT {
+                    fused += 1;
+                    false
+                } else {
+                    true
+                }
             }
         })
         .map(|a| a.id.clone())
         .collect();
     if due.is_empty() {
-        return Ok(json!({ "ok": true, "skipped": "无临期账号" }));
+        return Ok(if fused > 0 {
+            json!({ "ok": true, "skipped": "无临期账号", "fused": fused })
+        } else {
+            json!({ "ok": true, "skipped": "无临期账号" })
+        });
     }
     let mut renewed = 0usize;
     let mut failed = 0usize;
+    let mut streaks_now = streaks.as_object().cloned().unwrap_or_default();
     for id in &due {
         match buddy_ai_refresh_impl(state, id) {
-            Ok(_) => renewed += 1,
+            Ok(_) => {
+                renewed += 1;
+                streaks_now.remove(id);
+            }
             Err(e) => {
                 failed += 1;
+                streaks_now.insert(
+                    id.clone(),
+                    json!({ "streak": streak_of(id) + 1, "date": today }),
+                );
                 fs_utils::app_log(&state.data_dir, &format!("buddy-ai: 兜底续期失败 id={id}: {e}"));
             }
         }
     }
+    if renewed + failed > 0 {
+        let _ = crate::store::db(&state.data_dir)
+            .kv_set(BUDDY_AI_RENEW_STREAK_KEY, &Value::Object(streaks_now));
+    }
     if renewed == 0 {
         return Err(format!("buddy-ai 凭证续期全部失败（{failed} 个临期账号）"));
     }
-    Ok(json!({ "ok": true, "renewed": renewed, "failed": failed }))
+    Ok(json!({ "ok": true, "renewed": renewed, "failed": failed, "fused": fused }))
 }
 
 /// buddy-ai 模型目录同步实现（/v3/config 直连；手动命令与调度任务共用）。
@@ -853,6 +914,11 @@ pub fn buddy_ai_credits_sync_impl(state: &AppState) -> Result<Vec<Value>, String
         .unwrap_or_default();
     let mut out = Vec::new();
     for a in &pool.accounts {
+        // 审查修复（M17）：停用账号不参与积分/Token 同步，避免污染看板统计
+        // （对齐 buddy_ai_usage_official_all_impl 的 disabled 过滤口径）
+        if a.disabled {
+            continue;
+        }
         let rec = tokens.get(&a.id).cloned().unwrap_or_default();
         let token = as_str(fs_utils::dig(&rec, &["access_token"])).unwrap_or_default().to_string();
         if token.is_empty() {
@@ -1604,6 +1670,7 @@ fn buddy_ai_row_preview(item: &Value) -> String {
 /// 端点/回退与 buddy_ai_request_usage 同款：/v2 前缀 404 回退裸路径）。
 /// 返回 (聚合行 (date, credit, model), 请求级行)；requestId 去重，
 /// credit 缺失/负值/日期不可解析行跳过；请求级行仅含 ts 可解析的行。
+/// 审查修复（M21）：分页中途失败降级为「已取数据 + truncated」（零数据失败仍上抛）。
 fn buddy_ai_official_usage_rows(
     agent: &ureq::Agent,
     base: &str,
@@ -1652,20 +1719,41 @@ fn buddy_ai_official_usage_rows(
     let mut reported_total: i64 = 0;
     let mut page_responses: Vec<Value> = vec![first];
     let mut next_page = 2u64;
+    // 审查修复（M21）：分页中途失败降级——置 mid_fail 提前收束，返回已成功拉取的
+    // 页数据并透传 truncated（调用方/前端据此提示「数据不完整」），不再 `?`/Err
+    // 整体上抛丢弃全部已取页；首页探测失败与零数据失败仍原样上抛——调用方的
+    // stale 缓存回退依赖 Err 信号，空数据 + truncated 会被误计为成功账号跳过回退
+    let mut mid_fail = false;
     loop {
         let Some(v) = page_responses.pop() else {
             if next_page > 30 {
                 break;
             }
-            page_responses.push(call(&url, next_page)?);
-            next_page += 1;
+            match call(&url, next_page) {
+                Ok(v) => {
+                    page_responses.push(v);
+                    next_page += 1;
+                }
+                Err(e) => {
+                    if rows.is_empty() && sess_rows.is_empty() {
+                        return Err(e);
+                    }
+                    mid_fail = true;
+                    break;
+                }
+            }
             continue;
         };
         if v.get("code").and_then(Value::as_i64) != Some(0) {
-            return Err(format!(
+            let msg = format!(
                 "官网返回异常: {}",
                 v.get("msg").and_then(Value::as_str).unwrap_or("未知错误")
-            ));
+            );
+            if rows.is_empty() && sess_rows.is_empty() {
+                return Err(msg);
+            }
+            mid_fail = true;
+            break;
         }
         let data = v.get("data").cloned().unwrap_or_default();
         let items = data
@@ -1721,8 +1809,9 @@ fn buddy_ai_official_usage_rows(
             break;
         }
     }
-    // 截断标记（31 天 > 30 页 × 100 行的重度账号）：聚合可低估，调用方/前端须可感知
-    let truncated = reported_total > seen.len() as i64;
+    // 截断标记（31 天 > 30 页 × 100 行的重度账号）：聚合可低估，调用方/前端须可感知；
+    // M21 分页中途失败同样置 truncated（已取页数不足，聚合同样不完整）
+    let truncated = mid_fail || reported_total > seen.len() as i64;
     Ok((rows, sess_rows, truncated))
 }
 
@@ -1870,8 +1959,9 @@ pub fn buddy_ai_accounts_import(
     };
     let mut token_targets: Vec<(String, Value)> = Vec::new();
     for a in new_accounts {
-        // id 硬校验（与 buddy_ai_account_remove 的 64 字符上限同口径；防超长/带空白脏数据入池）
-        if a.id.is_empty() || a.id.len() > 64 || a.id.trim() != a.id {
+        // id 硬校验（审查 #12）：改用 fs_utils::ensure_uid_safe 白名单——字符集限定
+        // + 拒绝 ..，与 buddy_ai_account_remove 同口径
+        if fs_utils::ensure_uid_safe(&a.id).is_err() {
             invalid += 1;
             continue;
         }

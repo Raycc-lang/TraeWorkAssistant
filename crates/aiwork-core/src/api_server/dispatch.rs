@@ -493,13 +493,21 @@ pub fn resolve_target(
                 // buddy-ai 池上游不存在（审查修复）
                 let whitelist = super::unified_catalog::load_whitelist(&state.data_dir);
                 let in_wl = |m: &str| super::unified_catalog::whitelist_allows(&whitelist, m);
+                // 审查 #19：双收录模型可能落 buddy-ai 池（Intl 上游）——降级候选出自
+                // CN 目录，若候选 id 不在 Intl 目录，降级后发往 buddy-ai 池上游不存在。
+                // buddy_in_both 时候选取 CN∩Intl 交集；单收录保持 CN 目录候选不变
+                let in_wl_intl = |m: &str| {
+                    in_wl(m)
+                        && (!buddy_in_both
+                            || super::wb_catalog::find(&intl_catalog, m).is_some())
+                };
                 let final_model = if !buddy_intl_only
                     && state
                         .wb_bg_downgrade
                         .load(std::sync::atomic::Ordering::Relaxed)
                     && wb_model_route::is_background_task(body)
                 {
-                    wb_model_route::cheapest_catalog_model_filtered(&catalog, &in_wl)
+                    wb_model_route::cheapest_catalog_model_filtered(&catalog, &in_wl_intl)
                         .unwrap_or_else(|| r.model.clone())
                 } else if !buddy_intl_only
                     && state.wb_longctx_downgrade.load(std::sync::atomic::Ordering::Relaxed)
@@ -507,7 +515,7 @@ pub fn resolve_target(
                     && wb_model_route::estimate_input_tokens(body)
                         >= wb_model_route::LONGCTX_TOKEN_THRESHOLD
                 {
-                    wb_model_route::flash_catalog_model_filtered(&catalog, &in_wl)
+                    wb_model_route::flash_catalog_model_filtered(&catalog, &in_wl_intl)
                         .unwrap_or_else(|| r.model.clone())
                 } else {
                     r.model.clone()
@@ -2247,9 +2255,11 @@ mod tests {
         let r = resolve_target(&f.state, "glm-5.3", &bg_body(), None).unwrap();
         assert_eq!(r.model, "glm-5.3", "降级候选不在白名单 → 跳过降级保持原模型");
 
-        // 白名单清空（不限）→ 正常降级到目录最低倍率 hy4-preview
+        // 白名单清空（不限）→ 正常降级取目录最低倍率。#19 交集语义：glm-5.3 为
+        // CN/Intl 双收录（buddy_in_both），候选须同时在 Intl 目录——仅 CN 收录的
+        // hy4-preview 被排除，双收录且同倍率 0.00 的 hy3 当选（对齐 main 移植行为）
         super::super::unified_catalog::save_whitelist(&f.dir, &[]).unwrap();
         let r = resolve_target(&f.state, "glm-5.3", &bg_body(), None).unwrap();
-        assert_eq!(r.model, "hy4-preview", "空白名单不限 → 后台任务降级取目录最低倍率");
+        assert_eq!(r.model, "hy3", "空白名单不限 → 双收录请求降级取 CN∩Intl 交集内最低倍率");
     }
 }

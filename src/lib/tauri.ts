@@ -1075,19 +1075,32 @@ export async function setupListeners(
   handlers: ListenerHandlers,
 ): Promise<UnlistenFn[]> {
   const unsubs: UnlistenFn[] = [];
-  if (handlers.onCheckinProgress) {
-    unsubs.push(
-      await listen<CheckinProgressEvent>('checkin-progress', (e) =>
-        handlers.onCheckinProgress!(e.payload),
-      ),
-    );
-  }
-  if (handlers.onQoderCheckinProgress) {
-    unsubs.push(
-      await listen<string>('qoder-checkin-progress', (e) =>
-        handlers.onQoderCheckinProgress!(e.payload as string),
-      ),
-    );
+  // 审查修复（L31）：注册中途失败（某事件 listen 抛错）时，先注销已注册的
+  // 前序监听再重抛，避免泄漏；调用方（store）拿到异常时也不会有残留监听
+  try {
+    if (handlers.onCheckinProgress) {
+      unsubs.push(
+        await listen<CheckinProgressEvent>('checkin-progress', (e) =>
+          handlers.onCheckinProgress!(e.payload),
+        ),
+      );
+    }
+    if (handlers.onQoderCheckinProgress) {
+      unsubs.push(
+        await listen<string>('qoder-checkin-progress', (e) =>
+          handlers.onQoderCheckinProgress!(e.payload as string),
+        ),
+      );
+    }
+  } catch (err) {
+    for (const u of unsubs) {
+      try {
+        u();
+      } catch {
+        /* 单个注销失败不阻断清理，继续注销其余监听 */
+      }
+    }
+    throw err;
   }
   return unsubs;
 }

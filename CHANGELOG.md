@@ -6,6 +6,22 @@
 
 ---
 
+## [1.5.1] · 2026-10-20 · 移植 main 审查修复批 + 写权竞态加固
+
+> 移植 main `5f88dfe`→`5c4014f`（4 提交：六轮全面审查修复、14 项审查修复、复审修复、死代码清理），非 OS 依赖语义移植，未 merge；应用显隐等口径按 docker 后端对齐，桌面/OS 专属跳过。
+
+### 修复与加固
+
+- **网关**：buddy-ai 国际档折入仅开启生效（`buddy_in_both`），CN 专属模型不再静默切国际上游；模型级冷却按 TargetPool 归因真实池；WbDisabled 按 `available` 判定；非幂等建会话 POST 不重试；4xx 响应体脱敏（补 sessionId）；responses 429 冷却改视图表；Buddy 池降级候选取 CN∩Intl 交集。
+- **BuddyAI 链路**：凭证导出强制口令加密（AIWQENC1：Argon2id + AES-256-GCM，明文旧文件兼容导入）；打卡到账回写运行期网关池、空轮不固化当日已跑（`skipped_empty_pool`）；renew 永久失效连击熔断（3 轮当日跳过、跨日重置）；`import_creds` 拒 CN token 入国际池；账号库 id 白名单 `ensure_uid_safe`。
+- **调度与部署**：`buddy_ai_*_hhmm` 补 settings 回退与非法值二级回退；用量跨日归因；`AIWORK_DISABLE_LOCAL_QUOTA` 免容器本地 quota 空探测；OAuth 外置配置优先 `AIWORK_DATA_DIR`；签到间隔 `effective_checkin_gap` 统一。
+- **前端**：BuddyAiCredits 载入/同步改双守卫（写权版本门控，失败不占号）；saveFlags 失败按序号分流上报（被取代静默 + 诊断日志）；app_icons 白名单补 buddy-ai（Globe）；GatewayHelpModal 复制定时器卸载清理；ResourceSummary 保存成功后拉取最新池；应用显隐口径对齐后端（hidden_apps 3 键 / 图标 4 键）。
+- **杂项**：清理死代码 `model_cooling_remaining_wb`；凭证导入空 accessToken 500 改业务校验；qoder 会话说明剥离注入标签；模型 ID 归一化保留小数点。
+
+### 验证
+
+- `cargo test --workspace` 741 通过（7 忽略）· `tsc` 0 错误 · `vitest` 68 通过。
+
 ## [1.5.0] · 2026-10-19 · BuddyAI 国际池五池化 + 审查修复
 
 > 手工语义移植 main `f5f2cd3`→`origin/main`（28+2 提交），桌面/OS 专属跳过；「应用显隐联动」以 Web 侧 `appVisibility` 池级显隐落地（隐藏仅移除界面入口，调度/记账/绑定继续生效）。

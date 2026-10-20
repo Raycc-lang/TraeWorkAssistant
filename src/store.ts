@@ -241,7 +241,9 @@ function defaultSettings(): Settings {
 // 侧边栏应用显示兜底：旧版本配置缺字段/脏值归一，固定应用非法回退 trae 且强制可见
 // （合法 key 按 docker 分支应用集合裁剪：无 doubao；buddy-ai 不参与固定应用）
 function normalizeAppDisplay(settings: Settings): void {
-  const validApps: AppKey[] = ['trae', 'buddy', 'qoder', 'buddy-ai'];
+  // 审查修复（L33）：hidden_apps 白名单对齐后端 state.rs 口径——仅 3 键且不含
+  // buddy-ai（其可见性走独立 opt-in buddy_ai_visible，不进隐藏列表）
+  const validApps: AppKey[] = ['trae', 'buddy', 'qoder'];
   const pinnableApps: AppKey[] = ['trae', 'buddy', 'qoder'];
   if (!pinnableApps.includes(settings.pinned_app as AppKey)) settings.pinned_app = 'trae';
   settings.hidden_apps = (settings.hidden_apps ?? []).filter(
@@ -269,9 +271,13 @@ function normalizeAppDisplay(settings: Settings): void {
   settings.buddy_ai_catalog_sync_enabled = settings.buddy_ai_catalog_sync_enabled !== false;
   if (!settings.buddy_ai_catalog_sync_hhmm?.trim()) settings.buddy_ai_catalog_sync_hhmm = '05:55';
   // 自定义图标兜底：非法应用 key / 空图标名丢弃（非法图标名由渲染层 resolveAppIcon 回退默认）
+  // 审查修复（#7）：图标白名单对齐后端 state.rs 口径含 buddy-ai（应用显示面板行首
+  // 入口放行自定义图标；原沿用 hidden_apps 的 validApps 缺 buddy-ai，每次刷新
+  // 都把 buddy-ai 自定义图标清除并随 saveSettings 写回丢失）
+  const iconApps: AppKey[] = ['trae', 'buddy', 'qoder', 'buddy-ai'];
   const cleanIcons: Partial<Record<AppKey, string>> = {};
   for (const [k, v] of Object.entries(settings.app_icons ?? {})) {
-    if (validApps.includes(k as AppKey) && typeof v === 'string' && v.trim()) {
+    if (iconApps.includes(k as AppKey) && typeof v === 'string' && v.trim()) {
       cleanIcons[k as AppKey] = v.trim();
     }
   }
@@ -770,7 +776,10 @@ export const useAppStore = create<AppState>((set, get) => ({
     const next = { ...current, ...patch } as Settings;
     set({ settings: next });
     try {
-      await api.misc.settingsSet(next);
+      // 后端 settings_set 为真 patch 语义（仅写出现的字段）——只发 patch，
+      // 不发合并后的全量对象：store.settings 可能落后于其他通道（如系统设置弹框）刚保存的值，
+      // 全量发送会把那些字段回滚成旧值
+      await api.misc.settingsSet(patch);
     } catch (err) {
       // 回滚到修改前的值，避免 UI 显示与后端不一致
       set({ settings: current });

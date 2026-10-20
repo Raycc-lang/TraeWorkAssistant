@@ -389,10 +389,22 @@ pub(crate) fn refresh_lock_for(acct_id: &str) -> std::sync::Arc<std::sync::Mutex
 
 /// 账号移除路径主动清理（P3-L，对齐 qoder refresh_lock_remove）：回收刷新锁表项，
 /// 防止账号删除后条目永驻 HashMap（进程生命周期内每次增删账号泄漏一把锁）。
+/// 审查修复（M20）：仅当 Arc::strong_count==1（仅剩表内自身引用）时才回收——
+/// remove 与旧持有者 drop 守卫之间有窗口，贸然 remove 会让新读者经
+/// refresh_lock_for 重建新锁与旧持有者并行进入临界区，互斥失效；条目留待后续
+/// 移除再回收，仅延迟不泄漏。
 pub(crate) fn refresh_lock_remove(acct_id: &str) {
     let mut g = WB_REFRESH_LOCKS.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(map) = g.as_mut() {
-        map.remove(acct_id);
+        // 持表锁期间 check-then-remove 与 refresh_lock_for 的 get_or_insert 互斥，
+        // get 的借用不计入 strong_count，判定可靠
+        if map
+            .get(acct_id)
+            .map(|arc| std::sync::Arc::strong_count(arc) == 1)
+            .unwrap_or(false)
+        {
+            map.remove(acct_id);
+        }
     }
 }
 

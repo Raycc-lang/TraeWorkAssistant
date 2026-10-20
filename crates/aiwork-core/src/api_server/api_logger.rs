@@ -417,8 +417,18 @@ fn write_locked(st: &mut LoggerState, dir: &PathBuf) {
                 st.file = Some(f);
                 st.date = today;
             }
-            // 打开失败：丢弃本批（与旧实现 write 失败静默语义一致），保留队列外后续行
-            Err(_) => {
+            // 打开失败：丢弃本批（与旧实现 write 失败静默语义一致），保留队列外后续行；
+            // 但留痕一条到 stderr 与数据目录日志，便于排查磁盘/权限类故障（审查 L4）
+            Err(e) => {
+                let msg = format!(
+                    "[api_logger] 打开日志文件失败，丢弃本批 {} 行（path={}）: {e}",
+                    st.queue.len(),
+                    path.display()
+                );
+                eprintln!("{msg}");
+                if let Some(data_dir) = dir.parent() {
+                    crate::fs_utils::app_log(data_dir, &msg);
+                }
                 st.queue.clear();
                 st.date = today;
                 return;

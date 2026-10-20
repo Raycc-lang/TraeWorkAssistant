@@ -92,10 +92,30 @@ fn data_dir_of() -> Option<std::path::PathBuf> {
 pub fn oauth_client() -> &'static OAuthClientConfig {
     static CFG: std::sync::OnceLock<OAuthClientConfig> = std::sync::OnceLock::new();
     CFG.get_or_init(|| {
-        data_dir_of()
-            .map(|d| d.join("conf").join("oauth_client.json"))
-            .map(|p| fs_utils::read_json::<OAuthClientConfig>(&p))
-            .unwrap_or_default()
+        // 审查修复（B25/外置 OAuth 观测）：目录解析已走 data_dir_of（AIWORK_DATA_DIR
+        // 优先），回落内置默认时补一条轻量日志不再静默（进程级 OnceLock 仅记一条）
+        match data_dir_of() {
+            Some(root) => {
+                let p = root.join("conf").join("oauth_client.json");
+                if !p.exists() {
+                    fs_utils::app_log(
+                        &root,
+                        &format!(
+                            "[OAuth] 外置 OAuth 客户端配置缺失（{}），回落内置默认 client_id/secret",
+                            p.display()
+                        ),
+                    );
+                }
+                fs_utils::read_json::<OAuthClientConfig>(&p)
+            }
+            None => {
+                // 数据目录不可解析时 app.log 无处可写，走 stderr（容器日志可见）兜底
+                eprintln!(
+                    "[OAuth] 数据目录不可解析（AIWORK_DATA_DIR/APPDATA 均未设置），外置 OAuth 客户端配置不可用，回落内置默认"
+                );
+                OAuthClientConfig::default()
+            }
+        }
     })
 }
 

@@ -278,9 +278,11 @@ fn inject_trae_outbound(
     }
 }
 
-/// 模型级冷却快速失败（T2.7/F-34：优先级高于 Key 级）
-fn model_cooling_response(state: &ApiSharedState, model: &str, proto: Protocol) -> Response {
-    let rem = wb_route::model_cooling_remaining_wb(state, model).unwrap_or(0);
+/// 模型级冷却快速失败（T2.7/F-34：优先级高于 Key 级）。
+/// 审查 #21：剩余秒数按调用方档位视图取——此前固定走 CN wb 档便捷包装，
+/// buddy-ai 模型冷却时（独立冷却表有值）客户端拿到 "retry after 0s"
+fn model_cooling_response(view: &wb_route::WbView, model: &str, proto: Protocol) -> Response {
+    let rem = wb_route::model_cooling_remaining(view, model).unwrap_or(0);
     let msg = format!("model {} cooling down, retry after {}s", model, rem);
     match proto {
         Protocol::Anthropic => anthropic_error(StatusCode::TOO_MANY_REQUESTS, "rate_limit_error", &msg),
@@ -1026,7 +1028,7 @@ pub async fn responses_api(
             wb_route::WbView::wb(state.clone())
         };
         if wb_route::model_cooling_remaining(&view, &resolved_model).is_some() {
-            return model_cooling_response(&state, &resolved_model, Protocol::Responses);
+            return model_cooling_response(&view, &resolved_model, Protocol::Responses);
         }
     }
 
@@ -1704,6 +1706,9 @@ fn stream_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: String, str
                 })
         });
         let mut tried = HashSet::new();
+        // 审查修复（L1）：最近绑定账号（绑定成功才更新）——外层断连终局归因复用，
+        // 防换号重试期间断连落 "none" 致账单排查失据（对齐 wb_route）
+        let mut last_bound_uid: Option<String> = None;
         // 401 自愈去重（issue #27 方案 B）：每账号每请求最多强制刷新一次（对齐 wb_route T2.6）
         let mut refreshed_401 = HashSet::new();
         // 空完成计数（issue #57 后续可观测）：轮换耗尽收尾时区分「渠道指纹拦截」与「账号池耗尽」
@@ -1720,8 +1725,10 @@ fn stream_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: String, str
             // 审查 M5：断连也是请求终局，补记一行失败用量（未取号 → "none"，
             // 与下方轮换耗尽收尾同口径），防用量页 requests 缺口
             if tx.is_closed() {
+                // 审查修复（L1）：归因复用最近绑定账号（从未绑定才落 "none"）
+                let uid = last_bound_uid.as_deref().unwrap_or("none");
                 state.record_usage(
-                    false, &model, "none", &key_id, false, true,
+                    false, &model, uid, &key_id, false, true,
                     start_ts.elapsed().as_millis() as u64, 0, 0,
                 );
                 return;
@@ -1755,6 +1762,8 @@ fn stream_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: String, str
             if !bound {
                 continue;
             }
+            // 审查修复（L1）：绑定成功才更新「最近绑定账号」（CAS 拒绝的候选不算）
+            last_bound_uid = Some(picked.uid.clone());
             *safe_lock(&state.active_uid) = Some(picked.uid.clone());
 
             let mut converted = super::payload::prepare_llm_chat_body(

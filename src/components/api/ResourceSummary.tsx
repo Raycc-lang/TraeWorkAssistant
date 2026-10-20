@@ -173,15 +173,26 @@ function DispatchCenterCard({
         patch.buddy,
       );
       if (seq === saveSeqRef.current) {
-        // 本地合并仅覆盖本次修改的维度，其余保持父级现值
-        onPoolChanged({
-          ...pool,
-          ...(patch.trae !== undefined ? { strategy: patch.trae } : null),
-          ...(patch.buddy !== undefined ? { wb_strategy: patch.buddy } : null),
-          ...(patch.qoder !== undefined ? { qoder_strategy: patch.qoder } : null),
-          ...(patch.buddyAi !== undefined ? { buddy_ai_strategy: patch.buddyAi } : null),
-        });
-        toast('success', '调度策略已保存，运行中网关即时生效');
+        // 审查修复（H3）：保存成功后回读后端最新池配置刷新父级状态（poolSet 的
+        // uids/group_ids 参数为页面加载时的旧快照，其他端改过的池配置会被旧快照
+        // 静默回退，原先仅做本地合并无法感知）。回读失败时退回本地合并（仅覆盖
+        // 本次修改维度），保证 UI 至少反映本次保存结果
+        const latest = await api.apiServer.poolList().catch(() => null);
+        if (seq === saveSeqRef.current) {
+          if (latest) {
+            onPoolChanged(latest);
+          } else {
+            // 本地合并仅覆盖本次修改的维度，其余保持父级现值
+            onPoolChanged({
+              ...pool,
+              ...(patch.trae !== undefined ? { strategy: patch.trae } : null),
+              ...(patch.buddy !== undefined ? { wb_strategy: patch.buddy } : null),
+              ...(patch.qoder !== undefined ? { qoder_strategy: patch.qoder } : null),
+              ...(patch.buddyAi !== undefined ? { buddy_ai_strategy: patch.buddyAi } : null),
+            });
+          }
+          toast('success', '调度策略已保存，运行中网关即时生效');
+        }
       }
     } catch (e) {
       if (seq === saveSeqRef.current) {
