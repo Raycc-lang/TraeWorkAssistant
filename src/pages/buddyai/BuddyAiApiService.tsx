@@ -79,6 +79,9 @@ export default function BuddyAiApiService() {
   // 覆盖其后已成功落库/已被外部回读覆盖的新状态——saveFlags 入口与 refresh() 外部
   // 回读均递增，回滚仅当序号未变时执行（与 scopeSeqRef 同法）
   const flagsSeqRef = useRef(0);
+  // 保存请求序号守卫（审查 #6，与 ResourceSummary F2 同类竞态）：saving 复位仅限
+  // 最新一次请求——被取代的旧保存失败时静默（console.warn 诊断），不得弹虚假错误
+  const saveSeqRef = useRef(0);
 
   const refreshCatalog = useCallback(async () => {
     const [cat, unified] = await Promise.all([
@@ -170,6 +173,9 @@ export default function BuddyAiApiService() {
       pushToast('error', '池配置未加载，无法保存（请先刷新重试）');
       return false;
     }
+    // 序号守卫（F2 同范式）：仅最新一次请求允许回滚/saving 复位，乱序旧失败不得
+    // 用陈旧快照覆盖其后已成功保存的字段
+    const seq = ++saveSeqRef.current;
     setSaving(true);
     // 乐观更新（审查 P2：原在 await 之后 setFlags，保存进行中（≥400ms）再点
     // 另一个开关会基于旧 flags 快照提交，把第一次改动静默回退）
@@ -201,11 +207,11 @@ export default function BuddyAiApiService() {
       );
       return true;
     } catch (err) {
-      // 慢败回滚序号门控（审查修复 #6）：本保存失败时若其后已有新的乐观 set/外部
-      // 回读（序号已变），调用时陈旧快照的回滚会把并发已成功落库的新值（如 chip
-      // 保存 A 在途时保存 B 成功的 buddyAiEnabled）抹回旧值，后续保存还会把回退值
-      // 写回后端——仅当序号未变时回滚
       if (flagsSeqRef.current === flagsSeqAtCall) {
+        // 慢败回滚序号门控（审查修复 #6）：本保存失败时若其后已有新的乐观 set/外部
+        // 回读（序号已变），调用时陈旧快照的回滚会把并发已成功落库的新值（如 chip
+        // 保存 A 在途时保存 B 成功的 buddyAiEnabled）抹回旧值，后续保存还会把回退值
+        // 写回后端——仅当序号未变时回滚
         // 回滚值优先回读最新池快照（只回滚本次 patch 涉及的 key）：并发保存可能已
         // 成功写入同 key 新值，最新落库值即应为回滚目标；回读失败退回调用时快照
         let latest: ApiPoolFile | null = null;
@@ -230,16 +236,20 @@ export default function BuddyAiApiService() {
           }
           setFlags(revert);
         }
+        pushToast('error', `保存失败：${String(err).slice(0, 160)}`);
+      } else {
+        // 复审 No.2：本次失败已被更新的保存/回读取代，静默不上报（后续保存成功
+        // 会自动收敛，弹 toast 反成虚假提示）；仅补诊断日志便于排查
+        console.warn('[BuddyAiApiService] 保存请求已被更新的保存取代，失败已静默：', err);
       }
       // M10b 修复：chip 乐观高亮随本次 patch 回滚（原只回滚 flags，chip 保持
-      // 高亮但后端未落库，展示与实际状态分叉）；序号门控防止慢败回滚覆盖
-      // 其后已成功的乐观 set（审查修复）
+      // 高亮但后端未落库，展示与实际状态分叉）；scopeSeqRef 序号门控防止慢败
+      // 回滚覆盖其后已成功的乐观 set（审查修复）
       if (next.buddyAiGroupIds !== undefined && scopeSeqRef.current === seqAtCall) setPoolGroupScope(prevGroups);
       if (next.buddyAiTagIds !== undefined && scopeSeqRef.current === seqAtCall) setPoolTagScope(prevTags);
-      pushToast('error', `保存失败：${String(err).slice(0, 160)}`);
       return false;
     } finally {
-      setSaving(false);
+      if (seq === saveSeqRef.current) setSaving(false);
     }
   };
 

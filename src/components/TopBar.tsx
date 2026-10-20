@@ -452,8 +452,8 @@ function BuddyAiTopBar() {
 
   useEffect(() => {
     let alive = true;
-    // 探测抽成函数（审查修复 #23）：mount 即探一次 + 30s 低频轮询重探——窗口内
-    // 安装/卸载国际客户端徽标可自动刷新；locate 失败时下次轮询自然重试
+    // 审查 #23：客户端检测原为挂载时一次性快照，窗口存活期间装/卸客户端后徽标
+    // stale——补窗口聚焦重探测 + 30s 低频轮询（locate 为本地文件探测，开销可忽略）
     const probe = () => {
       api.env
         .locate('workbuddy_ai')
@@ -465,10 +465,13 @@ function BuddyAiTopBar() {
         .catch(() => {});
     };
     probe();
-    const timer = setInterval(probe, 30_000);
+    const onFocus = () => probe();
+    window.addEventListener('focus', onFocus);
+    const timer = window.setInterval(probe, 30_000);
     return () => {
       alive = false;
-      clearInterval(timer);
+      window.removeEventListener('focus', onFocus);
+      window.clearInterval(timer);
     };
   }, []);
 

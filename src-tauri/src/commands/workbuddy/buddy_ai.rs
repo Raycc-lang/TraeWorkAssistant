@@ -334,13 +334,14 @@ pub fn buddy_ai_account_import_creds(
             ));
         }
     }
-    // #13 反向凭证门控：显式 domain 只拦「声明非国际」，粘贴的 CN access_token
-    // （JWT iss = copilot.tencent.com）不带 domain 仍会入国际池，被 intl_domain_or
-    // 强打国际域名恒 401——解 JWT payload（不验签，仅明确命中 CN iss 才拒；解析
-    // 失败不拒，与国际 token 形态一致）
-    if buddy_ai_token_is_cn(&token) {
+    // 审查 #13：反向门控（国内侧 is_intl_credential 先例的镜像）——domain 缺省回落
+    // www.workbuddy.ai 只能挡显式传入的国内 domain，挡不住 CN token 不带 domain 直入
+    // 国际池。凭证 iss 才是真源，显式传国际 domain 不豁免；判定为非国际凭证一律拒绝
+    //（国际池 fail-closed，非 JWT 垃圾串同样挡下，与国内池「拒绝国际账号」双向隔离）
+    if !super::accounts::is_intl_credential(None, Some(&token)) {
         return Err(
-            "该 access_token 属国内版账号（iss: copilot.tencent.com），请在国内 WorkBuddy 页导入".into(),
+            "区域校验失败：该凭证非国际版（token 签发域非 workbuddy.ai）；国内账号请走 Buddy 页导入"
+                .into(),
         );
     }
     let domain = intl_domain_or(domain);
@@ -739,6 +740,14 @@ pub(crate) fn buddy_ai_refresh_impl(state: &AppState, user_id: &str) -> Result<S
 
 // ── 定时任务（2026-10-16 六页对齐批 3）：凭证兜底续期 + 模型目录同步 ──────────
 
+/// 账号级兜底续期失败连击 kv 键（审查 #16）：`{ "<id>": { "streak": n, "date": d } }`
+/// ——Intl 刷新失败有意按暂态处理不标 needs_relogin（防误杀，见 buddy_ai_refresh_impl），
+/// 但永久失效账号每轮必败且 renewed==0 拖任务 Err 全天退避空转；连击达阈值当日熔断
+/// 跳过，成功清零，跨日重置（服务端故障自愈后次日自动恢复探测，对齐打卡连击语义）
+const BUDDY_AI_RENEW_STREAK_KEY: &str = "buddy_ai_renew_fail_streak";
+/// 熔断阈值：同日连续失败 3 轮（首轮 + 退避重试）即熔断当日剩余重试
+const BUDDY_AI_RENEW_STREAK_LIMIT: i64 = 3;
+
 /// buddy-ai 凭证兜底续期任务（对齐国内 wb-renew lazy 口径）：仅刷新 AT 剩余 ≤48h
 /// 的启用账号；全部失败返 Err 交调度器 30 分钟冷却重试，部分失败按暂态容忍。
 /// 审查 #16①：needs_relogin=true 的账号（已判死待用户重登）不再纳入重试——
@@ -747,6 +756,17 @@ pub(crate) fn buddy_ai_refresh_impl(state: &AppState, user_id: &str) -> Result<S
 pub fn buddy_ai_renew_task(state: &AppState) -> Result<Value, String> {
     let pool = load_buddy_pool(state);
     let now = chrono::Utc::now().timestamp();
+    let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
+    let streaks: Value = crate::store::db(&state.data_dir).kv_get(BUDDY_AI_RENEW_STREAK_KEY);
+    let streak_of = |id: &str| -> i64 {
+        match streaks.get(id) {
+            Some(s) if s.get("date").and_then(Value::as_str) == Some(today.as_str()) => {
+                s.get("streak").and_then(Value::as_i64).unwrap_or(0).max(0)
+            }
+            _ => 0,
+        }
+    };
+    let mut fused = 0usize;
     let due: Vec<String> = pool
         .accounts
         .iter()
@@ -754,34 +774,59 @@ pub fn buddy_ai_renew_task(state: &AppState) -> Result<Value, String> {
             if a.disabled || a.needs_relogin {
                 return false;
             }
-            match a.access_token_expires_at {
+            let due_by_expiry = match a.access_token_expires_at {
                 // 有到期记录：剩余 ≤48h 纳入
                 Some(e) => e <= now + 48 * 3600,
                 // 无到期记录（导入未带 expiresIn 等）：凭证落盘超 48h 也纳入兜底，
                 // 否则这类账号永不触发兜底续期（auth_saved_at 在续期成功时刷新节流）
                 None => a.auth_saved_at.map(|s| s <= now - 48 * 3600).unwrap_or(false),
+            };
+            due_by_expiry && {
+                // 审查 #16：连击达阈值的账号当日熔断跳过（fused 计数供返回值观测）
+                if streak_of(&a.id) >= BUDDY_AI_RENEW_STREAK_LIMIT {
+                    fused += 1;
+                    false
+                } else {
+                    true
+                }
             }
         })
         .map(|a| a.id.clone())
         .collect();
     if due.is_empty() {
-        return Ok(json!({ "ok": true, "skipped": "无临期账号" }));
+        return Ok(if fused > 0 {
+            json!({ "ok": true, "skipped": "无临期账号", "fused": fused })
+        } else {
+            json!({ "ok": true, "skipped": "无临期账号" })
+        });
     }
     let mut renewed = 0usize;
     let mut failed = 0usize;
+    let mut streaks_now = streaks.as_object().cloned().unwrap_or_default();
     for id in &due {
         match buddy_ai_refresh_impl(state, id) {
-            Ok(_) => renewed += 1,
+            Ok(_) => {
+                renewed += 1;
+                streaks_now.remove(id);
+            }
             Err(e) => {
                 failed += 1;
+                streaks_now.insert(
+                    id.clone(),
+                    json!({ "streak": streak_of(id) + 1, "date": today }),
+                );
                 fs_utils::app_log(&state.data_dir, &format!("buddy-ai: 兜底续期失败 id={id}: {e}"));
             }
         }
     }
+    if renewed + failed > 0 {
+        let _ = crate::store::db(&state.data_dir)
+            .kv_set(BUDDY_AI_RENEW_STREAK_KEY, &Value::Object(streaks_now));
+    }
     if renewed == 0 {
         return Err(format!("buddy-ai 凭证续期全部失败（{failed} 个临期账号）"));
     }
-    Ok(json!({ "ok": true, "renewed": renewed, "failed": failed }))
+    Ok(json!({ "ok": true, "renewed": renewed, "failed": failed, "fused": fused }))
 }
 
 /// buddy-ai 模型目录同步实现（/v3/config 直连；手动命令与调度任务共用）。

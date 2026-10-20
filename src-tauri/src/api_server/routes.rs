@@ -299,22 +299,11 @@ fn inject_trae_outbound(
     }
 }
 
-/// 模型级冷却快速失败（T2.7/F-34：优先级高于 Key 级）
-/// issue #21：剩余秒数按档位取对应冷却表——buddy-ai 档读 Intl 独立表
-///（WbView::intl → buddy_ai_model_cooldowns），此前恒用 CN 表（model_cooling_
-/// remaining_wb）导致 buddy-ai 模型 429 文案恒为 retry after 0s
-fn model_cooling_response(
-    state: &std::sync::Arc<ApiSharedState>,
-    model: &str,
-    proto: Protocol,
-    buddy_ai: bool,
-) -> Response {
-    let rem = if buddy_ai {
-        wb_route::model_cooling_remaining(&wb_route::WbView::intl(state.clone()), model)
-            .unwrap_or(0)
-    } else {
-        wb_route::model_cooling_remaining_wb(state, model).unwrap_or(0)
-    };
+/// 模型级冷却快速失败（T2.7/F-34：优先级高于 Key 级）。
+/// 审查 #21：剩余秒数按调用方档位视图取——此前固定走 CN wb 档便捷包装，
+/// buddy-ai 模型冷却时（独立冷却表有值）客户端拿到 "retry after 0s"
+fn model_cooling_response(view: &wb_route::WbView, model: &str, proto: Protocol) -> Response {
+    let rem = wb_route::model_cooling_remaining(view, model).unwrap_or(0);
     let msg = format!("model {} cooling down, retry after {}s", model, rem);
     match proto {
         Protocol::Anthropic => anthropic_error(StatusCode::TOO_MANY_REQUESTS, "rate_limit_error", &msg),
@@ -1057,9 +1046,7 @@ pub async fn responses_api(
             wb_route::WbView::wb(state.clone())
         };
         if wb_route::model_cooling_remaining(&view, &resolved_model).is_some() {
-            // issue #21：档位随分流传入，429 剩余秒数取同档冷却表
-            //（buddy-ai 档 = Intl 独立表，与上方 view 感知判定同源）
-            return model_cooling_response(&state, &resolved_model, Protocol::Responses, buddy_ai);
+            return model_cooling_response(&view, &resolved_model, Protocol::Responses);
         }
     }
 

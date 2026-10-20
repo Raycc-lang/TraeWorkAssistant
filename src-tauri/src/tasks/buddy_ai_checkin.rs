@@ -267,6 +267,7 @@ fn process_account(
     token: &str,
     uid: &str,
     base: &str,
+    shared: Option<&std::sync::Arc<crate::api_server::ApiSharedState>>,
     emit: &mut dyn FnMut(&Value),
 ) -> Value {
     // T7 审查修复：fail 文案统一改写「HTTP 401/403」→「凭证401/403」。调度器
@@ -794,6 +795,26 @@ fn process_account(
             crate::fs_utils::app_log(&state.data_dir, &format!("buddy-ai: 打卡积分回写失败 {acct_id}: {err}"));
         }
     }
+    // 审查 #4：打卡到账同步拨进运行期网关 buddy_ai_pool（qoder/wb 先例）——
+    // 此前只写持久池，网关运行池钉死在装配时刻快照，零积分过滤窗口内到账的
+    // 新余额进不了运行池，账号被持续排除到下次积分同步（默认 every_hours 2h）。
+    // 键位口径：buddy-ai 网关装配以账号 id 充当条目 uid（审查 H2 复核），按
+    // acct_id 拨新即命中；expire None 不抹池内旧值（对齐 buddy_pool_write_credits
+    // 的「仅 Some 才覆盖」口径，防 expire_first「先到期优先」误压）
+    if let (Some(shared), Some(info)) = (shared, &after) {
+        let expire = match info.expire_secs {
+            Some(e) => Some(e),
+            None => shared
+                .buddy_ai_pool
+                .status_list()
+                .into_iter()
+                .find(|s| s.uid == acct_id)
+                .and_then(|s| s.credits_expire_at),
+        };
+        let m: std::collections::HashMap<String, (f64, Option<i64>)> =
+            std::collections::HashMap::from([(acct_id.to_string(), (info.total, expire))]);
+        shared.buddy_ai_pool.update_credits_snapshot(&m);
+    }
     let msg = match gain {
         Some(g) => format!("活跃打卡完成，积分 +{g:.0}（{:.0} → {:.0}）",
             before.as_ref().map(|b| b.total).unwrap_or(0.0),
@@ -870,26 +891,28 @@ fn acp_answer_request(
     format!("{method} ← 已代答（HTTP {status}）")
 }
 
+/// 诊断摘要敏感键（审查 #18：补 sessionId/session_id/stoken——ACP ② 步 sessionId
+/// 与沙箱 token/link/stoken 同属会话凭证，广播/app_log 落盘前一并打码；模块级供
+/// trim_json 等脱敏路径共用）
+const SENSITIVE_KEYS: [&str; 10] = [
+    "token",
+    "access_token",
+    "accessToken",
+    "refresh_token",
+    "refreshToken",
+    "authorization",
+    "link",
+    "sessionId",
+    "session_id",
+    "stoken",
+];
+
 /// 失败诊断用的响应摘要（审查 H5/H6 修复）：
 /// ① 先脱敏——响应可能携带沙箱凭证（② 步的 token/link 等），原样序列化会经
 ///    NDJSON 进度事件广播 + app_log 明文落盘（长期存储泄漏面）；
 /// ② 再截断——serde_json 输出 UTF-8 原文，按字节切片遇非 ASCII（中文错误文案）
 ///    不是字符边界会 panic 且 panic 沿 process_account 展开杀掉整轮打卡线程
 fn trim_json(v: &Value) -> String {
-    // 审查 #18：补 sessionId/session_id/stoken——② 步沙箱响应（link/token/sessionId
-    // 三件套）与四连 RPC 参数均携带会话标识，缺键时原值会经诊断摘要泄漏
-    const SENSITIVE_KEYS: [&str; 10] = [
-        "token",
-        "access_token",
-        "accessToken",
-        "refresh_token",
-        "refreshToken",
-        "authorization",
-        "link",
-        "sessionId",
-        "session_id",
-        "stoken",
-    ];
     let mut redacted = v.clone();
     redact_sensitive(redacted.as_object_mut(), &SENSITIVE_KEYS);
     let s = redacted.to_string();
@@ -976,9 +999,28 @@ pub fn run_checkin_round(
                 .unwrap_or(false)
         })
         .collect();
+    // 审查 #15：空池空轮打 skipped_empty_pool 标记——调度器 tick 据此不 mark_run
+    //（mark_run 固化「当日已跑」，当日新增账号会失去调度补打）；事件流契约不变
+    //（start/done 齐备，UI/CLI 零改动），结果落库亦跳过（无事件可记）
+    if accounts.is_empty() {
+        emit(&json!({ "type": "start", "total": 0 }));
+        let done = json!({
+            "type": "done", "ok": 0, "already": 0, "failed": 0,
+            "skipped": "buddy-ai 池无可用账号，本轮空跑跳过（不固化当日已跑）",
+            "skipped_empty_pool": true,
+        });
+        emit(&done);
+        return done;
+    }
     emit(&json!({ "type": "start", "total": accounts.len() }));
 
     let gap_secs = crate::models::effective_checkin_gap(state.settings().buddy_ai_checkin_gap_secs);
+    // 网关运行态共享句柄（审查 #4 运行期回写；对齐 qoder_checkin::run_checkin_round
+    // 与 buddy_ai_credits_sync_impl 提取模式）：网关未启动时为 None
+    let shared = runtime.and_then(|r| {
+        let g = r.lock().unwrap_or_else(|e| e.into_inner());
+        g.as_ref().map(|rt| rt.shared.clone())
+    });
     let mut events: Vec<Value> = Vec::new();
     for (i, (id, name, pool_uid)) in accounts.iter().enumerate() {
         if i > 0 && gap_secs > 0 {
@@ -1007,7 +1049,7 @@ pub fn run_checkin_round(
             "name": name,
             "message": format!("开始处理（{}/{}），六步链预计 1-3 分钟…", i + 1, accounts.len()),
         }));
-        let mut ev = process_account(state, &agent, id, name, &token, &uid, base, &mut *emit);
+        let mut ev = process_account(state, &agent, id, name, &token, &uid, base, shared.as_ref(), &mut *emit);
         ev["index"] = json!(i + 1);
         emit(&ev);
         events.push(ev);
