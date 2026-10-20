@@ -618,7 +618,7 @@ fn run_task(
                 buddy_acct_streaks.map.clear();
             }
             let mut events: Vec<Value> = Vec::new();
-            // runtime 透传（审查 #4）：打卡到账增量回写运行期 buddy_ai_pool
+            // runtime 透传（审查 #4）：打卡到账快照回写运行期 buddy_ai_pool
             let done = super::buddy_ai_checkin::run_checkin_round(st, runtime, &mut |ev| events.push(ev.clone()));
             // 审查 #15：空池空轮透传 skipped_empty_pool——tick 据此不 mark_run 且
             // 静默（当日新增账号保留调度补打机会）；连击统计无需更新（ok/already/

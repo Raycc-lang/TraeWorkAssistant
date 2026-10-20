@@ -975,7 +975,7 @@ fn sanitize_err_body(body: &str) -> String {
 /// 打卡整轮：buddy-ai 池全账号串行（NDJSON 管线复用 wb-checkin 契约）。
 /// 返回 done 事件（ok/already/failed 计数），供调度器/启动钩子直接消费。
 /// `runtime`：GUI 进程内网关运行态句柄（调度器/手动打卡/启动补跑传入，对齐
-/// qoder_checkin::run_checkin_round 先例）——到账增量回写运行期 buddy_ai_pool；
+/// qoder_checkin::run_checkin_round 先例）——到账快照回写运行期 buddy_ai_pool；
 /// CLI 独立进程传 None 跳过（该进程本就无内存池）
 pub fn run_checkin_round(
     state: &AppState,
@@ -1150,46 +1150,15 @@ pub fn run_checkin_round(
         }
     }
 
-    // 运行期网关池回写（审查 #4，仿 qoder_checkin 的 apply_credits_delta 先例）：
-    // 到账（success 且 reward>0）是真实积分入账，此前只回写持久池——运行期
-    // buddy_ai_pool 仍钉在旧余额，该账号会被零积分过滤持续排除至下次积分同步
-    // （every_hours 2h / daily 档最长数十小时；若它是池内唯一账号则网关整体不可用）。
-    // 键位复核：buddy-ai 网关装配以账号 id 充当条目 uid（buddy_ai_credits_sync_impl
-    // 同口径），事件 id 即账号 id。CLI 独立进程 runtime=None / 网关未运行（shared=None）
-    // 均跳过；apply_credits_delta 不动 credits_expire_at（打卡奖励不改变包到期）
-    if let Some(rt) = runtime {
-        let shared = rt
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .as_ref()
-            .map(|g| g.shared.clone());
-        if let Some(shared) = shared {
-            for e in &events {
-                if e.get("status").and_then(Value::as_str) != Some("success") {
-                    continue;
-                }
-                let Some(r) = e.get("reward").and_then(Value::as_f64) else {
-                    continue;
-                };
-                if r <= 0.0 {
-                    continue;
-                }
-                if let Some(id) = e.get("id").and_then(Value::as_str) {
-                    shared.buddy_ai_pool.apply_credits_delta(id, r);
-                }
-            }
-        }
-    }
+    // 合并复审记录（审查 #4 决策）：此处原并存 macos 侧「按 success 事件
+    // apply_credits_delta 增量回写」实现，与 process_account 的 update_credits_snapshot
+    // 绝对值快照叠加会双重计入（先覆绝对值再累加 dosage 差额，多计一次 reward）——
+    // 绝对值快照自校正且顺带保鲜 credits_expire_at，覆盖增量版全部触发场景，增量版
+    // 删除。qoder 场景 reward 为服务端声明值故增量成立；buddy-ai 的 reward 是
+    // before/after 差值，快照口径才正确（勿再以「qoder 先例」为由恢复增量回写）
 
     let done = json!({ "type": "done", "ok": ok, "already": already, "failed": failed });
-    // 空轮标记（审查 #15）：本轮无任何账号参与（空池/花名册全被凭证过滤）时，
-    // done 带 skipped_empty 供调度器跳过 mark_run——mark_run 会写 last_run_date=
-    // 今日，吞掉「当日新增账号后的补打窗口」（每日任务当日不再被调度）
-    let done = if accounts.is_empty() {
-        json!({ "type": "done", "ok": ok, "already": already, "failed": failed, "skipped_empty": true })
-    } else {
-        done
-    };
+    // 空轮已在函数头提前返回（审查 #15 skipped_empty_pool），此处 accounts 必非空
     emit(&done);
     done
 }
