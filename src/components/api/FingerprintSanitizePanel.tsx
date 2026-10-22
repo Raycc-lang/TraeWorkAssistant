@@ -10,13 +10,18 @@
  * 保存空 templates 数组 = 恢复内置默认；to=null（停用）= 从生效表移除该规则；
  * to=""（留空）= 剥离（改写为空串，删除指纹原文）。
  * builtin=true 表示尚无自定义副本、当前生效内置默认规则（后端 get 回显）。
+ *
+ * 档位分区（issue #129：§4.3 分区清洗）：WB 池与 buddy-ai 国际档各自独立一张
+ * 自定义表（内置默认表共享），切档必须重新拉取——此前只操作 wb 键导致国际档
+ * 完全没生效。
  */
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { Plus, RotateCcw, Save, ShieldCheck } from 'lucide-react';
+import { Eraser, FileSignature, Plus, RotateCcw, Save, ShieldCheck, Wand2 } from 'lucide-react';
 import { Badge, Spinner } from '../ui';
 import { api } from '../../lib/tauri';
 import { useAppStore } from '../../store';
-import type { SanitizeRule } from '../../types';
+import { parsePrefix, parseSystemText, sampleTier } from './fingerprintSamples';
+import type { FingerprintSample, SanitizeRule, SanitizeTier } from '../../types';
 
 /** 时间戳 → 本地时间展示；null/0 = 从未自定义 */
 const fmtTs = (ts: number | null) =>
@@ -31,12 +36,27 @@ export default function FingerprintSanitizePanel() {
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [confirmReset, setConfirmReset] = useState(false);
-  // 「恢复内置默认」二次确认倒计时句柄：重复点击需先撤销旧定时器，卸载必须清理
+  // 档位分区（issue #129 §4.3）：默认 wb 档；切换档位重新拉取对应档的自定
+  // 义表（后端按档位键隔离存储）
+  const [tier, setTier] = useState<SanitizeTier>('wb');
+  // 指纹样本（网关命中采样）与「一键生成规则」的整句/前缀两档策略
+  const [samples, setSamples] = useState<FingerprintSample[]>([]);
+  const [samplesOpen, setSamplesOpen] = useState(false);
+  const [sampleErr, setSampleErr] = useState<string | null>(null);
+  // 二次确认态：恢复默认 / 切换档位（丢弃未保存编辑）/ 清空样本（删除类）
+  // 三个动作共用 3s 内再点一次才生效的口径，避免误触不可逆操作
+  const [confirmClear, setConfirmClear] = useState(false);
+  const [pendingTier, setPendingTier] = useState<SanitizeTier | null>(null);
+  // 二次确认倒计时句柄：重复点击需先撤销旧定时器，卸载必须清理
   const confirmTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const clearTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const switchTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   useEffect(
     () => () => {
       if (confirmTimer.current) clearTimeout(confirmTimer.current);
+      if (clearTimer.current) clearTimeout(clearTimer.current);
+      if (switchTimer.current) clearTimeout(switchTimer.current);
     },
     [],
   );
@@ -44,7 +64,7 @@ export default function FingerprintSanitizePanel() {
   const load = useCallback(async () => {
     setLoading(true);
     try {
-      const view = await api.wbConfig.templateMapGet();
+      const view = await api.wbConfig.templateMapGet(tier);
       setRules(view.templates);
       setSavedRules(view.templates);
       setBuiltin(view.builtin ?? false);
@@ -54,17 +74,75 @@ export default function FingerprintSanitizePanel() {
     } finally {
       setLoading(false);
     }
-  }, [toast]);
+  }, [toast, tier]);
 
   useEffect(() => {
     void load();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  }, [load]);
+
+  /** 指纹样本：从网关命中采样拉取（内存环形缓冲，重启即空） */
+  const loadSamples = useCallback(async () => {
+    try {
+      setSamples(await api.wbConfig.fingerprintSamplesGet());
+      setSampleErr(null);
+    } catch (e) {
+      const msg = `加载指纹样本失败：${e}`;
+      setSampleErr(msg);
+      // 面板收起时内联错误不可见，写操作反馈必须直达用户
+      toast('error', msg);
+    }
+  }, [toast]);
+
+  useEffect(() => {
+    void loadSamples();
+  }, [loadSamples]);
 
   const dirty = useMemo(
     () => JSON.stringify(rules) !== JSON.stringify(savedRules),
     [rules, savedRules],
   );
+
+  /** 当前档位可用的样本数（样本按来源池归属档位，跨档位生成规则永不命中） */
+  const samplesUsableCount = useMemo(
+    () => samples.filter((s) => sampleTier(s.pool) === tier).length,
+    [samples, tier],
+  );
+
+  /**
+   * 档位切换：切档会重新拉取该档规则表，未保存的编辑必然被丢弃——脏状态下
+   * 需二次确认（否则用户随手切档即丢一屏编辑，且丢的是另一档的数据）。
+   */
+  const clickTier = (t: SanitizeTier) => {
+    if (t === tier) return;
+    if (switchTimer.current) clearTimeout(switchTimer.current);
+    if (dirty && pendingTier !== t) {
+      setPendingTier(t);
+      switchTimer.current = setTimeout(() => {
+        setPendingTier(null);
+        switchTimer.current = null;
+      }, 3000);
+      return;
+    }
+    switchTimer.current = null;
+    setPendingTier(null);
+    setTier(t);
+  };
+
+  /** 清空样本（删除类）：3s 内再点一次才真正执行 */
+  const clickClearSamples = () => {
+    if (clearTimer.current) clearTimeout(clearTimer.current);
+    if (confirmClear) {
+      clearTimer.current = null;
+      setConfirmClear(false);
+      void clearSamples();
+      return;
+    }
+    setConfirmClear(true);
+    clearTimer.current = setTimeout(() => {
+      setConfirmClear(false);
+      clearTimer.current = null;
+    }, 3000);
+  };
 
   /** 保存前置校验：from 必填且全局唯一（from 是改写锚点，重复会导致不可预期次序） */
   const validate = (): string | null => {
@@ -88,6 +166,7 @@ export default function FingerprintSanitizePanel() {
     try {
       // to=null（停用）原样落库；to=""（剥离）保留空串，两者不可混淆
       await api.wbConfig.templateMapSet(
+        tier,
         rules.map((r) => ({ from: r.from.trim(), to: r.to === null ? null : r.to.trim() })),
       );
       await load();
@@ -104,13 +183,46 @@ export default function FingerprintSanitizePanel() {
     setConfirmReset(false);
     setSaving(true);
     try {
-      await api.wbConfig.templateMapSet([]);
+      await api.wbConfig.templateMapSet(tier, []);
       await load();
       toast('success', '已恢复内置默认规则，下一条请求即生效');
     } catch (e) {
       toast('error', `恢复默认失败：${e}`);
     } finally {
       setSaving(false);
+    }
+  };
+
+  /** 清空样本缓冲：仅清内存环形缓冲，不影响 app.log 已落盘的样本行 */
+  const clearSamples = async () => {
+    try {
+      await api.wbConfig.fingerprintSamplesClear();
+      setSamples([]);
+      setSampleErr(null);
+      toast('success', '指纹样本已清空（仅内存缓冲，日志样本行不受影响）');
+    } catch (e) {
+      setSampleErr(`清空样本失败：${e}`);
+      toast('error', `清空指纹样本失败：${e}`);
+    }
+  };
+
+  /**
+   * 从样本一键生成规则草案：整句录入（from = 首条 system 完整文本，to = 空串即
+   * 剥离），或前缀模式（from = 首英文逗号/句号前整段）——上游逐字匹配的是整句
+   * （含工具清单），只截取一部分会让改写落在半句上，规则命中不可预期。
+   */
+  const addFromSample = (sample: string, whole: boolean) => {
+    try {
+      const from = whole ? parseSystemText(sample) : parsePrefix(sample);
+      if (rules.some((r) => r.from.trim() === from)) {
+        setSampleErr('该指纹的规则已存在，未重复添加');
+        return;
+      }
+      setSampleErr(null);
+      setRules((rs) => [...rs, { from, to: '' }]);
+      toast('success', '已生成规则草案：请填写改写文本后保存');
+    } catch (e) {
+      setSampleErr(e instanceof Error ? e.message : String(e));
     }
   };
 
@@ -144,6 +256,30 @@ export default function FingerprintSanitizePanel() {
             {savedAt && !builtin && ` 最近保存：${fmtTs(savedAt)}`}
           </p>
         </div>
+      </div>
+
+      {/* 档位切换（issue #129 §4.3 分区清洗：WB 池与 buddy-ai 国际档规则表独立） */}
+      <div className="flex items-center gap-1 rounded-md border border-slate-200 p-0.5 text-xs dark:border-zinc-700">
+        {(['wb', 'buddy-ai'] as SanitizeTier[]).map((t) => (
+          <button
+            key={t}
+            onClick={() => clickTier(t)}
+            title={pendingTier === t ? '当前档位有未保存的规则，再点一次将丢弃' : undefined}
+            className={`flex-1 rounded px-2 py-1 transition ${
+              tier === t
+                ? 'bg-brand-500 font-medium text-white'
+                : pendingTier === t
+                  ? 'bg-amber-100 font-medium text-amber-700 dark:bg-amber-500/20 dark:text-amber-300'
+                  : 'text-slate-500 hover:bg-slate-50 dark:text-zinc-400 dark:hover:bg-zinc-800'
+            }`}
+          >
+            {pendingTier === t
+              ? '确认切换？'
+              : t === 'wb'
+                ? 'WB 池档位'
+                : 'buddy-ai 国际档'}
+          </button>
+        ))}
       </div>
 
       {/* 操作条 */}
@@ -243,6 +379,106 @@ export default function FingerprintSanitizePanel() {
           <Plus size={13} />
           添加规则
         </button>
+      </div>
+
+      {/* 指纹样本：网关命中采样 → 一键生成规则草案（闭环最省力的一环） */}
+      <div className="rounded-lg border border-slate-200 dark:border-zinc-700">
+        <button
+          onClick={() => setSamplesOpen((v) => !v)}
+          className="flex w-full items-center gap-2 px-3 py-2 text-left text-xs text-slate-600 dark:text-zinc-300"
+        >
+          <FileSignature size={14} className="shrink-0 text-brand-500" />
+          <span className="font-medium">指纹样本</span>
+          <Badge tone="slate">{samples.length}</Badge>
+          <span className="ml-auto text-slate-400">{samplesOpen ? '收起' : '展开'}</span>
+        </button>
+        {samplesOpen && (
+          <div className="space-y-1.5 border-t border-slate-200 px-3 py-2 dark:border-zinc-700">
+            {samples.length === 0 ? (
+              <p className="text-xs text-slate-400">
+                暂无样本。上游命中指纹拦截（11128）或空完成影子风控后，网关会自动采样入内存缓冲（上限
+                50 条，重启清空）。
+              </p>
+            ) : samplesUsableCount === 0 ? (
+              <p className="text-[11px] text-amber-600 dark:text-amber-400">
+                缓冲内 {samples.length} 条样本均不属于当前档位（或该池不做模板清洗），
+                暂不可生成规则——切到对应档位，或等待本档命中后刷新。
+              </p>
+            ) : null}
+            {samples.length > 0 && (
+              samples.map((s, idx) => {
+                const ts = s.ts > 0 ? new Date(s.ts * 1000).toLocaleTimeString() : '';
+                // 样本归属档位：规则表按档位隔离，跨档位生成的规则永不命中
+                const sTier = sampleTier(s.pool);
+                const usable = sTier === tier;
+                const blockReason =
+                  sTier === null
+                    ? '该池请求不做模板清洗，样本仅供诊断'
+                    : `该样本属 ${sTier === 'wb' ? 'WB 池档位' : 'buddy-ai 国际档'}，与当前档位规则表不匹配`;
+                return (
+                  <div
+                    key={`${s.pool}-${s.ts}-${idx}`}
+                    className="rounded-md border border-slate-200 px-2 py-1.5 dark:border-zinc-700"
+                  >
+                    <div className="flex items-center gap-1.5 text-[11px] text-slate-400">
+                      <Badge tone={s.kind === 'empty' ? 'amber' : 'red'}>
+                        {s.kind === 'empty' ? '空完成' : '11128'}
+                      </Badge>
+                      <span>{s.pool}</span>
+                      {ts && <span>{ts}</span>}
+                      {s.note && <span className="truncate">{s.note}</span>}
+                      <span className="ml-auto flex shrink-0 gap-1">
+                        <button
+                          onClick={() => addFromSample(s.sample, false)}
+                          disabled={!usable}
+                          title={
+                            usable ? '以首英文逗号/句号前的整段作为原文指纹' : blockReason
+                          }
+                          className="rounded p-1 text-brand-500 transition hover:bg-brand-50 disabled:cursor-not-allowed disabled:text-slate-300 disabled:hover:bg-transparent dark:hover:bg-brand-900/20 dark:disabled:text-zinc-600"
+                        >
+                          <Wand2 size={13} />
+                        </button>
+                        <button
+                          onClick={() => addFromSample(s.sample, true)}
+                          disabled={!usable}
+                          title={usable ? '以整条 system 文本作为原文指纹' : blockReason}
+                          className="rounded p-1 text-brand-500 transition hover:bg-brand-50 disabled:cursor-not-allowed disabled:text-slate-300 disabled:hover:bg-transparent dark:hover:bg-brand-900/20 dark:disabled:text-zinc-600"
+                        >
+                          <FileSignature size={13} />
+                        </button>
+                      </span>
+                    </div>
+                    <p className="mt-1 break-all font-mono text-[11px] text-slate-500 dark:text-zinc-400">
+                      {s.sample}
+                    </p>
+                  </div>
+                );
+              })
+            )}
+            {sampleErr && <p className="text-xs text-rose-500">{sampleErr}</p>}
+            <div className="flex items-center gap-2 pt-1">
+              <button
+                onClick={() => void loadSamples()}
+                className="flex items-center gap-1 rounded-md border border-slate-200 px-2 py-1 text-xs text-slate-600 transition hover:bg-slate-50 dark:border-zinc-700 dark:text-zinc-300 dark:hover:bg-zinc-800"
+              >
+                刷新
+              </button>
+              <button
+                onClick={clickClearSamples}
+                disabled={samples.length === 0}
+                title={confirmClear ? '再点一次确认清空（仅内存缓冲）' : '清空内存样本缓冲'}
+                className={`flex items-center gap-1 rounded-md border px-2 py-1 text-xs transition disabled:opacity-40 ${
+                  confirmClear
+                    ? 'border-rose-400 bg-rose-50 font-medium text-rose-600 dark:border-rose-500/50 dark:bg-rose-500/10 dark:text-rose-300'
+                    : 'border-slate-200 text-slate-600 hover:bg-slate-50 dark:border-zinc-700 dark:text-zinc-300 dark:hover:bg-zinc-800'
+                }`}
+              >
+                <Eraser size={13} />
+                {confirmClear ? '确认清空？' : '清空'}
+              </button>
+            </div>
+          </div>
+        )}
       </div>
     </div>
   );

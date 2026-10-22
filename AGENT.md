@@ -1,4 +1,4 @@
-# AGENT.md — AI Work 助手 (ai-work-assistant) v1.4.16
+# AGENT.md — AI Work 助手 (ai-work-assistant) v1.5.2
 
 > 项目级别速查手册。给后续会话（人或 AI）秒接上下文用。任何会改契约的提交请同步更新本文档。
 > **产品形态（2026-09 Web 化转型已落地）**：Web-only 单体——`crates/aiwork-core`（业务核心，零桌面依赖）+ `crates/aiwork-server`（axum：管理面 `/api/*` + 网关 `/v1/*` + 静态托管 + 调度器），浏览器直访，Docker 部署。桌面壳（Tauri/托盘/代理/切换器/豆包/CC Switch/更新器）已整体退役并删除 `src-tauri/`（git 历史归档）。转型决策与裁剪清单见 `docs/tmp/docker-headless-server-plan.md`（ADR-1~4）。
@@ -71,7 +71,7 @@ ai-work-assistant/
 | JWT | `jwt_parse` / `refresh_jwt` | 解析 / 自动续期（48h lazy gate，需 refresh_token） |
 | 签到 | `checkin_start(opts)` / `checkin_trends(days)` | `opts: {scope, user_ids?, skip_checked_in, skip_expired}`；失败自动重试 2 轮（30s/90s）；进度走 SSE |
 | WorkBuddy | `workbuddy_accounts_*` / `workbuddy_checkin_start` / `workbuddy_growth_run` / `workbuddy_checkin_results` / `workbuddy_credits_fetch` / `workbuddy_credits_history_list` / `workbuddy_settings_*` / `workbuddy_oauth_login` / `workbuddy_usage_official` / `workbuddy_usage_official_all` / `workbuddy_usage_fallback` / `workbuddy_activity_info` | WB 账号/签到/成长中心/积分/官方用量（31 天分页，聚合含按模型汇总）/快照回退/活动信息；`workbuddy_credits_history_list` = WB 每日积分快照时序（wb_credits_history 表 365 天，含 earned = 当日余额差分与签到 reward 归并）；OAuth 为 authUrl+state 轮询（≤300s，纯 HTTP 无需粘贴）。注：本地 Token 统计（`workbuddy_token_stats`）为桌面版专属（扫描本机客户端会话文件），Web 版不提供 |
-| API 网关 | `pool_list/set/status` / `api_keys_list/save` / `api_models_list/sync` / `api_unified_models` / `api_custom_models_*` / `dispatch_policy_*` / `gateway_settings_*` / `trae_model_meta_*` | 三池调度策略（smart/priority + per_model 覆盖）、ck_ 子 Key、模型目录三源合并（四层兜底）、自定义上游、网关设置；网关常驻随服务启停（无启停命令） |
+| API 网关 | `pool_list/set/status` / `api_keys_list/save` / `api_models_list/sync` / `api_unified_models` / `api_custom_models_*` / `dispatch_policy_*` / `gateway_settings_*` / `trae_model_meta_*` / `wb_template_map_get/set(tier,map)` / `fingerprint_samples_get/clear` | 三池调度策略（smart/priority + per_model 覆盖）、ck_ 子 Key、模型目录三源合并（四层兜底）、自定义上游、网关设置；网关常驻随服务启停（无启停命令）；清洗规则表按 `tier: "wb"\|"buddy-ai"` 分档隔离（§8），指纹样本为内存环形缓冲（上限 50，重启清空） |
 | 用量/日志 | `api_usage_stats` / `api_wb_usage_stats` / `api_custom_usage_stats` / `api_logs_list/detail/search` / `logs_query` / `logs_clear` | 按日统计（分池）、请求日志、运行日志 |
 | 调度 | `scheduler_status` / `scheduler_config_get` / `scheduler_config_set(config)` | 任务状态（kv `scheduler_state`）+ 任务配置（kv `scheduler_cfg`：`disabled_tasks` 停用名单 + `task_times` 自定义时刻 HH:MM，未知键/非法时刻整体拒绝；缺省全开 + 默认时刻 = 推荐配置；set 为整表替换，前端须同时携带两字段） |
 | 通知 | `notify_config_get` / `notify_config_set` / `notify_test` | Bark / Server酱 / 通用 webhook 三渠道配置与测试（T11） |
@@ -139,7 +139,8 @@ $AIWORK_DATA_DIR（Docker: /app/data）
 - **三池**：`trae`（SOLO `llm_utils_chat`，通用积分 208）/ `buddy`（copilot.tencent.com 或 www.workbuddy.ai，按账号 domain 判定）/ `custom`（自定义 OpenAI 兼容上游，**命中即直达、不参与池间策略**）。
 - **池间策略**（`dispatch.rs`）：`smart` 默认（到期优先→倍率→健康积分和）；`priority` 严格按序；`per_model` 显式覆盖不做智能重排；`fallback` 跨池回退开关。
 - **WB headers 三铁律（红线）**：① Origin/Referer 按区域必带；② 缺省字段显式 `X-No-User-Id` 等占位；③ **chat 请求绝不携带 `X-Refresh-Token`**（仅 refresh 端点）。
-- **请求体改写**（`wb_payload.rs`）：强制 `stream:true`（非流式本地聚合）；reasoning_effort 按目录降级；审核指纹清洗（cc_xxx 剥离 + 模板黑名单改写，`wb_template_map` mtime 热更新）。
+- **会话头三件套（dsh-xdpool#58，红线）**：chat 请求必带 `X-Conversation-ID`（与注入请求体的会话 id 同一份，同会话稳定）/ `X-Conversation-Request-ID` / `X-Conversation-Message-ID`（后两者每请求随机），由 `make_wb_request` 统一附带——国际版网关硬校验，缺任一即 400 11128；仅 chat 路径附带。
+- **请求体改写**（`wb_payload.rs`）：强制 `stream:true`（非流式本地聚合）；reasoning_effort 按目录降级；role 大小写归一、`developer`→`system`；审核指纹清洗（cc_xxx 剥离 + 模板黑名单改写：`to` 支持 `|` 多候选按请求种子轮换、空完成/11128 重试追加激进短前缀规则、改写后首条 system 残指纹自检；模板表 `wb_template_map`/`buddy_ai_template_map` 按档位分区，热更新）。
 - **分级重试**（`retry.rs`）：429 Retry-After 优先→耗尽换号；503/529 指数退避；401/403 换号（WB 401 先刷新一次）；Fatal 透传。SOLO 与 WB 共用同一 `retry_plan`。
 - **会话粘性**（仅 WB）：显式 conversation_id 绑定（TTL 30m）+ 无 id 指纹模式；五态机 + 模型级/熔断冷却。
 - **四段模型路由**（`wb_model_route.json`）：aliases/rules/suffixes → 别名/通配/系列/`-thinking` 后缀注入 effort=high；全未命中回落原名。
@@ -156,8 +157,8 @@ $AIWORK_DATA_DIR（Docker: /app/data）
 - **主题系统**：Tailwind 3 + `darkMode:'class'`；`lib/themes.ts` 6 套主题经 `data-theme` 驱动，与 `index.css` 覆盖块一一对应——新增主题两处同步。
 - **snake_case**：`types.ts` 字段名与 Rust DTO 完全一致。
 - **路由**：极简 `useState`，不引 react-router。
-- **Modal**：不支持 `window.confirm()`，用自定义 `Modal`（支持 `size="lg"|"xl"`）。
-- **按钮反馈**：异步按钮动作 `withMinDelay(promise, 1000)` 确保最少 1 秒 loading；操作结果用 Toaster 提示。
+- **Modal**：不支持 `window.confirm()`，用自定义 `Modal`；轻量二次确认（同一文件内已有先例）可用「3s 内再点一次」两击模式，删除类操作一律不得单击直发。
+- **按钮反馈**：异步按钮动作 `withMinDelay(promise, 1000)` 确保最少 1 秒 loading；操作结果用 Toaster 提示；**写操作成功/失败都必须 toast**（含折叠面板内的错误，内联文本收起后不可见）。
 
 ## 10. 安全与合规
 

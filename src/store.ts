@@ -470,6 +470,10 @@ export const useAppStore = create<AppState>((set, get) => ({
       const deadCount = get().checkin.results.filter(
         (r) => r?.status === 'fail' && r.error_type === 'SessionDead',
       ).length;
+      // 服务端拒绝认证（issue #128）：JWT 存在但被服务端判定无效，非网络/限流问题
+      const authRejectedCount = get().checkin.results.filter(
+        (r) => r?.status === 'fail' && r.error_type === 'AuthRejected',
+      ).length;
       // 签到完成后静默刷新剩余积分（内部会再次 refreshAccounts）
       void api.accounts.refreshRemainingCredits().then(() => {
         get().refreshAccounts();
@@ -486,6 +490,12 @@ export const useAppStore = create<AppState>((set, get) => ({
         get().pushToast(
           'error',
           `${deadCount} 个账号 JWT 已被服务端吊销（该账号在别处重新登录/IDE 内退出过登录）：请在账号管理页对该账号重新执行 OAuth 登录录入`,
+        );
+      }
+      if (authRejectedCount > 0) {
+        get().pushToast(
+          'error',
+          `${authRejectedCount} 个账号被服务端拒绝认证（11128：请求被拒绝，非网络/限流问题）：JWT 存在但被判定无效，请在账号管理页对该账号重新执行 OAuth 登录录入`,
         );
       }
     }

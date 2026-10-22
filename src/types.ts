@@ -280,6 +280,23 @@ export interface Settings {
   buddy_ai_catalog_sync_hhmm: string;
 }
 
+/** 指纹清洗规则档位：wb = WB 池（workbuddy-cn / 国内档）；buddy-ai = 国际档独立表 */
+export type SanitizeTier = 'wb' | 'buddy-ai';
+
+/** 网关命中（指纹拦截/空完成影子风控）落下的指纹样本：供一键生成清洗规则 */
+export interface FingerprintSample {
+  /** 11128 = 指纹拦截；empty = 空完成（影子风控收尾采样） */
+  kind: string;
+  /** wb | trae | qoder | buddy-ai */
+  pool: string;
+  /** unix 秒 */
+  ts: number;
+  /** 样本：system="…" tools=[…] */
+  sample: string;
+  /** 模板命中注记 */
+  note: string;
+}
+
 /** 通知渠道配置（Phase 3 T11：Bark / Server酱 / 通用 webhook，独立 kv） */
 export interface NotifyConfig {
   /** 总开关：关闭时一切通知静默 */

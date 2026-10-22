@@ -490,10 +490,23 @@ pub fn dispatch(admin: &AdminState, name: &str, args: Value) -> Result<Value, St
             let config = arg(&args, "config")?;
             wb_config::wb_route_config_set(state, config).and_then(to_json)
         }
-        "wb_template_map_get" => wb_config::wb_template_map_get(state),
+        "wb_template_map_get" => {
+            let tier = opt_arg(&args, "tier")?;
+            wb_config::wb_template_map_get(state, tier)
+        }
         "wb_template_map_set" => {
+            let tier = opt_arg(&args, "tier")?;
             let map = arg(&args, "map")?;
-            wb_config::wb_template_map_set(state, map).and_then(to_json)
+            wb_config::wb_template_map_set(state, tier, map).and_then(to_json)
+        }
+        // 指纹样本（issue #125 增强：一键从样本生成清洗规则）
+        "fingerprint_samples_get" => {
+            let v = wb_config::fingerprint_samples_get()?;
+            Ok(v)
+        }
+        "fingerprint_samples_clear" => {
+            wb_config::fingerprint_samples_clear()?;
+            Ok(json!({}))
         }
 
         // ==================== oauth（OAuth 登录） ====================

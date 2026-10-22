@@ -21,6 +21,7 @@ import type {
   CustomModel,
   DeviceConflictGroup,
   DispatchPolicy,
+  FingerprintSample,
   GatewaySettings,
   GroupView,
   ImportPreview,
@@ -48,6 +49,7 @@ import type {
   Settings,
   SanitizeMapView,
   SanitizeRule,
+  SanitizeTier,
   TagView,
   TraeExpiredEntsResult,
   TraeModelMeta,
@@ -730,12 +732,18 @@ export const api = {
   wbConfig: {
     routeGet: () => invoke<Record<string, unknown>>('wb_route_config_get'),
     routeSet: (config: Record<string, unknown>) => invoke('wb_route_config_set', { config }),
-    templateMapGet: () => invoke<SanitizeMapView>('wb_template_map_get'),
+    // 指纹清洗规则表（按档位分区，§4.3：buddy-ai 国际档独立于 wb 国内档）
+    templateMapGet: (tier: SanitizeTier) =>
+      invoke<SanitizeMapView>('wb_template_map_get', { tier }),
     // 整体替换保存；load_templates 每请求读取，保存即对下一请求生效，无需重启网关
-    templateMapSet: (templates: SanitizeRule[]) =>
+    templateMapSet: (tier: SanitizeTier, templates: SanitizeRule[]) =>
       invoke<void>('wb_template_map_set', {
+        tier,
         map: { templates, updated_at: Math.floor(Date.now() / 1000) },
       }),
+    // 指纹样本（网关命中采样，供一键生成清洗规则）
+    fingerprintSamplesGet: () => invoke<FingerprintSample[]>('fingerprint_samples_get'),
+    fingerprintSamplesClear: () => invoke<void>('fingerprint_samples_clear'),
   },
   oauth: {
     getLoginUrl: () => invoke<OAuthLoginUrl>('oauth_get_login_url'),

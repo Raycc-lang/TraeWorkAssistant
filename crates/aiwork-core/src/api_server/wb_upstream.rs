@@ -128,14 +128,49 @@ pub fn build_chat_headers(c: &WbCreds) -> Vec<(&'static str, String)> {
     h
 }
 
+/// 会话头三件套（dsh-xdpool#58 实证 2026-10-19：国际版网关硬校验，缺任一即
+/// 400 11128 "request illegal"；值不校验仅查存在性，官方客户端每个 chat 请求
+/// 都带）。X-Conversation-ID 取调用方传入的 conv_id——make_wb_request 收到
+/// 的与 prepare 注入请求体的是同一份（调用方作用域现成有，免得此处再全量
+/// 反序列化一遍 body），同会话稳定，上游前缀缓存不被打散；空串兜底随机
+/// hex。另两个头每请求随机。仅 chat 路径附带——生图/目录（wb_images/
+/// wb_catalog 复用 build_chat_headers）非 chat 网关不校验，不扩散。
+fn conversation_headers(conv_id: &str) -> Vec<(&'static str, String)> {
+    let cid = if conv_id.is_empty() {
+        format!("{:032x}", rand::random::<u128>())
+    } else {
+        conv_id.to_string()
+    };
+    vec![
+        ("X-Conversation-ID", cid),
+        (
+            "X-Conversation-Request-ID",
+            format!("{:032x}", rand::random::<u128>()),
+        ),
+        (
+            "X-Conversation-Message-ID",
+            format!("{:032x}", rand::random::<u128>()),
+        ),
+    ]
+}
+
 /// 上游请求错误：(HTTP 状态 | 502 传输错误, body 摘要, Retry-After 秒)
 pub type UpstreamErr = (u16, String, Option<u64>);
 
-/// 发起 WB 对话请求，返回 SSE 流 reader
-pub fn make_wb_request(c: &WbCreds, body: &[u8]) -> Result<Box<dyn Read + Send>, UpstreamErr> {
+/// 发起 WB 对话请求，返回 SSE 流 reader。conv_id 为调用方 prepare 时注入
+/// 请求体的同一份会话 id
+pub fn make_wb_request(
+    c: &WbCreds,
+    conv_id: &str,
+    body: &[u8],
+) -> Result<Box<dyn Read + Send>, UpstreamErr> {
     let url = format!("{}{}", c.chat_base(), WB_CHAT_PATH);
     let mut req = wb_agent().post(&url);
     for (k, v) in build_chat_headers(c) {
+        req = req.set(k, &v);
+    }
+    // dsh-xdpool#58：X-Conversation 三头缺一即 11128（国际版硬校验）
+    for (k, v) in conversation_headers(conv_id) {
         req = req.set(k, &v);
     }
     match req.send_bytes(body) {
@@ -892,6 +927,31 @@ mod tests {
         assert_ne!(a, b);
         assert_eq!(a.len(), 32);
         assert!(a.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn conversation_headers_stable_per_conversation() {
+        // dsh-xdpool#58：调用方 conv_id 稳定透传（同会话上游前缀缓存不打散）；
+        // 另两个头每请求随机；空串兜底随机 hex（32 位，与 X-Request-ID 同款）
+        let a = conversation_headers("conv-1");
+        let b = conversation_headers("conv-1");
+        let get = |h: &[(&'static str, String)], k: &str| {
+            h.iter().find(|(n, _)| *n == k).unwrap().1.clone()
+        };
+        assert_eq!(get(&a, "X-Conversation-ID"), "conv-1");
+        assert_eq!(get(&b, "X-Conversation-ID"), "conv-1");
+        assert_ne!(
+            get(&a, "X-Conversation-Request-ID"),
+            get(&b, "X-Conversation-Request-ID")
+        );
+        assert_ne!(
+            get(&a, "X-Conversation-Message-ID"),
+            get(&b, "X-Conversation-Message-ID")
+        );
+        let fb = conversation_headers("");
+        let id = get(&fb, "X-Conversation-ID");
+        assert_eq!(id.len(), 32);
+        assert!(id.chars().all(|c| c.is_ascii_hexdigit()));
     }
 
     #[test]
