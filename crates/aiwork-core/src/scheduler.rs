@@ -363,7 +363,10 @@ fn tick(st: &AppState) {
                     if notify_cfg.on_checkin_done
                         && matches!(t.key, "trae-checkin" | "wb-checkin" | "qoder-checkin")
                     {
-                        crate::notify::send(st, &format!("{}完成", t.name), &summary, "checkin");
+                        // 门禁暂停轮（skipped_fail_streak）：标题用「暂停」——正文已是
+                        // 「已暂停…」，标题再叫「完成」自相矛盾
+                        let verb = if v.get("skipped_fail_streak").is_some() { "暂停" } else { "完成" };
+                        crate::notify::send(st, &format!("{}{verb}", t.name), &summary, "checkin");
                     }
                 }
             }
@@ -629,8 +632,9 @@ fn is_permanent_failure(e: &Value) -> bool {
 }
 
 /// 成长轮失败统计（run_task wb-growth 重试口径）：返回 (失败账号数, 其中永久性失败数)。
-/// 仅统计 growth 事件（type=growth && status=fail），start/done 等推进事件不计
-fn growth_fail_stats(events: &[Value]) -> (i64, i64) {
+/// 仅统计 growth 事件（type=growth && status=fail），start/done 等推进事件不计。
+/// pub(crate)：审查 No.3——UI 手动成长轮同口径统计（commands/workbuddy/checkin.rs）
+pub(crate) fn growth_fail_stats(events: &[Value]) -> (i64, i64) {
     let is_growth_fail = |e: &Value| {
         e.get("type").and_then(Value::as_str) == Some("growth")
             && e.get("status").and_then(Value::as_str) == Some("fail")
@@ -641,6 +645,85 @@ fn growth_fail_stats(events: &[Value]) -> (i64, i64) {
         .filter(|e| is_growth_fail(e) && is_permanent_failure(e))
         .count() as i64;
     (failed, permanent)
+}
+
+/// 纯函数：按本轮 成功数（含 already）/失败数 推导新连击值（独立便于单测）。
+/// 任一成功（含 already）→ 清零；混合轮不计数（随任一成功一并清零，绝不 +1）；
+/// 全轮失败 → +1；两者皆 0（空池空转）→ 原值不动。
+/// 移植自 main（buddy-ai 同名函数，wb-checkin/wb-growth 当日全败门禁复用）。
+/// pub(crate)：审查 No.3——UI 手动轮次连击同步复用（commands/workbuddy/checkin.rs）
+pub(crate) fn buddy_ai_streak_next(prev: i64, ok_count: i64, failed_count: i64) -> i64 {
+    if ok_count > 0 {
+        0
+    } else if failed_count > 0 {
+        prev + 1
+    } else {
+        prev
+    }
+}
+
+// ── 移植 main #134 方案3：wb-checkin / wb-growth 当日连续整轮全败连击 ──────────
+// 仿 buddy-ai streak 模式（buddy-ai-checkin 分支内联门禁）：调度器对可重试失败
+// 30→60→120 分钟退避全天重试，凭证级失效时每轮占轮次锁数分钟且反复撞锁
+//（用户点「开始签到」必被拒）。连续 ≥3 整轮全败当日暂停（mark_run 记「今日已处理」
+// 终止重试链），任一成功清零，次日自动恢复。
+
+/// 当日全败暂停阈值（对齐 buddy-ai；wb-checkin 与 wb-growth 共用同一阈值）
+const WB_ROUND_FAIL_STREAK_LIMIT: i64 = 3;
+/// 独立 kv 键：签到与成长各自计数（互不影响；计数与日期同文档单次写入防半写分叉）。
+/// pub(crate)：审查 No.3——UI 手动轮次（commands/workbuddy/checkin.rs）同键同步连击
+pub(crate) const WB_CHECKIN_STREAK_KEY: &str = "wb_checkin_fail_streak";
+pub(crate) const WB_GROWTH_STREAK_KEY: &str = "wb_growth_fail_streak";
+
+/// 读当前连击数：date ≠ 今日（跨日/无记录/损坏）→ 从 0 起（对齐 buddy_ai_checkin_streak）。
+/// pub(crate)：审查 No.3——UI 手动轮次连击同步复用（commands/workbuddy/checkin.rs）
+pub(crate) fn wb_round_fail_streak(st: &AppState, kv_key: &str, today: &str) -> i64 {
+    let v: Value = crate::store::db(&st.data_dir).kv_get(kv_key);
+    if v.get("date").and_then(Value::as_str) != Some(today) {
+        return 0;
+    }
+    v.get("streak").and_then(Value::as_i64).unwrap_or(0).max(0)
+}
+
+/// 持久化连击数。落库失败静默：连击丢失仅回到多试几轮的自愈起点（对齐 buddy-ai 同款注释）。
+/// pub(crate)：审查 No.3——UI 手动轮次连击同步复用（commands/workbuddy/checkin.rs）
+pub(crate) fn wb_round_fail_streak_save(st: &AppState, kv_key: &str, today: &str, streak: i64) {
+    let _ = crate::store::db(&st.data_dir).kv_set(kv_key, &json!({ "streak": streak, "date": today }));
+}
+
+/// 后台轮次事件转发回调（方案1 共通封装，审查 No.4 去重）：经 AppState 事件管线
+///（emit_event → SSE hub）同步转发进度事件，无需 AppHandle。wb-checkin / wb-growth 共用
+fn state_event_emitter(st: &AppState) -> crate::commands::workbuddy::WbCheckinEmitter {
+    let st2 = st.clone();
+    std::sync::Arc::new(move |name: &str, payload: Value| st2.emit_event(name, payload))
+}
+
+/// 后台轮次 panic 兜底 + exit 补发（审查 No.5 同款缺口的后台路径闭环）：方案1 转发
+/// start 事件后，若轮次中途 panic，done/exit 复位事件不再发出——前端运行态永久悬挂。
+/// tick 层 catch_unwind 拿不到轮次事件句柄补不了发，须在轮次现场兜底：正常结束与
+/// panic 均补发 exit（前端 exit 仅复位运行态，幂等无害，与 UI 路径 spawn_wb_round
+/// 契约一致）；panic 落日志并返 Err 交调度器 mark_fail + 冷却重试。
+fn run_wb_round_guarded<T>(
+    st: &AppState,
+    emit: &crate::commands::workbuddy::WbCheckinEmitter,
+    f: impl FnOnce() -> T,
+) -> Result<T, String> {
+    let ret = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+    crate::commands::workbuddy::emit_wb_event(emit, &json!({ "type": "exit", "ok": ret.is_ok() }));
+    ret.map_err(|p| {
+        let detail = if let Some(s) = p.downcast_ref::<&str>() {
+            (*s).to_string()
+        } else if let Some(s) = p.downcast_ref::<String>() {
+            s.clone()
+        } else {
+            "未知 panic".to_string()
+        };
+        crate::fs_utils::app_log(
+            &st.data_dir,
+            &format!("[WB 轮次] 后台轮次 panic（exit 已补发，前端运行态已复位）：{detail}"),
+        );
+        "WB 后台轮次 panic（已捕获，交调度器冷却重试）".to_string()
+    })
 }
 
 /// 执行单个任务（复用 CLI 任务同款实现，进度静默、结果汇总落日志）
@@ -696,26 +779,62 @@ fn run_task(key: &str, st: &AppState) -> Result<Value, String> {
         // 审查 P2（issue #61 批次）：同 trae-checkin——可重试失败返 Err 交 30 分钟冷却重试；
         // 永久性凭证失败（需重新登录 / 无可用凭证，30 分钟内不会自愈）剔除出重试判定
         "wb-checkin" => {
-            let Ok(_round) = crate::commands::workbuddy::try_acquire_wb_round() else {
-                // skipped_busy：抢不到轮次锁（UI 路径在跑）= 幂等跳过而非失败（对齐
-                // qoder-checkin）——返 Err 会触发当日首败误报通知 + 白耗 Server酱 额度
-                return Ok(json!({ "ok": true, "skipped": "已有签到/成长任务在执行中，本轮跳过", "skipped_busy": true }));
+            // 移植 main #134 方案2：抢轮次锁（进程内 + 持有者标签；Windows 跨进程
+            // 互斥体 OS 专属不移植）与 UI 路径互斥，skipped 文案携带持有者明细
+            let _round = match crate::commands::workbuddy::try_acquire_wb_round("调度器签到", &st.data_dir) {
+                Ok(g) => g,
+                Err(why) => {
+                    // skipped_busy：抢不到轮次锁（UI 路径在跑）= 幂等跳过而非失败（对齐
+                    // qoder-checkin）——返 Err 会触发当日首败误报通知 + 白耗 Server酱 额度
+                    return Ok(json!({ "ok": true, "skipped": why, "skipped_busy": true }));
+                }
             };
+            // 移植 main #134 方案3：当日连续整轮全败门禁（疑似凭证级失效，重试注定
+            // 失败）——达阈值当日暂停，mark_run 记「今日已处理」终止全天退避重试链，
+            // 次日自动恢复
+            let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+            let prev_streak = wb_round_fail_streak(st, WB_CHECKIN_STREAK_KEY, &today);
+            if prev_streak >= WB_ROUND_FAIL_STREAK_LIMIT {
+                return Ok(json!({
+                    "ok": true,
+                    "skipped": "连续多轮全部失败（疑似凭证失效），当日暂停签到，次日自动恢复",
+                    // 审查 No.1：补 summary——mark_run 后通知正文优先取本字段；否则布尔 ok
+                    // 无法匹配 (ok,already,failed) 三元组，正文沦为原始 JSON
+                    "summary": "签到已暂停：当日连续多轮全部失败（疑似凭证失效），次日自动恢复",
+                    "skipped_fail_streak": true,
+                }));
+            }
             let mut events: Vec<Value> = Vec::new();
-            let done = crate::tasks::wb_checkin::run_checkin_round(
-                st,
-                &crate::tasks::wb_checkin::CheckinOpts::daily(),
-                &mut |ev| events.push(ev.clone()),
-            );
+            // 移植 main #134 方案1：后台轮次同步转发进度事件（此前仅收集不转发，前端
+            // 运行态零显示，用户点击必撞锁且不可见原因）。docker 适配：经 AppState
+            // 事件管线（emit_event → SSE hub）转发，无需 AppHandle
+            let emit = state_event_emitter(st);
+            // 审查补充：panic 兜底 + exit 补发（防前端运行态悬挂），panic 返 Err 冷却重试
+            let done = run_wb_round_guarded(st, &emit, || {
+                crate::tasks::wb_checkin::run_checkin_round(
+                    st,
+                    &crate::tasks::wb_checkin::CheckinOpts::daily(),
+                    &mut |ev| {
+                        crate::commands::workbuddy::emit_wb_event(&emit, ev);
+                        events.push(ev.clone());
+                    },
+                )
+            })?;
+            let ok = done.get("ok").and_then(Value::as_i64).unwrap_or(0);
+            let already = done.get("already").and_then(Value::as_i64).unwrap_or(0);
             let failed = done.get("failed").and_then(Value::as_i64).unwrap_or(0);
+            // 移植 main #134 方案3：轮末更新连击（复用 buddy_ai_streak_next 纯函数：
+            // 任一成功含 already 清零 / 全败 +1 / 空轮不动），值不变不落库
+            let new_streak = buddy_ai_streak_next(prev_streak, ok + already, failed);
+            if new_streak != prev_streak {
+                wb_round_fail_streak_save(st, WB_CHECKIN_STREAK_KEY, &today, new_streak);
+            }
             let failed_permanent = events
                 .iter()
                 .filter(|e| e.get("status").and_then(Value::as_str) == Some("fail") && is_permanent_failure(e))
                 .count() as i64;
             let retryable = (failed - failed_permanent).max(0);
             if retryable > 0 {
-                let ok = done.get("ok").and_then(Value::as_i64).unwrap_or(0);
-                let already = done.get("already").and_then(Value::as_i64).unwrap_or(0);
                 return Err(format!(
                     "WB 签到：{ok} 成功 / {already} 已签 / {retryable} 失败（稍后自动重试）"
                 ));
@@ -724,10 +843,27 @@ fn run_task(key: &str, st: &AppState) -> Result<Value, String> {
         }
         // WorkBuddy 每日成长：成长三开关驱动，抢轮次锁与 UI 路径互斥
         "wb-growth" => {
-            let Ok(_round) = crate::commands::workbuddy::try_acquire_wb_round() else {
-                // skipped_busy：对齐 qoder-checkin/wb-checkin 的幂等跳过（防误报通知）
-                return Ok(json!({ "ok": true, "skipped": "已有签到/成长任务在执行中，本轮跳过", "skipped_busy": true }));
+            // 移植 main #134 方案2：抢轮次锁（进程内 + 持有者标签；Windows 跨进程
+            // 互斥体 OS 专属不移植）与 UI 路径互斥
+            let _round = match crate::commands::workbuddy::try_acquire_wb_round("调度器成长", &st.data_dir) {
+                Ok(g) => g,
+                Err(why) => {
+                    // skipped_busy：对齐 qoder-checkin/wb-checkin 的幂等跳过（防误报通知）
+                    return Ok(json!({ "ok": true, "skipped": why, "skipped_busy": true }));
+                }
             };
+            // 移植 main #134 方案3：当日连续整轮全败门禁（同 wb-checkin，独立连击键）
+            let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+            let prev_streak = wb_round_fail_streak(st, WB_GROWTH_STREAK_KEY, &today);
+            if prev_streak >= WB_ROUND_FAIL_STREAK_LIMIT {
+                return Ok(json!({
+                    "ok": true,
+                    "skipped": "连续多轮全部失败（疑似凭证失效），当日暂停成长任务，次日自动恢复",
+                    // 审查 No.1：补 summary（同 wb-checkin，正文可读）
+                    "summary": "成长任务已暂停：当日连续多轮全部失败（疑似凭证失效），次日自动恢复",
+                    "skipped_fail_streak": true,
+                }));
+            }
             let s = crate::commands::workbuddy::load_settings(st);
             let flags = crate::tasks::wb_checkin::GrowthOpts {
                 travel: s.growth_travel,
@@ -736,10 +872,31 @@ fn run_task(key: &str, st: &AppState) -> Result<Value, String> {
             };
             // run_growth_round 为 NDJSON 推进式输出（无汇总返回值）。审查修复：失败事件
             // 此前被空回调丢弃（恒 Ok：当日不重试不通知）——现累计事件，可重试失败返
-            // Err 交 30 分钟冷却重试；永久性凭证失败剔除（对齐 wb-checkin 口径）
+            // Err 交 30 分钟冷却重试；永久性凭证失败剔除（对齐 wb-checkin 口径）。
+            // 移植 main #134 方案1：后台轮次同步转发进度事件（同 wb-checkin）
             let mut events: Vec<Value> = Vec::new();
-            crate::tasks::wb_checkin::run_growth_round(st, &flags, &[], &mut |ev| events.push(ev.clone()));
+            let emit = state_event_emitter(st);
+            // 审查补充：panic 兜底 + exit 补发（同 wb-checkin）
+            run_wb_round_guarded(st, &emit, || {
+                crate::tasks::wb_checkin::run_growth_round(st, &flags, &[], &mut |ev| {
+                    crate::commands::workbuddy::emit_wb_event(&emit, ev);
+                    events.push(ev.clone());
+                });
+            })?;
             let (failed, failed_permanent) = growth_fail_stats(&events);
+            // 移植 main #134 方案3：轮末更新连击（复用 buddy_ai_streak_next 纯函数；
+            // ok_count 统计 growth+ok 事件，对齐桌面口径）
+            let ok_count = events
+                .iter()
+                .filter(|e| {
+                    e.get("type").and_then(Value::as_str) == Some("growth")
+                        && e.get("status").and_then(Value::as_str) == Some("ok")
+                })
+                .count() as i64;
+            let new_streak = buddy_ai_streak_next(prev_streak, ok_count, failed);
+            if new_streak != prev_streak {
+                wb_round_fail_streak_save(st, WB_GROWTH_STREAK_KEY, &today, new_streak);
+            }
             let retryable = (failed - failed_permanent).max(0);
             if retryable > 0 {
                 return Err(format!("WB 成长：{retryable} 个账号失败（稍后自动重试）"));
@@ -1627,5 +1784,51 @@ mod sched_backoff_tests {
         // 24h 内连续失败：照旧累计（2 → 60 分钟）
         mark_fail(&st, key, "同日二连失败");
         assert_eq!(retry_cooldown_ms(&load_state(&st), key), 60 * 60_000);
+    }
+
+    /// 连击纯函数（移植 main #134 方案3，wb-checkin/wb-growth 门禁复用）：
+    /// 任一成功（含 already）清零；全轮失败 +1；混合轮不计数（随任一成功清零，
+    /// 绝不 +1）；两者皆 0（空池空转）原值不动
+    #[test]
+    fn buddy_ai_streak_next_rules() {
+        // 全轮失败：+1
+        assert_eq!(buddy_ai_streak_next(0, 0, 2), 1);
+        assert_eq!(buddy_ai_streak_next(2, 0, 1), 3);
+        // 任一成功（含 already）：清零
+        assert_eq!(buddy_ai_streak_next(2, 1, 0), 0);
+        // 混合（部分成功）：不计数——按「任一成功清零」归零，绝不 +1
+        assert_eq!(buddy_ai_streak_next(2, 1, 1), 0);
+        assert_eq!(buddy_ai_streak_next(2, 3, 2), 0);
+        // 两者皆 0（空池空转）：原值不动
+        assert_eq!(buddy_ai_streak_next(4, 0, 0), 4);
+        assert_eq!(buddy_ai_streak_next(0, 0, 0), 0);
+    }
+
+    /// 连击持久化与跨日重置（审查 No.2 补测）：kv 文档 {streak, date} 同文档单次写入；
+    /// date ≠ 今日（跨日/无记录/损坏）一律从 0 起；签到/成长双键独立计数
+    #[test]
+    fn wb_round_fail_streak_persist_and_day_reset() {
+        let st = temp_state("wb_streak");
+        let today = "2026-01-30";
+        // 无记录 → 0
+        assert_eq!(wb_round_fail_streak(&st, WB_CHECKIN_STREAK_KEY, today), 0);
+        // 写 2 读回 2
+        wb_round_fail_streak_save(&st, WB_CHECKIN_STREAK_KEY, today, 2);
+        assert_eq!(wb_round_fail_streak(&st, WB_CHECKIN_STREAK_KEY, today), 2);
+        // 原始文档含 date + streak 双字段（计数与日期同文档防半写分叉）
+        let raw: Value = crate::store::db(&st.data_dir).kv_get(WB_CHECKIN_STREAK_KEY);
+        assert_eq!(raw.get("streak").and_then(Value::as_i64), Some(2));
+        assert_eq!(raw.get("date").and_then(Value::as_str), Some(today));
+        // 跨日（date ≠ today）→ 从 0 起（次日自动恢复）
+        assert_eq!(wb_round_fail_streak(&st, WB_CHECKIN_STREAK_KEY, "2026-01-31"), 0);
+        // 双键独立：growth 键不受 checkin 键影响
+        assert_eq!(wb_round_fail_streak(&st, WB_GROWTH_STREAK_KEY, today), 0);
+        wb_round_fail_streak_save(&st, WB_GROWTH_STREAK_KEY, today, 3);
+        assert_eq!(wb_round_fail_streak(&st, WB_GROWTH_STREAK_KEY, today), 3);
+        assert_eq!(wb_round_fail_streak(&st, WB_CHECKIN_STREAK_KEY, today), 2);
+        // 损坏文档（streak 非数值）→ 0，不 panic 不误判
+        let _ = crate::store::db(&st.data_dir)
+            .kv_set(WB_GROWTH_STREAK_KEY, &json!({ "streak": "corrupted", "date": today }));
+        assert_eq!(wb_round_fail_streak(&st, WB_GROWTH_STREAK_KEY, today), 0);
     }
 }

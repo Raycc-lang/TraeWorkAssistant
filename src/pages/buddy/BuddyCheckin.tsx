@@ -99,6 +99,9 @@ export default function BuddyCheckin() {
   const [growthLines, setGrowthLines] = useState<WbGrowthLine[]>([]);
   const [growthSummary, setGrowthSummary] = useState<string | null>(null);
   const unlistenRef = useRef<(() => void) | null>(null);
+  // 最近一次成长轮 start 的 total（审查 No.6 对齐：空池空转轮 done 静默 toast，
+  // 用 ref 而非 state——listen 闭包只注册一次，直接读 state 会捕获初始值）
+  const growthTotalRef = useRef(0);
   // 活动档期日历（F-80-余 v2 推广）：近 90 天逐账号签到记录按日聚合
   const [calDays, setCalDays] = useState<CheckinCalendarDay[]>([]);
 
@@ -164,21 +167,30 @@ export default function BuddyCheckin() {
           setGrowthLines([]);
           setGrowthSummary(null);
           setGrowthRunning(true);
+          growthTotalRef.current = parsed.total ?? 0;
         } else {
+          // 后台轮次（调度器）也会推 start：前端运行态同步置位（移植 main #134 方案1）
           setLines([]);
           setDoneInfo(null);
+          setRunning(true);
         }
       } else if ('type' in parsed && parsed.type === 'done') {
         if (parsed.mode === 'growth') {
           setGrowthSummary('成长中心执行完成');
           setGrowthRunning(false);
           void refresh();
-          pushToast('success', '成长中心执行完成（旅行/盲盒/任务结果见下方明细）');
+          // 审查 No.6 同款口径：空池空转轮（start total=0）不弹完成 toast 纯噪音
+          if (growthTotalRef.current > 0) {
+            pushToast('success', '成长中心执行完成（旅行/盲盒/任务结果见下方明细）');
+          }
         } else {
           setDoneInfo({ ok: parsed.ok, already: parsed.already, failed: parsed.failed });
           setRunning(false);
           void refresh();
-          pushToast(parsed.failed > 0 ? 'warn' : 'success', `WorkBuddy 签到完成：成功 ${parsed.ok}，已签 ${parsed.already}，失败 ${parsed.failed}`);
+          // 审查 No.6：空池空转 done(0,0,0) 静默——无任何账号执行时弹「成功 0」纯噪音
+          if (parsed.ok + parsed.already + parsed.failed > 0) {
+            pushToast(parsed.failed > 0 ? 'warn' : 'success', `WorkBuddy 签到完成：成功 ${parsed.ok}，已签 ${parsed.already}，失败 ${parsed.failed}`);
+          }
         }
       } else if ('type' in parsed && parsed.type === 'growth') {
         const line = parsed as WbGrowthLine;
