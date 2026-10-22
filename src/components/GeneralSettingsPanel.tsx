@@ -31,13 +31,13 @@ export default function GeneralSettingsPanel() {
   // 应用图标选择器：当前展开替换哪个应用的图标（null = 全部收起）
   const [iconPickerFor, setIconPickerFor] = useState<AppKey | null>(null);
   // 侧边栏显示拖拽排序态：dragKey = 正在拖拽的行（半透明反馈）；listRef = 列表容器
-  // （mousemove 据此定位指针所在行）；「侧边栏显示」列表行序即侧边栏应用 Tab 展示顺序
+  // （pointermove 据此定位指针所在行）；「侧边栏显示」列表行序即侧边栏应用 Tab 展示顺序
   const [dragKey, setDragKey] = useState<AppKey | null>(null);
   const listRef = useRef<HTMLDivElement | null>(null);
   // 当前拖拽的监听器清理函数（onUp）：拖拽中组件被卸载（如 Esc 关闭设置弹框）时兜底移除
   const dragCleanupRef = useRef<(() => void) | null>(null);
 
-  // 卸载兜底：window 级 mousemove/mouseup 监听器不随组件销毁自动移除，必须显式清理
+  // 卸载兜底：window 级 pointermove/pointerup 监听器不随组件销毁自动移除，必须显式清理
   useEffect(() => () => dragCleanupRef.current?.(), []);
 
   useEffect(() => {
@@ -96,16 +96,29 @@ export default function GeneralSettingsPanel() {
     });
   };
 
-  // 抓手按下启动拖拽：window 级 mousemove 实时检测指针所在行并换位（松开即止）。
-  // 不用 HTML5 DnD——Tauri Windows 端 dragDropEnabled 默认开启，原生文件拖放
-  // 处理器会拦截网页内 dragstart，draggable 完全失效（实测无法拖动）
-  const beginDrag = (key: AppKey) => (e: React.MouseEvent) => {
+  // 键盘等价路径（可达性）：↑/↓ 与相邻行换位——拖拽为指针交互，键盘用户由此调整顺序
+  const moveApp = (key: AppKey, dir: -1 | 1) => {
+    if (!form) return;
+    const order = getOrderedApps(form);
+    const i = order.indexOf(key);
+    const j = i + dir;
+    if (i < 0 || j < 0 || j >= order.length) return;
+    reorderApps(key, order[j]);
+  };
+
+  // 抓手按下启动拖拽：window 级 pointermove 实时检测指针所在行并换位（松开即止）。
+  // Pointer Events 统一鼠标/触摸（docker Web 形态会被移动端浏览器访问，
+  // 触摸端由抓手 touch-none 阻止滚动打断）；不用 HTML5 DnD——Tauri Windows 端
+  // dragDropEnabled 默认开启，原生文件拖放处理器会拦截网页内 dragstart，
+  // draggable 完全失效（实测无法拖动）
+  const beginDrag = (key: AppKey) => (e: React.PointerEvent) => {
+    if (e.button !== 0) return; // 仅左键触发（右键/中键拖拽属误触，右键还会被 preventDefault 抑制菜单）
     e.preventDefault(); // 防止拖动时选中文字
     let current = key;
     setDragKey(current);
-    const onMove = (ev: MouseEvent) => {
-      // 鼠标按键已全部抬起却没有收到 mouseup：焦点被抢走（alt-tab/系统弹窗）后
-      // 松开鼠标的事件落在了别处。此时若继续处理移动会无按键持续换位、拖拽态
+    const onMove = (ev: PointerEvent) => {
+      // 按键已全部抬起却没有收到 pointerup：焦点被抢走（alt-tab/系统弹窗）后
+      // 松开的事件落在了别处。此时若继续处理移动会无按键持续换位、拖拽态
       // 卡死到下一次点击，且乱序会被「保存设置」持久化——立即结束拖拽。
       if (ev.buttons === 0) {
         onUp();
@@ -115,7 +128,9 @@ export default function GeneralSettingsPanel() {
       if (!rows) return;
       rows.forEach((el) => {
         const r = el.getBoundingClientRect();
-        if (ev.clientY >= r.top && ev.clientY < r.bottom) {
+        // 水平边界同判（审查修复）：本区块为两列布局，指针移入左栏同高区域
+        // 不得触发换位（仅按 Y 判定会静默打乱行序）
+        if (ev.clientX >= r.left && ev.clientX < r.right && ev.clientY >= r.top && ev.clientY < r.bottom) {
           const target = el.dataset.appKey as AppKey | undefined;
           if (target && target !== current) {
             reorderApps(current, target);
@@ -127,12 +142,14 @@ export default function GeneralSettingsPanel() {
     };
     const onUp = () => {
       setDragKey(null);
-      window.removeEventListener('mousemove', onMove);
-      window.removeEventListener('mouseup', onUp);
+      window.removeEventListener('pointermove', onMove);
+      window.removeEventListener('pointerup', onUp);
+      window.removeEventListener('pointercancel', onUp);
       dragCleanupRef.current = null;
     };
-    window.addEventListener('mousemove', onMove);
-    window.addEventListener('mouseup', onUp);
+    window.addEventListener('pointermove', onMove);
+    window.addEventListener('pointerup', onUp);
+    window.addEventListener('pointercancel', onUp); // 触摸端被浏览器接管滚动时兜底收尾
     dragCleanupRef.current = onUp;
   };
 
@@ -305,14 +322,24 @@ export default function GeneralSettingsPanel() {
                     dragging ? 'opacity-40' : pinned && 'opacity-60',
                   )}
                 >
-                  {/* 拖拽抓手：按住上下拖动实时换位（仅抓手触发，避免误碰勾选/图标按钮） */}
+                  {/* 拖拽抓手：按住上下拖动实时换位（仅抓手触发，避免误碰勾选/图标按钮）；
+                      键盘等价路径 = 聚焦后 ↑/↓ 换位（可达性），touch-none 防触摸端
+                      滚动打断 pointer 拖拽 */}
                   <span
-                    title="按住拖动调整显示顺序"
-                    className="flex shrink-0 cursor-grab active:cursor-grabbing"
+                    title="按住拖动或聚焦后按 ↑/↓ 调整显示顺序"
+                    tabIndex={0}
+                    aria-label={`调整「${tab.label}」显示顺序（上下方向键移动）`}
+                    className="flex shrink-0 cursor-grab touch-none active:cursor-grabbing"
+                    onPointerDown={beginDrag(tab.key)}
+                    onKeyDown={(e) => {
+                      if (e.key === 'ArrowUp' || e.key === 'ArrowDown') {
+                        e.preventDefault();
+                        moveApp(tab.key, e.key === 'ArrowUp' ? -1 : 1);
+                      }
+                    }}
                   >
                     <GripVertical
                       size={14}
-                      onMouseDown={beginDrag(tab.key)}
                       className="text-slate-300 dark:text-zinc-600"
                       aria-hidden
                     />

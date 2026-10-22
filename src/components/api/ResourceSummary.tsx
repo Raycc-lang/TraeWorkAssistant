@@ -7,7 +7,8 @@
  *  ② 池间调度策略：smart / priority + 优先级序编辑 + 跨池回退（dispatch_policy_get/set 即时生效）；
  *  ③ 各资源池池内调度：Trae（strategy）/ Buddy（wb_strategy，空 = 跟随 Trae 池）/
  *     Qoder（qoder_strategy，空 = 跟随 Trae 池）/ BuddyAI 国际（buddy_ai_strategy，
- *     空 = 跟随 Trae 池）下拉编辑，自定义模型命中即直达；
+ *     空 = 跟随 Trae 池）下拉编辑，自定义模型为第五资源池参与统一调度（默认候选序尾部兜底，
+ *     custom/ 前缀锁池、per_model/Key 绑定可上移，纯 custom 模型唯一源直达）；
  *     上游开关与池成员在各应用「资源调度」页维护。
  * 下方为 Trae / Buddy / Qoder / BuddyAI 国际 / 自定义 五池摘要卡；前四者详情引导至
  * 各应用「资源调度」页，自定义池详情引导至「自定义模型」Tab。
@@ -335,7 +336,7 @@ function DispatchCenterCard({
       {/* ② 池间调度策略 */}
       <div className="border-t border-slate-100 pt-3 dark:border-zinc-800">
         <div className="mb-1.5 text-[11px] font-medium text-slate-500 dark:text-zinc-400">
-          池间调度（仅作用于多源同名模型 Trae/Buddy/Qoder/BuddyAI 国际；自定义模型命中即直达不受影响）
+          池间调度（多源同名模型全池生效；custom 池默认候选序尾部兜底，per_model/前缀锁池可上移）
         </div>
         <div className="flex flex-wrap items-center gap-x-6 gap-y-2 text-xs">
           <label className="flex items-center gap-2">
@@ -617,7 +618,7 @@ function DispatchCenterCard({
             </label>
           )}
           <span className="text-slate-400 dark:text-zinc-500">
-            自定义模型：<span className="text-slate-700 dark:text-zinc-200">命中即直达</span>（上游自有计费，无池内调度）
+            自定义模型：<span className="text-slate-700 dark:text-zinc-200">统一调度尾部兜底（纯 custom 模型直达）</span>（上游自有计费，池内上游组负载均衡）
           </span>
           <span className="text-slate-400 dark:text-zinc-500">
             上游开关与成员在各应用「资源调度」页配置
@@ -895,7 +896,7 @@ export default function ResourceSummary() {
           <Row label="启用模型数" value={metrics.customEnabledCount} />
           <Row label="模型总数" value={metrics.customModelTotal} />
           <Row label="消耗口径" value="上游自有计费" />
-          <Row label="调度语义" value="模型名命中即直达" />
+          <Row label="调度语义" value="统一调度尾部兜底（纯 custom 模型直达）" />
         </div>
         <p className="mt-3 border-t border-slate-100 pt-2 text-[11px] text-slate-400 dark:border-zinc-800 dark:text-zinc-500">
           <Blocks size={11} className="mr-1 inline" />

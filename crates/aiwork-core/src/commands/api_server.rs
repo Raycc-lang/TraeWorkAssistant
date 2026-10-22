@@ -920,7 +920,9 @@ pub fn custom_models_remove(state: &AppState, id: String) -> Result<bool, String
 
 /// 自定义模型连通性测试：向上游发一条最小 chat 请求（max_tokens=16），
 /// 成功返回摘要、失败返回原因（保存/编辑前的前置校验入口）。
-/// 阻塞 IO 放 spawn_blocking，外加 30s 总超时（覆盖连接 10s + 首字 10s + 出字余量）。
+/// 阻塞 IO 放 spawn_blocking，外加 30s 总超时（覆盖连接 3s + 首字 10s + 出字余量；
+/// 超时到期仅放弃等待，probe 线程由探活专用短读 agent 限定最长占用，
+/// 见 custom_route::custom_agent_read_secs）。
 pub async fn custom_model_test(
     model: crate::api_server::custom_models::CustomModel,
 ) -> Result<String, String> {

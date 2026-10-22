@@ -173,7 +173,8 @@ pub fn circuit_remaining_secs(cm_id: &str) -> Option<u64> {
 ///   按调用次数递增会把「跨片段渐进」放大成「单请求轮换放大」（Qoder 审查
 ///   修复同款语义：同片段内换号不递增）。半开 = 窗口到期后下一请求自然放行，
 ///   放行请求失败 → 新片段重新记账（此处 `Instant::now() >= *until` 分支）。
-/// - Auth 类（401/403/402）：直接落 600s 长窗，不吃渐进表；参与组内轮换。
+/// - Auth 类（401/403/402）：直接落 600s 长窗，不吃渐进表；参与组内轮换；
+///   记账同时清零渐进片段计数（长窗过期后 Server 失败从基准值重新起步）
 pub fn note_circuit_failure(cm_id: &str, kind: FailKind) {
     circuit_map()
         .lock()
@@ -186,6 +187,10 @@ pub fn note_circuit_failure(cm_id: &str, kind: FailKind) {
                 if candidate > *until {
                     *until = candidate;
                 }
+                // 审查修复：Auth 记账同时清零渐进计数——401/403/402 为配置/账户类
+                // 错误，与负载类 Server 渐进语义无关；不清零则长窗过期后首个 Server
+                // 失败继承既有 fails，直接落高倍冷却窗而非从 30s 基准重新起步
+                *fails = 0;
             }
             FailKind::Server => {
                 if Instant::now() >= *until {
@@ -204,9 +209,10 @@ pub fn note_circuit_failure(cm_id: &str, kind: FailKind) {
             }
         })
         .or_insert_with(|| match kind {
+            // Auth 插入 fails=0：渐进片段计数只归 Server 类记账（与 and_modify 清零同口径）
             FailKind::Auth => (
                 Instant::now() + Duration::from_secs(AUTH_LONG_WINDOW_SECS),
-                1,
+                0,
             ),
             FailKind::Server => (
                 Instant::now() + Duration::from_secs(CIRCUIT_BASE_SECS),
@@ -420,6 +426,51 @@ mod tests {
             assert_eq!(e.1, 3);
             let left = e.0.saturating_duration_since(Instant::now()).as_secs();
             assert!(left > 110 && left <= 120, "第三次片段窗口 120s，实际 {left}");
+        }
+        clear_circuit(&id);
+    }
+
+    /// 审查修复回归：Auth 长窗过期后 Server 失败从基准值重新起步（不继承
+    /// 既有渐进计数——Auth 记账清零 fails，长窗与负载渐进语义解耦）
+    #[test]
+    fn t05c_auth_window_expiry_resets_progressive() {
+        let id = uid(9);
+        note_circuit_failure(&id, FailKind::Auth);
+        {
+            let map = circuit_map().lock().unwrap_or_else(|e| e.into_inner());
+            assert_eq!(map.get(&id).unwrap().1, 0, "Auth 记账不计入渐进片段");
+        }
+        // 拨到过去：模拟 600s 长窗已过期
+        {
+            let mut map = circuit_map().lock().unwrap_or_else(|e| e.into_inner());
+            map.get_mut(&id).unwrap().0 = Instant::now() - Duration::from_secs(1);
+        }
+        // 过期后 Server 失败 → 从基准 30s 重新记账（fails=1），不继承长窗前计数
+        note_circuit_failure(&id, FailKind::Server);
+        {
+            let map = circuit_map().lock().unwrap_or_else(|e| e.into_inner());
+            let e = map.get(&id).unwrap();
+            assert_eq!(e.1, 1, "长窗过期后 Server 失败从基准重新记账");
+            let left = e.0.saturating_duration_since(Instant::now()).as_secs();
+            assert!(left > 28 && left <= 30, "应落基准窗 30s，实际 {left}");
+        }
+        clear_circuit(&id);
+    }
+
+    /// 审查修复回归：Server 渐进失败后转入 Auth 记账 → 渐进计数清零
+    /// （and_modify 路径——t05c 首记走 or_insert，此处覆盖既有条目分支）
+    #[test]
+    fn t05d_auth_clears_progressive_on_existing_entry() {
+        let id = uid(10);
+        note_circuit_failure(&id, FailKind::Server);
+        note_circuit_failure(&id, FailKind::Server); // 同片段不递增，fails=1
+        note_circuit_failure(&id, FailKind::Auth);
+        {
+            let map = circuit_map().lock().unwrap_or_else(|e| e.into_inner());
+            let e = map.get(&id).unwrap();
+            assert_eq!(e.1, 0, "Auth 记账清零既有渐进计数");
+            let left = e.0.saturating_duration_since(Instant::now()).as_secs();
+            assert!(left > 590, "长窗保持 600s，实际 {left}");
         }
         clear_circuit(&id);
     }

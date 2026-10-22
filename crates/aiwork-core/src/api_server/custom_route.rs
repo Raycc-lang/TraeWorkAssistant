@@ -55,8 +55,17 @@ fn rebuild_body(core: &Value, cm: &CustomModel) -> Vec<u8> {
 /// custom 专用 agent（快速失败参数）：连接超时 3s（快速失败切换——连接拒绝/
 /// 3s 超时立即进入组内轮换）/ 写 30s / 空闲读 300s（与 wb_agent 同读口径）
 fn custom_agent() -> ureq::Agent {
+    custom_agent_read_secs(300)
+}
+
+/// 指定空闲读超时的 agent 变体（审查修复）：探活（probe）在 spawn_blocking
+/// 线程上阻塞执行，命令层 30s 总超时到期只放弃等待、线程仍被占用至上游读
+/// 超时为止——300s 空闲读对探活无意义（max_tokens=16），缩至 30s 把单段
+/// 空闲读阻塞压到连接 3s + 写 30s + 读 30s 量级（约 63s；持续滴行的流式
+/// 响应不受空闲读超时约束，探活场景 max_tokens=16 实际远低于此）
+fn custom_agent_read_secs(read_secs: u64) -> ureq::Agent {
     ureq::AgentBuilder::new()
-        .timeout_read(std::time::Duration::from_secs(300))
+        .timeout_read(std::time::Duration::from_secs(read_secs))
         .timeout_write(std::time::Duration::from_secs(30))
         .timeout_connect(std::time::Duration::from_secs(3))
         .max_idle_connections(20)
@@ -64,10 +73,19 @@ fn custom_agent() -> ureq::Agent {
         .build()
 }
 
-/// 发起自定义上游请求（Bearer 鉴权；custom 专用 agent）
+/// 发起自定义上游请求（Bearer 鉴权；网关热路径用 custom_agent()）
 fn make_custom_request(cm: &CustomModel, body: &[u8]) -> Result<Box<dyn std::io::Read + Send>, (u16, String)> {
+    make_custom_request_with(cm, body, custom_agent())
+}
+
+/// agent 参数化变体：探活传短读超时 agent（custom_agent_read_secs(30)）
+fn make_custom_request_with(
+    cm: &CustomModel,
+    body: &[u8],
+    agent: ureq::Agent,
+) -> Result<Box<dyn std::io::Read + Send>, (u16, String)> {
     let url = custom_models::chat_url(&cm.base_url);
-    let mut req = custom_agent().post(&url);
+    let mut req = agent.post(&url);
     req = req.set("content-type", "application/json");
     req = req.set("accept", "text/event-stream");
     if !cm.api_key.is_empty() {
@@ -134,14 +152,15 @@ pub fn probe(cm: &CustomModel) -> Result<String, String> {
     })
     .to_string()
     .into_bytes();
-    let reader = make_custom_request(cm, &body).map_err(|(status, resp_body)| {
-        let preview: String = resp_body.chars().take(200).collect();
-        if preview.is_empty() {
-            format!("上游返回 status {status}（无响应体；请检查 API 地址与 Key）")
-        } else {
-            format!("上游返回 status {status}：{preview}")
-        }
-    })?;
+    let reader = make_custom_request_with(cm, &body, custom_agent_read_secs(30))
+        .map_err(|(status, resp_body)| {
+            let preview: String = resp_body.chars().take(200).collect();
+            if preview.is_empty() {
+                format!("上游返回 status {status}（无响应体；请检查 API 地址与 Key）")
+            } else {
+                format!("上游返回 status {status}：{preview}")
+            }
+        })?;
     let lines = wb_upstream::lines_with_first_byte_timeout(reader)
         .map_err(|_| "10 秒内未收到上游响应（首字超时）".to_string())?;
     let (resp, error_info) = wb_sse::aggregate(lines, &format!("probe-{}", now_ts()));
@@ -430,8 +449,9 @@ pub async fn custom_aggregate_chat(
                 // 组内全熔断/已试尽（pool_health 前置下理论不可达，防御性兜底）；
                 // [DEBUG] 排障行由 loop 后收尾统一落（此处 break 即达，不重复）
                 set_last_error(&state, format!("custom model={} group exhausted", model));
+                // 日志记 502（与下方 openai_error(BAD_GATEWAY) 实收一致；stream 路径为 503）
                 state.logger.log_request(
-                    "custom", "POST", proto.log_path(), &model, stream, 503, "custom",
+                    "custom", "POST", proto.log_path(), &model, stream, 502, "custom",
                     start_ts.elapsed().as_millis() as u64, &key_name, "-", Some(&last_err),
                 );
                 break;
@@ -449,6 +469,10 @@ pub async fn custom_aggregate_chat(
                     let preview: String = resp_body.chars().take(200).collect();
                     last_err = format!("自定义上游错误（status {}）：{}", status, preview);
                     set_last_error(&state, format!("custom model={} status={} body={}", model, status, preview));
+                    // 日志约定（审查固化）：aggregate 路径逐 attempt 记上游实回状态码
+                    // （与 WB 聚合路径同口径，保留上游侧可观测信息）；客户端实收恒为
+                    // BAD_GATEWAY 502，对齐由组耗尽收尾日志行落（stream 路径错误即
+                    // 下发同码，天然自洽）
                     state.logger.log_request(
                         "custom", "POST", proto.log_path(), &model, stream, status, "custom",
                         duration_ms, &key_name, &acct_name, Some(&format!("upstream status={}", status)),

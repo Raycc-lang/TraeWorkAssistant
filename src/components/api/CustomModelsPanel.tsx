@@ -180,7 +180,23 @@ export default function CustomModelsPanel({
     }
   };
 
-  /** 保存（新增/编辑共用）：必填校验 → 强制连通性测试（不通过无法保存）→ upsert */
+  /** 编辑模式跳测判定（审查修复）：连通性三要素（名/地址/Key）均未改动时
+   *  跳过强制测试——上游临时宕机/欠费时仍可保存备注、权重、备胎等非连通性
+   *  修改（否则连「禁用它」都无法保存）；新增或三要素任一变更仍强制测试 */
+  const identityUnchanged = (f: CustomModel) => {
+    if (!f.id) return false;
+    const orig = models.find((x) => x.id === f.id);
+    if (!orig) return false;
+    const norm = (s: string) => s.trim().replace(/\/+$/, '');
+    return (
+      orig.name.trim().toLowerCase() === f.name.trim().toLowerCase() &&
+      norm(orig.base_url) === norm(f.base_url) &&
+      orig.api_key === f.api_key
+    );
+  };
+
+  /** 保存（新增/编辑共用）：必填校验 → 强制连通性测试（不通过无法保存；编辑
+   *  且连通性要素未变时可跳过，见 identityUnchanged）→ upsert */
   const save = async () => {
     if (!form) return;
     const errs = validate(form);
@@ -203,8 +219,12 @@ export default function CustomModelsPanel({
       toast('error', `保存失败：相同模型与上游地址/Key 的条目已存在（${dup.name}）`);
       return;
     }
-    const ok = await runTest();
-    if (!ok) return;
+    if (identityUnchanged(form)) {
+      toast('info', '连通性要素未变更，已跳过测试');
+    } else {
+      const ok = await runTest();
+      if (!ok) return;
+    }
     setSaving(true);
     try {
       const next = await api.apiServer.customModelsSave({
@@ -247,6 +267,11 @@ export default function CustomModelsPanel({
     }
   };
 
+  /** 待删除条目所在上游组成员数（单条 = 1；删除确认文案按组/单条区分后果） */
+  const deleteGroupSize = deleteFor
+    ? groups.find((g) => g.key === deleteFor.name.trim().toLowerCase())?.members.length ?? 1
+    : 1;
+
   const set = <K extends keyof CustomModel>(k: K, v: CustomModel[K]) =>
     setForm((f) => (f ? { ...f, [k]: v } : f));
 
@@ -265,7 +290,8 @@ export default function CustomModelsPanel({
               ) : (
                 <Badge tone="green" className="!px-1.5 !text-[10px]">主</Badge>
               )}
-              {m.weight !== 1 && <Badge tone="slate" className="!px-1.5 !text-[10px]">权重×{m.weight}</Badge>}
+              {/* weight<=1 不显示徽标（旧数据显式存 0 时后端保存才归一 1，渲染端兜底防「权重×0」） */}
+              {m.weight > 1 && <Badge tone="slate" className="!px-1.5 !text-[10px]">权重×{m.weight}</Badge>}
             </>
           ) : (
             <>
@@ -377,7 +403,21 @@ export default function CustomModelsPanel({
                         onClick={() => toggleGroup(g.key)}
                       >
                         <td className="py-2 pr-4" colSpan={7}>
-                          <div className="flex flex-wrap items-center gap-1.5 font-mono text-xs font-medium text-slate-700 dark:text-zinc-200">
+                          {/* 可达性挂在 td 内层元素（role=button 挂 tr 会抹平行语义，
+                              屏幕阅读器丢失表格行上下文） */}
+                          <div
+                            className="flex flex-wrap items-center gap-1.5 font-mono text-xs font-medium text-slate-700 dark:text-zinc-200"
+                            role="button"
+                            tabIndex={0}
+                            aria-expanded={!isCollapsed}
+                            aria-label={`上游组 ${head.name}（${g.members.length} 个上游），回车展开/收起`}
+                            onKeyDown={(e) => {
+                              if (e.key === 'Enter' || e.key === ' ') {
+                                e.preventDefault();
+                                toggleGroup(g.key);
+                              }
+                            }}
+                          >
                             {isCollapsed ? <ChevronRight size={13} /> : <ChevronDown size={13} />}
                             {head.name}
                             {head.vendor && <Badge tone="slate" className="!px-1.5 !text-[10px]">{head.vendor}</Badge>}
@@ -604,7 +644,15 @@ export default function CustomModelsPanel({
       >
         <div className="text-sm">
           确认删除模型「{deleteFor?.name}」？
-          <div className="mt-1 text-xs text-slate-400">删除后该模型名将回落 Trae/Buddy/Qoder 统一调度管线（如内置目录存在同名模型）。</div>
+          {/* 审查修复：组内成员删除需提示组语义——上游组仍由剩余成员承接流量，
+              与单条删除「整个模型名回落统一调度」的后果不同 */}
+          {deleteGroupSize > 1 ? (
+            <div className="mt-1 text-xs text-amber-500">
+              该模型名是上游组（{deleteGroupSize} 个上游），删除本条后仍有 {deleteGroupSize - 1} 条上游将继续以组内负载均衡承接请求。
+            </div>
+          ) : (
+            <div className="mt-1 text-xs text-slate-400">删除后该模型名将回落 Trae/Buddy/Qoder 统一调度管线（如内置目录存在同名模型）。</div>
+          )}
         </div>
       </Modal>
     </div>

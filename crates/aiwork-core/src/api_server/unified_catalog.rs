@@ -461,6 +461,13 @@ pub fn unified_models_ex(
     let mut qoder_img: HashMap<String, bool> = HashMap::new();
     // 自定义模型供应商（canonical → 用户填写值；聚合末段优先于系列推断）
     let mut custom_vendor: HashMap<String, String> = HashMap::new();
+    // Custom 侧候选值（审查修复，镜像 buddy_ctx/qoder_ctx 模式）：context/
+    // max_tokens/supports_image 由末段按命中侧（hit == custom）选定——v3 起
+    // custom 不再「命中即直达」（候选序尾部兜底），合并时无条件覆盖会让多源
+    // 条目在命中 Trae/Buddy 时仍展示 custom 侧声明
+    let mut custom_ctx: HashMap<String, u64> = HashMap::new();
+    let mut custom_mt: HashMap<String, u64> = HashMap::new();
+    let mut custom_img: HashMap<String, bool> = HashMap::new();
 
     // 源1：Trae（先入者；同 canonical 的 wb 条目随后合并）
     for m in &trae_list {
@@ -618,11 +625,23 @@ pub fn unified_models_ex(
         }
     }
     for (canonical, g) in &custom_groups {
-        if !g.vendor.is_empty() {
+        // 审查修复（P3）：全 disabled 组的 vendor 不进候选表（「disabled 不参与
+        // 声明」原则对多源条目的 vendor 覆盖同样成立，末段回落系列推断）
+        if g.enabled && !g.vendor.is_empty() {
             custom_vendor.insert(canonical.clone(), g.vendor.clone());
         }
-        // 展示倍率：0 = 免费（有效语义，透传聚合层）——命中 custom 即按免费展示；
-        // 聚合尾部 rate=命中侧倍率，disabled 的 custom 源不会被命中，不影响 Trae/Buddy 侧
+        // Custom 侧候选值仅 enabled 组参与（hit == custom 时末段回选）
+        if g.enabled {
+            if let Some(c) = g.ctx {
+                custom_ctx.insert(canonical.clone(), c);
+            }
+            if let Some(t) = g.mt {
+                custom_mt.insert(canonical.clone(), t);
+            }
+            custom_img.insert(canonical.clone(), g.img);
+        }
+        // 展示倍率：0 = 免费（有效语义，透传聚合层）；聚合尾部 rate=命中侧倍率，
+        // disabled 的 custom 源不会被命中，不影响 Trae/Buddy 侧
         let crate_rate: Option<f64> = g.rate;
         match acc.get_mut(canonical) {
             Some(u) => {
@@ -631,19 +650,14 @@ pub fn unified_models_ex(
                     rate: crate_rate,
                     enabled: g.enabled,
                 });
+                // 审查修复（P2）：合并臂不再无条件覆盖 ctx/mt/supports_image——
+                // v3 起 custom 未必命中（候选序尾部兜底），声明改由末段按 hit
+                // 侧回选（custom_ctx/custom_mt/custom_img）；rate 保留组内最小值
+                // 作为末段回退链的兜底位
                 if g.enabled {
                     if let Some(r) = crate_rate {
                         u.rate = Some(r);
                     }
-                    if let Some(c) = g.ctx {
-                        u.context_length = Some(c);
-                    }
-                    if let Some(t) = g.mt {
-                        u.max_tokens = Some(t);
-                    }
-                    // 审查修复：disabled 自定义条目不参与顶层 supports_image 覆盖
-                    // （停用模型的多模态声明不得改变聚合视图展示，仅 enabled 条目参与）
-                    u.supports_image = Some(g.img);
                 }
             }
             None => {
@@ -653,13 +667,16 @@ pub fn unified_models_ex(
                     UnifiedModel {
                         id: g.name.clone(),
                         display: g.name.clone(),
-                        vendor: g.vendor.clone(),
+                        // 审查修复（P2）：全 disabled 组不发布 vendor/上下文/最大输出
+                        // 声明（与合并臂 g.enabled 门控同口径）——仅徽章置灰，
+                        // 「disabled 不参与声明」原则对纯 custom 条目同样成立
+                        vendor: if g.enabled { g.vendor.clone() } else { String::new() },
                         region: None,
                         rate: if g.enabled { crate_rate } else { None },
                         efforts: Vec::new(),
                         max_mode: false,
-                        context_length: g.ctx,
-                        max_tokens: g.mt,
+                        context_length: if g.enabled { g.ctx } else { None },
+                        max_tokens: if g.enabled { g.mt } else { None },
                         supports_image: g.enabled.then_some(g.img),
                         sources: vec![UnifiedSource {
                             pool: "custom",
@@ -869,29 +886,42 @@ pub fn unified_models_ex(
     let policy = super::dispatch::load_policy(data_dir);
     for u in &mut out {
         let canonical = canonical_id(&u.id);
-        let pools: Vec<TargetPool> = policy
+        let mut pools: Vec<TargetPool> = policy
             .per_model
             .get(&canonical)
             .unwrap_or(&policy.priority)
             .iter()
             .filter_map(|s| TargetPool::parse(s))
             .collect();
-        // 命中池：自定义来源命中即直达（dispatch ⓪ 短路）→ 显示层同步命中 custom；
-        // 否则优先级序首个 enabled 源 → 任一 enabled 源 → 首源
-        let hit = u
-            .sources
+        // 审查修复（P1）：v3 已废除「custom 命中即直达」短路（dispatch ⓪ 移除，
+        // 默认候选序 = [buddy, buddy-ai, trae, qoder, custom] 尾部兜底）——目录
+        // 命中侧同步对齐 dispatch 候选序口径：per_model/全局优先级序 + 缺池尾部
+        // 补齐（与 resolve_target 的补齐序列一致），custom 仅在候选序排到时才命中。
+        // 否则多源同名模型会出现「目录展示取 custom 侧倍率/上下文，实际调度
+        // 与计费走 Trae/Buddy」的口径错位。
+        // 边界说明：Smart 重排为请求期动态口径（到期/倍率/积分，随账号状态变化），
+        // 目录作为静态派生视图不镜像（与 sticky/前缀锁定/Key 绑定序同理）——
+        // strategy=Smart 且无 per_model 时 hit 侧可能与实际命中池不同，此为
+        // 静态目录的既有取舍，非本判定引入
+        for p in [
+            TargetPool::Buddy,
+            TargetPool::BuddyAi,
+            TargetPool::Trae,
+            TargetPool::Qoder,
+            TargetPool::Custom,
+        ] {
+            if !pools.contains(&p) {
+                pools.push(p);
+            }
+        }
+        // 命中池：候选序首个 enabled 源 → 任一 enabled 源 → 首源
+        let hit = pools
             .iter()
-            .find(|s| s.pool == "custom" && s.enabled)
-            .map(|s| s.pool)
-            .or_else(|| {
-                pools
+            .find_map(|p| {
+                u.sources
                     .iter()
-                    .find_map(|p| {
-                        u.sources
-                            .iter()
-                            .find(|s| s.pool == p.as_str() && s.enabled)
-                            .map(|s| s.pool)
-                    })
+                    .find(|s| s.pool == p.as_str() && s.enabled)
+                    .map(|s| s.pool)
             })
             .or_else(|| u.sources.iter().find(|s| s.enabled).map(|s| s.pool))
             .or_else(|| u.sources.first().map(|s| s.pool));
@@ -923,6 +953,20 @@ pub fn unified_models_ex(
                 u.supports_image = Some(*img);
             }
         }
+        // context_length/max_tokens/supports_image 命中 custom → Custom 组声明
+        // （审查修复，镜像 qoder 分支）：合并臂已不再无条件覆盖，未命中 custom
+        // 时多源条目保留 Trae/Buddy/Qoder 侧声明，口径与实际调度命中侧一致
+        if hit == Some("custom") {
+            if let Some(c) = custom_ctx.get(&canonical) {
+                u.context_length = Some(*c);
+            }
+            if let Some(t) = custom_mt.get(&canonical) {
+                u.max_tokens = Some(*t);
+            }
+            if let Some(img) = custom_img.get(&canonical) {
+                u.supports_image = Some(*img);
+            }
+        }
         // display：L1 人工 label 绝对最高优先（§3.2，覆盖双源展示名）；
         // 未人工维护时命中 buddy → 取 WB 展示名，命中 trae → 保持 Trae 侧（已含 L2 label）
         if let Some(label) = l1.get(&canonical).and_then(|m| m.label.clone()) {
@@ -940,6 +984,15 @@ pub fn unified_models_ex(
             }
         } else if u.supports_image.is_none() {
             if let Some(img) = buddy_img.get(&canonical) {
+                u.supports_image = Some(*img);
+            }
+        }
+        // 图片声明终极兜底：仍为 None 时退任一 enabled 源声明（审查修复配套——
+        // 合并臂不再无条件覆盖后，t13「enabled custom 条目参与图片声明」语义由
+        // 此承接：命中侧未声明而 custom 组声明了多模态时仍如实展示，disabled
+        // 条目不参与（不在 custom_img 候选表））
+        if u.supports_image.is_none() {
+            if let Some(img) = custom_img.get(&canonical) {
                 u.supports_image = Some(*img);
             }
         }

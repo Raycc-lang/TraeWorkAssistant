@@ -8,23 +8,25 @@
 
 ## [1.5.4] · 2026-10-22 · Custom 模型上游组（第五资源池）+ 侧边栏应用拖拽排序
 
-> 语义移植 main `f4888f6` => `21fc6fb`（11 提交，未 merge）。桌面/OS 专属跳过：d34a99d 应用内更新器脱离进程树启动安装器 + PREINSTALL 禁用树杀（Tauri 桌面更新链，docker Web 形态无桌面客户端/NSIS 安装包，不适用）；61bd1ab / 21fc6fb 为 main 自有 CHANGELOG 补录（本文件替代）；f8f1bce 为 main 版本 chore（本分支自管 1.5.4）；2079d8c 为 merge 提交（无内容）。
+> 语义移植 main `f4888f6` => `21fc6fb`（11 提交，未 merge）。跳过：d34a99d 桌面更新器/NSIS（OS 专属）；61bd1ab / 21fc6fb 为 main 自有 CHANGELOG（本文件替代）；f8f1bce 为 main 版本 chore（本分支自管 1.5.4）；2079d8c 为 merge 提交。
 
 ### 新增
 
-- **Custom 模型上游组（P1 同名多条=上游组）**：`custom_models.json` 同名多条即上游组——新增 weight（负载权重）/ standby（备胎）字段、完全重复条目校验、`find_enabled_all` 按 enabled 过滤、目录聚合合并展示、CustomModelsPanel 分组 UI。
-- **上游组负载均衡与实例级熔断（P2+P3，custom_lb）**：组内加权轮询 + 主备顺延 + 会话粘性；失败渐进冷却 30s×2ⁿ 封顶 480s（401/403/402 长熔断 600s）、3s 快速失败 agent；组内全熔断/耗尽自动降级跨池兜底；`custom_lb_status` 可观测端点。
-- **跨池整合（P4）**：`TargetPool` 新增 Custom 变体并扩展 parse；统一目录接入第四源 + fallback 管线；custom 直连/模型名前缀锁池、API Key 绑定池、`per_model` 写 `"custom"`、Smart 倍率、别名链路全部生效——纯 custom 模型唯一源直达，混合场景作候选序尾部兜底参与统一调度。
-- **测试与文档补齐（main 9143633）**：[DEBUG] UPSTREAM_GROUP_EXHAUSTED 排障行；401→200 端到端轮换 mock 测试；熔断窗口翻倍 / Smart 免费胜出 / 回退方向 / 目录聚合四组新用例；tech-framework §6.1 同步改写为「多池与统一目录」（补录 qoder 池行、池间策略五变体、新增「自定义模型上游组」bullet）。
-- **侧边栏应用拖拽排序（app_order）**：系统设置「应用显示」新增拖拽抓手——window 级 mousemove 实时换位（不用 HTML5 DnD，规避 Tauri dragDropEnabled 拦截 dragstart）、`ev.buttons` 校验防焦点丢失后拖拽态卡死乱序持久化、卸载兜底清理监听器、拖拽/固定 opacity 类互斥（cn 为纯 clsx 无 tailwind-merge）；Settings 新增 `app_order` 字段（后端 retain 白名单 + HashSet 保序去重，docker 白名单 trae/buddy/qoder/buddy-ai 四键口径）；Sidebar Tab 按 `getOrderedApps` 排序展示（未提及项按默认顺序补尾）、网格最多 4 列（>4 折两行）。
+- **Custom 模型上游组**：`custom_models.json` 同名多条即上游组（weight 负载权重 / standby 备胎、完全重复校验、目录聚合合并展示、CustomModelsPanel 分组 UI）。
+- **上游组负载均衡与实例级熔断（custom_lb）**：加权轮询 + 主备顺延 + 会话粘性；渐进熔断 30s×2ⁿ 封顶 480s（401/403/402 长 600s）、3s 快速失败；组内全熔断自动跨池兜底；`custom_lb_status` 可观测。
+- **跨池整合**：Custom 作为第五资源池参与统一调度——前缀锁池 / Key 绑定池 / `per_model` 写 `"custom"` / Smart 倍率 / 别名链路全部生效；纯 custom 模型唯一源直达，混合场景候选序尾部兜底。
+- **侧边栏应用拖拽排序**：系统设置「应用显示」新增拖拽抓手实时换位，`app_order` 持久化（后端保序去重，未提及项按默认顺序补尾）；Sidebar Tab 按新顺序展示，网格最多 4 列（>4 折两行）。
+- **测试与文档**：端到端轮换 / 熔断窗口 / Smart 免费胜出 / 回退方向 / 目录聚合新用例；[DEBUG] UPSTREAM_GROUP_EXHAUSTED 排障行；tech-framework §6.1 改写「多池与统一目录」（补录 qoder 池行）。
 
 ### 修复与加固
 
-- **逐行审查修复（main 14d61fb）**：统一目录组倍率只统计 enabled 条目（disabled 免费(0) 以 None 占位，不再压低组内最小倍率），t13b 用例同步修正；aggregate 路径组耗尽 [DEBUG] 行去重（loop 后收尾统一落）；custom_models 模块注释与 `no_healthy_detail` Custom 臂陈旧注释同步 v3 语义。
+- 统一目录组倍率只统计 enabled 条目（disabled 免费(0) 不再压低组内最小倍率）；aggregate 排障行去重；模块注释同步 v3 语义。
+- **移植审查修复**：`parse_bind_pool` 补 `buddy-ai` 臂（移植漏臂致 BuddyAI 池绑定静默失效、组织预览错池，dispatch 消费分支成死代码）；非流式组耗尽兜底日志 502 对齐客户端实收（stream 路径本为 503 自洽）。
+- **移植后全面审查修复（2026-10-23）**：① 统一目录命中侧移除已废除的 custom 短路，改为与 dispatch 候选序一致（per_model/优先级序 + 缺池尾部补齐），custom 侧 rate/context/max_tokens/supports_image 全部改由命中侧回选（合并臂不再无条件覆盖），消除「目录展示取 custom 侧、实际调度走 Trae/Buddy」的口径错位；Smart 重排为请求期动态口径、目录不镜像（既有取舍，注释如实声明）；全 disabled 组不发布 vendor/上下文/多模态声明（多源与纯 custom 条目同口径）；② custom_lb Auth 长窗记账清零渐进片段计数（长窗过期后 Server 失败从 30s 基准重起步，不继承既有 fails，新增 t05c 回归）；③ custom_models upsert/remove 读-改-写持专用互斥锁（对齐 POOL_CFG_LOCK 范式，防并发丢更新）+ base_url 信任边界声明（有意放行 127.0.0.1 本机推理服务）；④ 模型探活 agent 空闲读缩至 30s（spawn_blocking 线程最长占用 ~63s 上界）；⑤ aggregate 逐 attempt 日志状态码约定注释固化；⑥ 前端拖拽改 Pointer Events（触摸端可用 + pointercancel 兜底）、补左键校验与两列布局水平边界判定、抓手键盘 ↑/↓ 换位 + aria、分组折叠行键盘/aria-expanded；⑦ 编辑模式连通性三要素（名/地址/Key）未变更时跳过强制测试（上游临时宕机仍可保存修改）；⑧ 上游组成员删除确认文案区分组内语义（剩余 N-1 条继续承接）；⑨ ResourceSummary 调度语义文案对齐 v3；⑩ weight≤1 渲染兜底不再显示「权重×0」；⑪ AGENT.md `custom_models_*` 命令前缀修正。
 
 ### 验证
 
-- `cargo test --workspace` 792 通过（7 忽略）· `tsc --noEmit` 0 错误 · `vitest` 76 通过。
+- `cargo test --workspace` 793 通过（7 忽略，含新增 t05c 回归）· `tsc --noEmit` 0 错误 · `vitest` 76 通过。
 
 ## [1.5.3] · 2026-10-22 · WB 轮次锁持有者标签 + 后台轮次事件转发 + 当日全败门禁
 

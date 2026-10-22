@@ -14,6 +14,7 @@
 //! 请求体强制 `stream:true`（与 WB 上游同策略：统一 SSE 处理，非流式本地聚合）。
 
 use std::path::Path;
+use std::sync::{Mutex, MutexGuard, OnceLock};
 
 use serde::{Deserialize, Serialize};
 
@@ -107,6 +108,21 @@ pub fn load(data_dir: &Path) -> Vec<CustomModel> {
     })
 }
 
+/// custom_models 读-改-写互斥（审查修复）：upsert / remove 的「load → 修改 →
+/// save_list」复合段并发时，旧副本整表写回会互相覆盖丢更新（cmd_bridge 每 cmd
+/// 独立 spawn_blocking，无天然串行化）。对齐 runtime.rs POOL_CFG_LOCK 范式：
+/// 所有此类复合段必须持本锁；纯读（load）无需持锁。叶子锁——锁内不做其他
+/// 文件/池锁获取。豁免：启动迁移（store::migrate import_custom_models 直调
+/// docs::custom_models_save）在 server bind 前单线程执行，无并发窗口，不取本锁。
+static UPSERT_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+fn cfg_write_lock() -> MutexGuard<'static, ()> {
+    UPSERT_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+}
+
 /// 整表保存（调用方负责校验后的最终形态落盘）
 pub fn save_list(data_dir: &Path, models: Vec<CustomModel>) -> Result<(), String> {
     let now = now_ts();
@@ -145,6 +161,12 @@ pub fn upsert(data_dir: &Path, mut m: CustomModel) -> Result<Vec<CustomModel>, S
     {
         return Err("API 地址必须以 http:// 或 https:// 开头".into());
     }
+    // 信任边界声明（审查 P2）：base_url 不做私网/环回/链路本地地址过滤——自定义
+    // 上游本就支持指向本机推理服务（Ollama / LM Studio 等 127.0.0.1 场景），
+    // 过滤会破坏合法用法；且该配置仅管理员可写（admin auth_middleware 全量
+    // 覆盖）。管理员应知悉：请求自服务端网络位置发出，勿配置不可信内网地址
+    // 读-改-写复合段持互斥锁（审查修复）：load 起即持锁，并发 upsert/remove 防丢更新
+    let _g = cfg_write_lock();
     let mut list = load(data_dir);
     let canonical = canonical_id(&m.name);
     // 完全重复校验（P1 放宽）：同名（canonical 相同）+ 同 base_url + 同 api_key
@@ -179,6 +201,8 @@ pub fn upsert(data_dir: &Path, mut m: CustomModel) -> Result<Vec<CustomModel>, S
 
 /// 按 id 删除；返回是否确有删除
 pub fn remove(data_dir: &Path, id: &str) -> Result<bool, String> {
+    // 读-改-写复合段持互斥锁（审查修复，与 upsert 同口径）
+    let _g = cfg_write_lock();
     let mut list = load(data_dir);
     let before = list.len();
     list.retain(|m| m.id != id);

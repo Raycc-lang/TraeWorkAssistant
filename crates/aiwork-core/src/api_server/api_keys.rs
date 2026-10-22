@@ -222,6 +222,7 @@ pub fn parse_bind_pool(s: &str) -> Option<&'static str> {
     match s.trim().to_lowercase().as_str() {
         "trae" => Some("trae"),
         "buddy" => Some("buddy"),
+        "buddy-ai" => Some("buddy-ai"),
         "qoder" => Some("qoder"),
         "custom" => Some("custom"),
         _ => None,
