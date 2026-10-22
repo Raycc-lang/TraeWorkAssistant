@@ -417,6 +417,13 @@ impl AppState {
         s.app_icons.retain(|k, v| {
             matches!(k.as_str(), "trae" | "buddy" | "qoder" | "buddy-ai") && !v.trim().is_empty()
         });
+        // 应用显示顺序归一：仅保留合法 key + 保序去重（HashSet 全量去重——
+        // Vec::dedup 只去相邻重复，非相邻重复如 [trae,buddy,trae] 漏网；
+        // 保持用户拖拽后的相对顺序，不排序）；未提及/空缺 = 前端按内置默认顺序补在末尾
+        s.app_order
+            .retain(|k| matches!(k.as_str(), "trae" | "buddy" | "qoder" | "buddy-ai"));
+        let mut seen_order = std::collections::HashSet::new();
+        s.app_order.retain(|k| seen_order.insert(k.clone()));
         s
     }
 

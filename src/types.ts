@@ -227,6 +227,11 @@ export interface Settings {
   hidden_apps: AppKey[];
   /** 侧边栏应用自定义图标（应用 key → 图标名，lib/appIcons.ts 候选表；缺失/非法回退内置默认图标） */
   app_icons: Partial<Record<AppKey, string>>;
+  /**
+   * 侧边栏应用显示顺序（AppKey 列表，应用显示面板拖拽排序写入；空/缺省 = 内置默认顺序）。
+   * 未提及的应用由 getOrderedApps 按默认顺序补在末尾——新版本新增应用对老配置天然兼容
+   */
+  app_order: AppKey[];
   /** Trae 签到多账号间隔秒（默认 3s，0=关闭；防上游频控） */
   trae_checkin_gap_secs: number | null;
   /** WorkBuddy 签到/成长多账号间隔秒（默认 3s，0=关闭；两轮共用） */
@@ -495,7 +500,8 @@ export interface GatewaySettings {
 }
 
 /** 自定义模型条目（data/custom_models.json；custom_models_list/save/remove）。
- *  OpenAI 兼容上游直通：请求模型名 canonical 命中 enabled 条目即直达该上游 */
+ *  OpenAI 兼容上游直通：请求模型名 canonical 命中组内 enabled 条目，
+ *  同名多条 = 上游组（负载均衡轮询） */
 export interface CustomModel {
   /** 稳定 id（cm-<12hex>，保存时为空则新增） */
   id: string;
@@ -515,6 +521,10 @@ export interface CustomModel {
   rate: number;
   note: string;
   updated_at: number;
+  /** 负载权重（默认 1；0 视为 1）——上游组内加权轮询用 */
+  weight: number;
+  /** 备胎标记（默认 false）：true = 活跃条目全部失败/熔断时才启用 */
+  standby: boolean;
 }
 
 /** Trae 模型元数据 L1 覆盖层（data/trae_model_meta.json；trae_model_meta_set/clear，§6.1）

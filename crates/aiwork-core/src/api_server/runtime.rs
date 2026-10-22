@@ -410,6 +410,9 @@ pub fn build_shared(state: &AppState) -> Arc<ApiSharedState> {
         buddy_ai_enabled: std::sync::atomic::AtomicBool::new(pool_file.buddy_ai_enabled),
         wb_sticky: StickyStore::load(&state.data_dir),
         pool_sticky: Mutex::new(std::collections::HashMap::new()),
+        // custom 上游组会话粘上游 + 组内轮询计数（P2 移植）：内存态不落盘，重启清零
+        custom_upstream_sticky: Mutex::new(std::collections::HashMap::new()),
+        custom_lb_counters: Mutex::new(std::collections::HashMap::new()),
         model_cooldowns: Mutex::new(std::collections::HashMap::new()),
         // buddy-ai 模型级冷却独立实例（§4.2：Intl 池冷却表独立，CN 侧模型故障
         // 不得冷却 Intl 池同型号，反之亦然）

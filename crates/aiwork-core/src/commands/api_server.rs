@@ -942,6 +942,23 @@ pub async fn custom_model_test(
     }
 }
 
+/// 自定义上游熔断状态快照（P3 可观测）：每条仍在冷却中的上游
+/// (cm.id, 连续失败片段数, 剩余冷却秒)。UI 徽标消费，与 custom_models_list
+/// 按 id 关联展示「熔断中」态；重启清零（内存态）。
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct CustomUpstreamCircuitStatus {
+    pub id: String,
+    pub fails: u32,
+    pub cooling_secs: u64,
+}
+
+pub fn custom_lb_status() -> Vec<CustomUpstreamCircuitStatus> {
+    crate::api_server::custom_lb::circuit_snapshot()
+        .into_iter()
+        .map(|(id, fails, cooling_secs)| CustomUpstreamCircuitStatus { id, fails, cooling_secs })
+        .collect()
+}
+
 /// Trae 模型元数据人工覆盖（L1 覆盖层，键 canonical_id；编辑后聚合视图即时生效）
 pub fn trae_model_meta_set(
     state: &AppState,

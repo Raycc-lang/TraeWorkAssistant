@@ -2,6 +2,7 @@ pub mod api_keys;
 pub mod api_logger;
 pub mod auth;
 pub mod config_cache;
+pub mod custom_lb;
 pub mod custom_models;
 pub mod custom_route;
 pub mod dispatch;
@@ -136,6 +137,13 @@ pub struct ApiSharedState {
     /// 会话池粘性（统一网关 §4.4，内存态不落盘、重启即清）：
     /// session_key → (上次成功服务的资源池, 过期时间 Unix 秒)，TTL 60s 软粘
     pub pool_sticky: Mutex<std::collections::HashMap<String, (dispatch::TargetPool, i64)>>,
+    /// custom 上游组会话粘上游（P2）：session_key → (cm.id, 过期 Instant)，
+    /// TTL 60s，内存态不落盘（与池粘性同口径；custom_lb 模块消费）
+    pub custom_upstream_sticky:
+        Mutex<std::collections::HashMap<String, (String, std::time::Instant)>>,
+    /// custom 上游组加权轮询计数（P2）：canonical 模型名 → 组内共享计数器——
+    /// 按模型分组各计各的，避免单全局计数器跨组交替破坏组内分布
+    pub custom_lb_counters: Mutex<std::collections::HashMap<String, std::sync::atomic::AtomicUsize>>,
     /// 模型级冷却（F-34）：model → (until 秒, 连续失败次数)；10→20→40s 渐进退避，
     /// 优先级高于 Key 级冷却
     pub model_cooldowns: Mutex<std::collections::HashMap<String, (i64, u32)>>,
@@ -176,6 +184,64 @@ pub struct ApiSharedState {
     /// 上游 504 期间回退逐请求发生，未节流会让 app.log 被同一行刷爆并产生
     /// 每请求一次同步文件 IO（审查修复）
     pub fallback_log_at: Mutex<std::collections::HashMap<String, i64>>,
+}
+
+/// 测试专用：全字段默认构造（custom_route 端到端轮换测试等无 fixture 的
+/// 测试模块复用；开关取生产默认值，池为空池）
+#[cfg(test)]
+pub(crate) fn test_shared_state(data_dir: std::path::PathBuf) -> ApiSharedState {
+    ApiSharedState {
+        pool: ApiPool::new(),
+        wb_pool: ApiPool::new(),
+        wb_enabled: std::sync::atomic::AtomicBool::new(true),
+        wb_sanitize: std::sync::atomic::AtomicBool::new(true),
+        wb_default_thinking: std::sync::atomic::AtomicBool::new(false),
+        wb_tool_exec: std::sync::atomic::AtomicBool::new(false),
+        wb_bg_downgrade: std::sync::atomic::AtomicBool::new(false),
+        wb_longctx_downgrade: std::sync::atomic::AtomicBool::new(false),
+        wb_hedge_threshold_ms: std::sync::atomic::AtomicU64::new(0),
+        trae_hedge_threshold_ms: std::sync::atomic::AtomicU64::new(0),
+        trae_pool_sticky_ttl_secs: std::sync::atomic::AtomicU64::new(0),
+        wb_pool_sticky_ttl_secs: std::sync::atomic::AtomicU64::new(0),
+        qoder_pool_sticky_ttl_secs: std::sync::atomic::AtomicU64::new(0),
+        buddy_ai_pool_sticky_ttl_secs: std::sync::atomic::AtomicU64::new(0),
+        buddy_ai_hedge_threshold_ms: std::sync::atomic::AtomicU64::new(0),
+        buddy_ai_sticky_enabled: std::sync::atomic::AtomicBool::new(false),
+        qoder_flash_free_rate: std::sync::atomic::AtomicBool::new(true),
+        trae_enabled: std::sync::atomic::AtomicBool::new(true),
+        qoder_pool: ApiPool::new(),
+        qoder_enabled: std::sync::atomic::AtomicBool::new(true),
+        qoder_identity: None,
+        qoder_hedge_threshold_ms: std::sync::atomic::AtomicU64::new(0),
+        qoder_sticky_enabled: std::sync::atomic::AtomicBool::new(false),
+        qoder_sticky: wb_sticky::StickyStore::default(),
+        buddy_ai_pool: ApiPool::new(),
+        buddy_ai_enabled: std::sync::atomic::AtomicBool::new(false),
+        trae_sticky: wb_sticky::StickyStore::default(),
+        wb_sticky: wb_sticky::StickyStore::default(),
+        buddy_ai_sticky: wb_sticky::StickyStore::default(),
+        pool_sticky: Mutex::new(std::collections::HashMap::new()),
+        custom_upstream_sticky: Mutex::new(std::collections::HashMap::new()),
+        custom_lb_counters: Mutex::new(std::collections::HashMap::new()),
+        model_cooldowns: Mutex::new(std::collections::HashMap::new()),
+        buddy_ai_model_cooldowns: Mutex::new(std::collections::HashMap::new()),
+        default_model: String::new(),
+        data_dir: data_dir.clone(),
+        total_requests: AtomicU64::new(0),
+        inflight: Arc::new(AtomicU64::new(0)),
+        active_uid: Mutex::new(None),
+        last_error: Mutex::new(None),
+        logger: ApiLogger::new(data_dir.join("logs")),
+        debug_enabled: std::sync::atomic::AtomicBool::new(false),
+        usage: Mutex::new(usage::UsageFile::default()),
+        usage_dirty: Mutex::new(Vec::new()),
+        wb_probe_ts_ms: std::sync::atomic::AtomicI64::new(-1),
+        wb_probe_ok: std::sync::atomic::AtomicI64::new(-1),
+        buddy_ai_probe_ts_ms: std::sync::atomic::AtomicI64::new(-1),
+        buddy_ai_probe_ok: std::sync::atomic::AtomicI64::new(-1),
+        trae_jwt_refresh: None,
+        fallback_log_at: Mutex::new(std::collections::HashMap::new()),
+    }
 }
 
 impl ApiSharedState {
@@ -873,6 +939,8 @@ mod inflight_tests {
             trae_sticky: wb_sticky::StickyStore::default(),
             wb_sticky: wb_sticky::StickyStore::default(),
             pool_sticky: Mutex::new(std::collections::HashMap::new()),
+            custom_upstream_sticky: Mutex::new(std::collections::HashMap::new()),
+            custom_lb_counters: Mutex::new(std::collections::HashMap::new()),
             model_cooldowns: Mutex::new(std::collections::HashMap::new()),
             default_model: String::new(),
             data_dir: dir.clone(),

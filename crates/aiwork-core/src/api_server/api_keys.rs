@@ -216,12 +216,14 @@ impl ResolvedKey {
     }
 }
 
-/// 解析 bind_pool 字段为静态池标识（空/非法→None）
+/// 解析 bind_pool 字段为静态池标识（空/非法→None）；custom（v3 决策 C：
+/// 绑定 custom = custom 优先 + 不可用按序回退）
 pub fn parse_bind_pool(s: &str) -> Option<&'static str> {
     match s.trim().to_lowercase().as_str() {
         "trae" => Some("trae"),
         "buddy" => Some("buddy"),
         "qoder" => Some("qoder"),
+        "custom" => Some("custom"),
         _ => None,
     }
 }

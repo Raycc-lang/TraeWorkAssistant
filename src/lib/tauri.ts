@@ -699,6 +699,9 @@ export const api = {
     customModelsRemove: (id: string) => invoke<boolean>('custom_models_remove', { id }),
     // 自定义模型连通性测试：发一条最小 chat 请求（max_tokens=16），成功返回摘要 / 失败返回原因
     customModelTest: (model: CustomModel) => invoke<string>('custom_model_test', { model }),
+    // 自定义上游熔断状态快照（P3 可观测）：每条仍在冷却中的上游 (id, fails, cooling_secs)
+    customLbStatus: () =>
+      invoke<{ id: string; fails: number; cooling_secs: number }[]>('custom_lb_status'),
     // ---- 统一网关命令（Phase 1 §8.1）：统一模型目录 / 网关设置 ----
     unifiedModels: (availableOnly?: boolean) =>
       invoke<UnifiedModel[]>('api_unified_models', { availableOnly: availableOnly ?? null }),

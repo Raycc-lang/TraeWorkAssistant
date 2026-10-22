@@ -470,6 +470,7 @@ pub fn dispatch(admin: &AdminState, name: &str, args: Value) -> Result<Value, St
             let model = arg(&args, "model")?;
             block_on_async(api_server_cmd::custom_model_test(model)).and_then(to_json)
         }
+        "custom_lb_status" => to_json(api_server_cmd::custom_lb_status()),
         "trae_model_meta_set" => {
             let model = arg(&args, "model")?;
             let meta = arg(&args, "meta")?;

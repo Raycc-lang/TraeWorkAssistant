@@ -111,16 +111,18 @@ SQLite 单库（WAL），三类表（详见 `crates/aiwork-core/src/store/schema
 
 纯 axum 层，随服务常驻，`AIWORK_LISTEN_ADDR` 可配（默认容器 `0.0.0.0:8080`）。
 
-### 6.1 三池与统一目录
+### 6.1 多池与统一目录
 
 | 池 | 上游 | 积分 |
 |---|---|---|
 | `trae` | `trae-api-cn.mchost.guru` `POST /api/agent/v3/llm_utils_chat`（SOLO） | 通用积分（product_id 208） |
 | `buddy` | `copilot.tencent.com`（CN）/ `www.workbuddy.ai`（Global，按账号 domain 判定） | Buddy 积分 |
-| `custom` | 自定义 OpenAI 兼容上游（`custom_models.json`） | 各自计费；**命中即直达、不参与池间策略** |
+| `qoder` | Qoder 推理网关 `gateway.qoder.com.cn`（非 OpenAI 兼容：COSY 签名 + 请求体加密 + SSE 信封翻译） | Qoder 积分 |
+| `custom` | 自定义 OpenAI 兼容**上游组**（`custom_models.json`，同名多条 = 上游组） | 各自计费；**第五资源池参与统一调度（默认候选序尾部兜底），纯 custom 模型唯一源直达** |
 
-- **池间策略**（`dispatch.rs`）：`smart` 默认（① 积分最早到期优先 → ② 模型倍率小者优先 → ③ 健康积分总和多优先）；`priority` 严格按序；`per_model` 显式覆盖不做智能重排；`fallback` 跨池回退开关。
-- **统一目录**（`unified_catalog.rs`）：三源合并（canonical_id trim+lowercase 归并），Trae 元数据四层兜底（L1 人工 `trae_model_meta` → L2 官网同步 → L3 默认 → L4 系列推断）；`GET /v1/models` 与前端共用。
+- **池间策略**（`dispatch.rs`）：`TargetPool { Trae, Buddy, Custom, Qoder, BuddyAi }` 五变体；`smart` 默认（① 积分最早到期优先 → ② 模型倍率小者优先（custom 取组内最小 rate）→ ③ 健康积分总和多优先）；`priority` 严格按序（默认候选序尾部补全 custom 兜底位）；`per_model` 显式覆盖不做智能重排（值可写 `"custom"` 任意位置）；`fallback` 跨池回退开关；`TargetPool::parse` 接受 `custom`（`custom/模型名` 前缀锁池直达；Key 绑定 "custom" 同语义：优先 + 不可用按序回退；池健康判定 custom 侧为组内任一上游未熔断）。
+- **统一目录**（`unified_catalog.rs`）：多源合并（canonical_id trim+lowercase 归并；同 canonical 多条 custom 条目聚合单行、倍率取组内最小），Trae 元数据四层兜底（L1 人工 `trae_model_meta` → L2 官网同步 → L3 默认 → L4 系列推断）；`GET /v1/models` 与前端共用。
+- **自定义模型上游组**（`custom_lb.rs` / `custom_route.rs`）：组内加权轮询（粘性 TTL 60s、`standby` 备胎 failover）+ 实例级熔断（30s×2ⁿ 封顶 480s，401/403/402 长 600s，成功即清）；执行路径上游连接 3s 快速失败、首字前失败组内轮换（≤ min(N,3)）；`custom_lb_status` 熔断快照。
 
 ### 6.2 协议端点
 

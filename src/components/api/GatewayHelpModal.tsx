@@ -202,12 +202,14 @@ export default function GatewayHelpModal({ open, onClose }: { open: boolean; onC
             <div className="space-y-1.5 leading-relaxed text-slate-500 dark:text-zinc-400">
               <p>
                 <span className="font-medium text-slate-600 dark:text-zinc-300">自定义模型：</span>
-                模型名命中启用条目即直达该上游（上游自有计费），不参与跨池回退。
+                同名多条上游记录组成上游组（组内加权轮询负载均衡，可标记备胎），失败自动切换组内其他上游、
+                连续故障熔断冷却自动恢复；作为第五资源池参与统一调度——默认候选序位于尾部兜底，
+                纯自定义模型（无同名内置源）直达；可用 <code>custom/模型名</code> 前缀或 Key 绑定「自定义上游池」显式优先。
               </p>
               <p>
-                <span className="font-medium text-slate-600 dark:text-zinc-300">多源同名模型（Trae/Buddy/BuddyAI 国际/Qoder）：</span>
+                <span className="font-medium text-slate-600 dark:text-zinc-300">多源同名模型（Trae/Buddy/BuddyAI 国际/Qoder/自定义）：</span>
                 按「池间调度策略」选池——智能调度（默认）按 积分先到期 → 免费/低倍率 → 积分多 排序，全并列时按池优先级序；
-                固定优先级按序取首选可用池（Qoder / BuddyAI 国际默认序位于尾部，可在调度策略中心上移）；可选「首选池不可用时跨池回退」。仅单源可用时直接路由该池。
+                固定优先级按序取首选可用池（Qoder / BuddyAI 国际 / 自定义默认序位于尾部，可在调度策略中心上移）；可选「首选池不可用时跨池回退」。仅单源可用时直接路由该池。
               </p>
               <p>
                 <span className="font-medium text-slate-600 dark:text-zinc-300">池内取号：</span>
