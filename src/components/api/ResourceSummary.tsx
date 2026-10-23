@@ -396,7 +396,7 @@ function DispatchCenterCard({
           {/* issue #90 修复③a：多源同名模型来源标识（/v1/models 池前缀别名条目） */}
           <label
             className="flex items-center gap-1.5 text-slate-500 dark:text-zinc-400"
-            title="/v1/models 为多源同名模型附带 trae/xxx、buddy/xxx、buddy-ai/xxx、qoder/xxx 别名条目，客户端可按前缀点名指定池（各池同名模型倍率与效果不同）；关闭时目录保持原形态"
+            title="/v1/models 为多源同名模型附带 trae/xxx、buddy/xxx、buddy-ai/xxx、qoder/xxx、custom/xxx 别名条目，客户端可按前缀点名指定池（各池同名模型倍率与效果不同）；关闭时目录保持原形态"
           >
             <input
               type="checkbox"
