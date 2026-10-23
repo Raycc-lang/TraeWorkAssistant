@@ -452,7 +452,10 @@ fn race_first_byte(
     dedicated: Option<&str>,
 ) -> Result<RaceWin, ()> {
     let hedge_ms = state.route_hedge_ms();
-    if hedge_ms == 0 {
+    // issue #138：对冲关闭（hedge_ms==0）或大 body（> HEDGE_SKIP_BODY_BYTES，
+    // 对冲需 converted.to_vec() 全量快照 + 按 hedge 账号整包重建，瞬时内存
+    // 放大得不偿失）时均退化为纯首字超时（语义与关闭对冲一致）
+    if hedge_ms == 0 || converted.len() > super::routes::HEDGE_SKIP_BODY_BYTES {
         return wb_upstream::lines_with_first_byte_timeout(reader).map(|lines| RaceWin {
             lines,
             uid: primary_uid.to_string(),
@@ -683,10 +686,17 @@ fn run_wb_stream(
 ) {
     // 请求日志附带的 API Key 展示名（匿名/未知 → 空串，日志显示 "-"）
     let key_name = super::api_keys::key_name_for(&state.data_dir, key_id);
-    let peek: Value = serde_json::from_slice(body_vec).unwrap_or(json!({}));
-    let sticky_key = SessionKey::from_body(&peek);
-    // F-76④ 上下文过大提示（仅日志标注，不做真裁剪）
-    log_longctx_hint(state, &peek, model);
+    // issue #138 P0：peek DOM 用完即弃——块内一次性提取 sticky/longctx 提示与
+    // effort 后立即释放，不再存活整条流（大 body 下 DOM 放大 3~6 倍）
+    let (sticky_key, effort_hint) = {
+        let peek: Value = serde_json::from_slice(body_vec).unwrap_or(json!({}));
+        // F-76④ 上下文过大提示（仅日志标注，不做真裁剪）
+        log_longctx_hint(state, &peek, model);
+        (
+            SessionKey::from_body(&peek),
+            peek.get("reasoning_effort").and_then(|v| v.as_str()).map(str::to_string),
+        )
+    };
     let templates = load_templates(state);
     let mut sanitize = state.wb_sanitize.load(std::sync::atomic::Ordering::Relaxed);
 
@@ -843,7 +853,7 @@ fn run_wb_stream(
 
         let catalog = super::wb_catalog::load(&state.data_dir);
         let effort = super::wb_catalog::find(&catalog, model)
-            .and_then(|m| m.resolve_effort(peek.get("reasoning_effort").and_then(|v| v.as_str())));
+            .and_then(|m| m.resolve_effort(effort_hint.as_deref()));
         // 多候选改写种子（issue #122 方案 C1）：conv_id 绑定请求、tried.len()
         // 随换号轮换递增——跨重试候选必变；空完成后（empty_hits>0）或池级指纹
         // 拦截 TTL 内（issue #122 缺口2）追加激进清洗（issue #122 方案 C2）
@@ -1238,10 +1248,16 @@ pub async fn wb_aggregate_chat(
         let state = WbView::new(state, buddy_ai);
         // 请求日志附带的 API Key 展示名（匿名/未知 → 空串，日志显示 "-"）
         let key_name = super::api_keys::key_name_for(&state.data_dir, &key_id);
-        let peek: Value = serde_json::from_slice(&body_vec).unwrap_or(json!({}));
-        let sticky_key = SessionKey::from_body(&peek);
-        // F-76④ 上下文过大提示（仅日志标注，不做真裁剪）
-        log_longctx_hint(&state, &peek, &model);
+        // issue #138 P0：peek DOM 用完即弃（同流式路径口径）
+        let (sticky_key, effort_hint) = {
+            let peek: Value = serde_json::from_slice(&body_vec).unwrap_or(json!({}));
+            // F-76④ 上下文过大提示（仅日志标注，不做真裁剪）
+            log_longctx_hint(&state, &peek, &model);
+            (
+                SessionKey::from_body(&peek),
+                peek.get("reasoning_effort").and_then(|v| v.as_str()).map(str::to_string),
+            )
+        };
         let templates = load_templates(&state);
         let mut sanitize = state.wb_sanitize.load(std::sync::atomic::Ordering::Relaxed);
 
@@ -1354,7 +1370,7 @@ pub async fn wb_aggregate_chat(
 
             let catalog = super::wb_catalog::load(&state.data_dir);
             let effort = super::wb_catalog::find(&catalog, &model)
-                .and_then(|m| m.resolve_effort(peek.get("reasoning_effort").and_then(|v| v.as_str())));
+                .and_then(|m| m.resolve_effort(effort_hint.as_deref()));
             // 多候选改写种子 + 激进清洗开关（issue #122 方案 C1/C2，同流式路径口径：
             // 种子随换号轮换递增，空完成后/池级拦截 TTL 内追加激进规则）
             let seed = wb_payload::variant_seed(&conv_id, tried.len() as u64);

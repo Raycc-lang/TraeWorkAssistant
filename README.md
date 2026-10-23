@@ -54,7 +54,10 @@ docker exec aiwork-server cat /app/data/conf/admin_token
 | `AIWORK_VAULT_KEY`   | 空（自动生成）         | 敏感数据加密密钥（任意字符串 SHA-256 归一 32B）；**容器重建必须可复现**，否则已存凭据不可解密          |
 | `AIWORK_DATA_DIR`    | `/app/data`     | 数据目录（容器内固定挂载 volume）                                             |
 | `AIWORK_PORT`        | `8080`          | 仅供容器 HEALTHCHECK 探活取端口                                           |
+| `AIWORK_MAX_BODY_BYTES` | `8388608`（8MiB） | 请求体上限（字节，clamp [256KiB, 64MiB]，issue #138）；小内存部署可下调，如 `4194304`；升级后大请求体（长上下文/图片 base64）客户端遇 413 时，上调至 `33554432` 可恢复 1.5.4 的 32MiB 行为 |
 | `TZ`                 | `Asia/Shanghai` | 调度任务按本地时刻触发（签到/续期/快照）                                            |
+
+**内存需求与调优**（issue #138）：1.5.5 起 Linux 构建内置 jemalloc（后台线程定期归还空闲页），常驻内存显著低于旧版。最低 512MB 可运行；建议 1GB 及以上并发更稳。仍紧张时：① 下调 `AIWORK_MAX_BODY_BYTES`（超大对话/长文请求体是瞬时内存大头）；② `docker run --memory=512m` 硬限防失控；③ `curl http://127.0.0.1:8080/health` 观察 `rss_kib`（常驻）与 `inflight`（在途请求数）排查。若自行部署 earlyoom，建议按内存绝对值判杀（如 `-m 5 -s 10`）而非百分比，避免小内存机上误杀。
 
 ### 方式二：源码构建
 

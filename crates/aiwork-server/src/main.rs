@@ -10,6 +10,15 @@
 //! - AIWORK_ADMIN_TOKEN  管理面 token（未设置时首启生成 conf/admin_token）
 //! - --task-run <name>   CLI 任务兜底（checkin / wb-checkin / wb-renew / refresh-credits，跑完即退）
 
+// issue #138 P0：Linux gnu 目标换用 jemalloc 全局分配器——glibc 默认多 arena
+// （默认 8×CPU 核数）+ 每请求 tokio 线程翻新，短生命周期大分配（请求 body/DOM
+// 快照）跨 arena 碎片化后 RSS 只涨不降（2核2G ECS 上 512MiB 驻留被 earlyoom
+// 反复 SIGTERM）；jemalloc 后台线程定期归还未用页（dirty/muzzy decay 5s），
+// 常驻内存显著回落。Windows MSVC/macOS 不受影响（cfg 门控，保持系统分配器）
+#[cfg(target_env = "gnu")]
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
 use std::sync::Arc;
 
 use aiwork_core::api_server::runtime::{build_shared, set_gateway_shared};

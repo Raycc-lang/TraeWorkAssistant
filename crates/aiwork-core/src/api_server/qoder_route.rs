@@ -460,11 +460,15 @@ fn race_qoder_first_byte(
     allowed: Option<&HashSet<String>>,
     dedicated: Option<&str>,
     primary_session_ids: &Option<(String, String, String)>,
+    converted_len: usize,
 ) -> Result<QoderRaceWin, ()> {
     let hedge_ms = state
         .qoder_hedge_threshold_ms
         .load(std::sync::atomic::Ordering::Relaxed);
-    if hedge_ms == 0 {
+    // issue #138：对冲关闭（hedge_ms==0）或大 body（> HEDGE_SKIP_BODY_BYTES，
+    // 对冲需整包克隆 peek + 按 hedge 账号 prepare_qoder_body 重建，瞬时内存
+    // 放大得不偿失）时均退化为纯首字超时（语义与关闭对冲一致）
+    if hedge_ms == 0 || converted_len > super::routes::HEDGE_SKIP_BODY_BYTES {
         let lines = lines_with_first_byte_timeout(primary_reader)?;
         return Ok(QoderRaceWin {
             lines,
@@ -981,6 +985,7 @@ fn run_qoder_stream(
                         allowed_set.as_ref(),
                         dedicated.as_deref(),
                         &envelope_ids,
+                        converted.len(),
                     ) {
                         Ok(w) => w,
                         Err(()) => {
@@ -1548,6 +1553,7 @@ pub async fn qoder_aggregate_chat(
                             allowed_set.as_ref(),
                             dedicated.as_deref(),
                             &envelope_ids,
+                            converted.len(),
                         ) {
                             Ok(w) => w,
                             Err(()) => {

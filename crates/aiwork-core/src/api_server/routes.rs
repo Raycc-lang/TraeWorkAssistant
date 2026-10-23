@@ -27,15 +27,62 @@ use super::{classify_error, classify_solo_error, streaming_agent, ApiSharedState
             AGENT_HOST, APP_ID, EP_LLM_CHAT, IDE_VERSION, IDE_VERSION_CODE, REFERER_BASE};
 
 const MAX_ROTATE: usize = 3;
-/// 请求体上限（issue #21）：axum `Bytes` 提取器受 DefaultBodyLimit 约束（默认 2MiB），
-/// build_router 已显式放开到本值，两处阈值必须一致。32MiB 适配长上下文客户端
-/// （每轮重发完整历史 + 图片 base64 场景）
-pub(super) const MAX_BODY_BYTES: usize = 32 << 20;
-
-/// 请求体超限文案（issue #21）：由常量推导，避免阈值调整后文案脱节
-pub(super) fn body_too_large_msg() -> String {
-    format!("request body exceeds {}MB limit", MAX_BODY_BYTES >> 20)
+/// 请求体上限（issue #21/#138）：axum `Bytes` 提取器受 DefaultBodyLimit 约束
+/// （默认 2MiB），build_router 已显式放开到本函数返回值，两处阈值必须一致。
+/// 默认 8MiB（issue #138：大 body 是 DOM/拷贝内存放大的源头，收紧默认值适配
+/// 2C2G 部署）；长上下文客户端（每轮重发完整历史 + 图片 base64）可经
+/// `AIWORK_MAX_BODY_BYTES` 环境变量恢复，clamp [256KiB, 64MiB]；OnceLock 缓存
+/// 避免每请求重复读环境变量
+pub(super) fn max_body_bytes() -> usize {
+    static CACHE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *CACHE.get_or_init(|| {
+        const DEFAULT: usize = 8 << 20;
+        const MIN: usize = 256 << 10;
+        const MAX: usize = 64 << 20;
+        let Some(raw) = std::env::var("AIWORK_MAX_BODY_BYTES").ok() else {
+            return DEFAULT;
+        };
+        let raw = raw.trim();
+        match raw.parse::<usize>() {
+            Ok(n) if n >= MIN && n <= MAX => n,
+            Ok(n) => {
+                let clamped = n.clamp(MIN, MAX);
+                eprintln!(
+                    "[aiwork] AIWORK_MAX_BODY_BYTES={raw} 超出 [{},{}]，已钳制为 {clamped} 字节",
+                    fmt_size_human(MIN),
+                    fmt_size_human(MAX)
+                );
+                clamped
+            }
+            Err(_) => {
+                eprintln!("[aiwork] AIWORK_MAX_BODY_BYTES={raw} 非法，回退默认 {DEFAULT} 字节");
+                DEFAULT
+            }
+        }
+    })
 }
+
+/// 字节数人读格式（issue #138 审查修复）：整 MiB → "8MB"，否则 KiB；
+/// 与 body_too_large_msg 既有口径一致（仅用于整 KiB 值）
+fn fmt_size_human(n: usize) -> String {
+    if n % (1 << 20) == 0 {
+        format!("{}MB", n >> 20)
+    } else {
+        format!("{}KiB", n >> 10)
+    }
+}
+
+/// 请求体超限文案（issue #21）：由阈值推导，避免调整后文案脱节；
+/// 非整 MiB 配置自适应 KiB 展示（如 256KiB → "256KiB"，避免右移截断成 "0MB"）
+pub(super) fn body_too_large_msg() -> String {
+    format!("request body exceeds {} limit", fmt_size_human(max_body_bytes()))
+}
+
+/// issue #138：首字对冲的大 body 门槛（Trae/WB/Qoder 三池共用）——超过该值时
+/// 跳过对冲：对冲需全量快照 + 按对冲账号整包重建，超大请求下瞬时内存放大
+/// 得不偿失；与 max_body_bytes 的 MIN 同值，正常对话远小于此，被跳过的恰是
+/// 内存高风险请求
+pub(super) const HEDGE_SKIP_BODY_BYTES: usize = 256 << 10;
 
 /// 客户端协议：决定响应/流事件的输出格式（请求侧均已统一转为 OpenAI 内部格式）
 #[derive(Clone, Copy, PartialEq)]
@@ -495,13 +542,37 @@ pub async fn health(State(state): State<Arc<ApiSharedState>>) -> impl IntoRespon
     // 豁免，2026-10-12 审查 P1 修复——容器非环回监听下仍需可达，探活依赖），
     // 原实现透出 total_credits/active_uid/last_error/池账号数/token 汇总
     // ——非环回监听时局域网内无 Key 即可抓取账号与积分画像，与「非环回强制
-    // 鉴权」防线矛盾。探活只需存活布尔；完整诊断由需鉴权的 GET /status 承载
-    // （字段超集，含双池账号明细与 token 分池统计）
-    let _ = &state;
-    Json(json!({
+    // 鉴权」防线矛盾。收敏后探活仅保留存活布尔与低敏运维指标（无账号/凭据/
+    // 积分信息）；完整诊断由需鉴权的 GET /status 承载
+    // （字段超集，含双池账号明细与 token 分池统计）。issue #138 P2：补透
+    // inflight（在途请求数）与 rss_kib（进程 RSS，KiB）——容器内存告警/OOM
+    // 排查探针；RSS 读取失败（非 Linux 平台）省略字段
+    // issue #138 P2：/health 探活仅透出低敏运维指标（inflight/rss_kib），
+    // 完整诊断由需鉴权的 GET /status 承载
+    let mut body = json!({
         "status": "ok",
         "running": true,
-    }))
+        "inflight": state.inflight.load(std::sync::atomic::Ordering::Relaxed),
+    });
+    if let Some(kib) = read_self_rss_kib() {
+        body["rss_kib"] = json!(kib);
+    }
+    Json(body)
+}
+
+/// 进程 RSS（KiB，issue #138 P2）：仅 Linux（/proc/self/status VmRSS），
+/// 其他平台 None（/health 相应省略字段）
+#[cfg(target_os = "linux")]
+fn read_self_rss_kib() -> Option<u64> {
+    let status = std::fs::read_to_string("/proc/self/status").ok()?;
+    let line = status.lines().find(|l| l.starts_with("VmRSS:"))?;
+    line["VmRSS:".len()..].trim().split_whitespace().next()?.parse().ok()
+}
+
+/// 非 Linux 平台无统一 RSS 读取口（不做 /health 平台特化）
+#[cfg(not(target_os = "linux"))]
+fn read_self_rss_kib() -> Option<u64> {
+    None
 }
 
 /// /healthz（T2.3/F-32）：三池均无可用账号 → 503，供探活/看门狗。
@@ -825,7 +896,7 @@ pub async fn chat_completions(
     headers: axum::http::HeaderMap,
     body: axum::body::Bytes,
 ) -> Response {
-    if body.len() > MAX_BODY_BYTES {
+    if body.len() > max_body_bytes() {
         return openai_error(
             StatusCode::PAYLOAD_TOO_LARGE,
             "request_too_large",
@@ -947,7 +1018,7 @@ pub async fn responses_api(
     key_id: Option<Extension<KeyId>>,
     body: axum::body::Bytes,
 ) -> Response {
-    if body.len() > MAX_BODY_BYTES {
+    if body.len() > max_body_bytes() {
         return openai_error(
             StatusCode::PAYLOAD_TOO_LARGE,
             "request_too_large",
@@ -1178,7 +1249,7 @@ pub async fn messages(
     key_id: Option<Extension<KeyId>>,
     body: axum::body::Bytes,
 ) -> Response {
-    if body.len() > MAX_BODY_BYTES {
+    if body.len() > max_body_bytes() {
         return anthropic_error(
             StatusCode::PAYLOAD_TOO_LARGE,
             "invalid_request_error",
@@ -1328,7 +1399,7 @@ pub async fn completions(
     key_id: Option<Extension<KeyId>>,
     body: axum::body::Bytes,
 ) -> Response {
-    if body.len() > MAX_BODY_BYTES {
+    if body.len() > max_body_bytes() {
         return openai_error(
             StatusCode::PAYLOAD_TOO_LARGE,
             "request_too_large",
@@ -1499,7 +1570,7 @@ async fn images_entry(
         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     // inflight guard（§4.5）：async fn 全程 inline await，作用域即请求生命周期
     let _guard = state.inflight_guard();
-    if body.len() > MAX_BODY_BYTES {
+    if body.len() > max_body_bytes() {
         return openai_error(StatusCode::PAYLOAD_TOO_LARGE, "request_too_large", &body_too_large_msg());
     }
     let peek: Value = match serde_json::from_slice(&body) {
@@ -1682,9 +1753,9 @@ fn stream_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: String, str
         // 会话→账号粘性（per-pool 三参数批次，对齐 Buddy/Qoder）：显式
         // conversationId / 消息指纹命中且账号健康 → 首选粘住账号（上游 KV cache
         // 复用；busy 且有空闲候选时让位，F-77④ 同构）。子 Key 限定上游不含
-        // 粘性账号时忽略粘性
-        let peek: Value = serde_json::from_slice(&body_vec).unwrap_or_else(|_| json!({}));
-        let sticky_key = SessionKey::from_body(&peek);
+        // 粘性账号时忽略粘性。issue #138 P0：改窄探测（from_slice），不再
+        // 整包 Value DOM——原先 peek 存活整条流是大 body RSS 高水位主因
+        let sticky_key = SessionKey::from_slice(&body_vec);
         // 空指纹（无 messages / 无 conversation_id）不可粘
         let sticky_usable = !sticky_key.cache_key().ends_with(':');
         let sticky0: Option<String> = if sticky_usable {
@@ -2273,9 +2344,9 @@ async fn aggregate_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: St
         let key_name = super::api_keys::key_name_for(&state.data_dir, &key_id);
         // 会话→账号粘性（per-pool 三参数批次，与流式路径同构）：显式
         // conversationId / 消息指纹命中且账号健康 → 首选粘住账号；子 Key 限定
-        // 上游不含粘性账号时忽略粘性
-        let peek: Value = serde_json::from_slice(&body_vec).unwrap_or_else(|_| json!({}));
-        let sticky_key = SessionKey::from_body(&peek);
+        // 上游不含粘性账号时忽略粘性。issue #138 P0：改窄探测（from_slice），
+        // 不再整包 Value DOM
+        let sticky_key = SessionKey::from_slice(&body_vec);
         // 空指纹（无 messages / 无 conversation_id）不可粘
         let sticky_usable = !sticky_key.cache_key().ends_with(':');
         let sticky0: Option<String> = if sticky_usable {
@@ -2778,6 +2849,19 @@ fn race_trae_first_byte(
         .trae_hedge_threshold_ms
         .load(std::sync::atomic::Ordering::Relaxed);
     if hedge_ms == 0 {
+        let lines = super::wb_upstream::lines_with_first_byte_timeout(reader)?;
+        return Ok(TraeRaceWin {
+            lines,
+            uid: primary_uid.to_string(),
+            hedge: None,
+            takeover: false,
+            upstream_hdr: primary_hdr,
+        });
+    }
+    // issue #138：大 body 跳过对冲——对冲需 body_vec.to_vec() 全量快照 +
+    // 按对冲账号整包重建（prepare_llm_chat_body），超大请求下两份拷贝与二次
+    // 重建的瞬时内存放大得不偿失；退化为纯首字超时（语义与关闭对冲一致）
+    if body_vec.len() > HEDGE_SKIP_BODY_BYTES {
         let lines = super::wb_upstream::lines_with_first_byte_timeout(reader)?;
         return Ok(TraeRaceWin {
             lines,

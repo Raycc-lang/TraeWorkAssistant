@@ -54,6 +54,10 @@ ENV AIWORK_DATA_DIR=/app/data \
     AIWORK_PORT=8080 \
     AIWORK_DISABLE_LOCAL_QUOTA=1 \
     TZ=Asia/Shanghai
+# issue #138 P0：jemalloc 后台线程定期归还未用页（dirty/muzzy decay 5s），
+# 压低常驻 RSS（2核2G 场景避免 earlyoom 误杀）；依赖 aiwork-server 内
+# cfg(target_env="gnu") 的 jemalloc 全局分配器（Docker 构建即 gnu 目标）
+ENV _RJEM_MALLOC_CONF="background_thread:true,dirty_decay_ms:5000,muzzy_decay_ms:5000"
 EXPOSE 8080
 VOLUME ["/app/data"]
 # 健康 check：AIWORK_LISTEN_ADDR 改端口时需同步调整 AIWORK_PORT

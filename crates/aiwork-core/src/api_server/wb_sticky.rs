@@ -56,6 +56,7 @@ pub struct StickyStore {
 }
 
 /// 会话键：显式 conversationId 或消息指纹
+#[derive(Debug, PartialEq, Eq)]
 pub enum SessionKey {
     Explicit(String),
     Fingerprint(String),
@@ -74,6 +75,33 @@ impl SessionKey {
             return SessionKey::Explicit(cid.to_string());
         }
         SessionKey::Fingerprint(fingerprint_messages(body))
+    }
+
+    /// 从原始请求字节窄提取会话键（issue #138 P0）：语义对齐 [from_body]
+    /// （非空 conversation_id → 显式；否则前 3 条消息指纹），但不构建整包 DOM——
+    /// 只实例化探测所需字段，未声明字段与 messages 第 4+ 条由 serde 流式跳过
+    /// （大 body 下省去 3~6 倍 DOM 内存放大，且不再有 peek 闭包存活整条流）。
+    /// 字段级畸形（conversation_id/role/block text 类型不匹配、非对象消息或
+    /// 内容块、null content）宽松跳过，与 from_body 的 as_str 宽松口径一致；
+    /// 仅结构性畸形（messages 非数组、顶层非对象）探测失败 → 回退仅提取
+    /// conversation_id，再失败按「不可粘」（空指纹）处理
+    pub fn from_slice(body: &[u8]) -> SessionKey {
+        if let Ok(p) = serde_json::from_slice::<SessionKeyProbe>(body) {
+            if let Some(cid) =
+                p.conversation_id.as_deref().map(str::trim).filter(|s| !s.is_empty())
+            {
+                return SessionKey::Explicit(cid.to_owned());
+            }
+            return SessionKey::Fingerprint(fingerprint_probe(&p.messages));
+        }
+        if let Ok(c) = serde_json::from_slice::<CidProbe>(body) {
+            if let Some(cid) =
+                c.conversation_id.as_deref().map(str::trim).filter(|s| !s.is_empty())
+            {
+                return SessionKey::Explicit(cid.to_owned());
+            }
+        }
+        SessionKey::Fingerprint(String::new())
     }
 
     /// 缓存键（"cid:{id}" / "fp:{指纹}"）——池粘性键复用同一前缀约定（§4.4）
@@ -114,10 +142,354 @@ pub fn fingerprint_messages(body: &serde_json::Value) -> String {
     if norm.is_empty() {
         return String::new();
     }
+    fingerprint_hex(&norm)
+}
+
+/// SHA256(norm) 前 6 位 hex（from_body / from_slice 共用尾段，指纹逐字节一致）
+fn fingerprint_hex(norm: &str) -> String {
     let mut h = Sha256::new();
     h.update(norm.as_bytes());
     let digest = h.finalize();
     digest.iter().take(3).map(|b| format!("{:02x}", b)).collect()
+}
+
+// ==================== issue #138 P0：原始字节窄探测（消灭 peek DOM） ====================
+//
+// 流式/聚合路径原先整包 serde_json::Value 后取 SessionKey：大 body（长上下文
+// 重发完整历史 + base64 图片）DOM 内存放大 3~6 倍，且 peek 在流式闭包中存活
+// 整条流，是 2C2G 部署 RSS 高水位的最大单点（issue #138）。以下窄探测载荷
+// 仅声明指纹/显式模式所需字段，其余 token 零分配跳过。
+
+/// 顶层窄探测载荷（未声明字段由 serde 默认忽略）
+#[derive(serde::Deserialize)]
+struct SessionKeyProbe {
+    #[serde(default, deserialize_with = "opt_string_lenient")]
+    conversation_id: Option<String>,
+    #[serde(default, deserialize_with = "first_three_messages")]
+    messages: Vec<ProbeMessage>,
+}
+
+/// 兜底探测：主探测失败时仅提取 conversation_id（显式粘性尽力保留）
+#[derive(serde::Deserialize)]
+struct CidProbe {
+    #[serde(default)]
+    conversation_id: Option<String>,
+}
+
+/// 宽松字符串探测 newtype：字符串 → Some；null/数字/布尔/数组/对象 → None
+/// （数组/对象整体流式消费保持 JSON 流合法）。对齐 from_body 链路 `as_str()`
+/// 的宽松口径：字段类型不匹配按「无此字段」降级而非整体探测失败
+struct OptStringLenient(Option<String>);
+
+impl<'de> serde::Deserialize<'de> for OptStringLenient {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        struct V;
+        impl<'de> serde::de::Visitor<'de> for V {
+            type Value = OptStringLenient;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("a string or any")
+            }
+            fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<Self::Value, E> {
+                Ok(OptStringLenient(Some(v.to_owned())))
+            }
+            fn visit_none<E>(self) -> Result<Self::Value, E> {
+                Ok(OptStringLenient(None))
+            }
+            fn visit_unit<E>(self) -> Result<Self::Value, E> {
+                Ok(OptStringLenient(None))
+            }
+            fn visit_bool<E>(self, _: bool) -> Result<Self::Value, E> {
+                Ok(OptStringLenient(None))
+            }
+            fn visit_u64<E>(self, _: u64) -> Result<Self::Value, E> {
+                Ok(OptStringLenient(None))
+            }
+            fn visit_i64<E>(self, _: i64) -> Result<Self::Value, E> {
+                Ok(OptStringLenient(None))
+            }
+            fn visit_f64<E>(self, _: f64) -> Result<Self::Value, E> {
+                Ok(OptStringLenient(None))
+            }
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                mut seq: A,
+            ) -> Result<Self::Value, A::Error> {
+                while seq.next_element::<serde::de::IgnoredAny>()?.is_some() {}
+                Ok(OptStringLenient(None))
+            }
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<Self::Value, A::Error> {
+                while map
+                    .next_entry::<serde::de::IgnoredAny, serde::de::IgnoredAny>()?
+                    .is_some()
+                {}
+                Ok(OptStringLenient(None))
+            }
+        }
+        d.deserialize_any(V)
+    }
+}
+
+/// deserialize_with 入口（SessionKeyProbe.conversation_id 字段复用）
+fn opt_string_lenient<'de, D: serde::Deserializer<'de>>(
+    d: D,
+) -> Result<Option<String>, D::Error> {
+    <OptStringLenient as serde::Deserialize>::deserialize(d).map(|v| v.0)
+}
+
+/// 单条消息窄探测：role 缺失/null/非串 → None（对齐 as_str().unwrap_or("")）；
+/// 非对象消息（数组混入标量）按空消息降级，对齐 from_body 链路 `msg.get(..)`
+/// 对标量返回 None 的宽松口径
+#[derive(Default)]
+struct ProbeMessage {
+    role: Option<String>,
+    content: ProbeContent,
+}
+
+impl<'de> serde::Deserialize<'de> for ProbeMessage {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        struct V;
+        impl<'de> serde::de::Visitor<'de> for V {
+            type Value = ProbeMessage;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("a message object or any")
+            }
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut m = ProbeMessage::default();
+                while let Some(key) = map.next_key::<String>()? {
+                    match key.as_str() {
+                        "role" => m.role = map.next_value::<OptStringLenient>()?.0,
+                        "content" => m.content = map.next_value::<ProbeContent>()?,
+                        _ => {
+                            map.next_value::<serde::de::IgnoredAny>()?;
+                        }
+                    }
+                }
+                Ok(m)
+            }
+            fn visit_str<E: serde::de::Error>(self, _: &str) -> Result<Self::Value, E> {
+                Ok(ProbeMessage::default())
+            }
+            fn visit_none<E>(self) -> Result<Self::Value, E> {
+                Ok(ProbeMessage::default())
+            }
+            fn visit_unit<E>(self) -> Result<Self::Value, E> {
+                Ok(ProbeMessage::default())
+            }
+            fn visit_bool<E>(self, _: bool) -> Result<Self::Value, E> {
+                Ok(ProbeMessage::default())
+            }
+            fn visit_u64<E>(self, _: u64) -> Result<Self::Value, E> {
+                Ok(ProbeMessage::default())
+            }
+            fn visit_i64<E>(self, _: i64) -> Result<Self::Value, E> {
+                Ok(ProbeMessage::default())
+            }
+            fn visit_f64<E>(self, _: f64) -> Result<Self::Value, E> {
+                Ok(ProbeMessage::default())
+            }
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                mut seq: A,
+            ) -> Result<Self::Value, A::Error> {
+                while seq.next_element::<serde::de::IgnoredAny>()?.is_some() {}
+                Ok(ProbeMessage::default())
+            }
+        }
+        d.deserialize_any(V)
+    }
+}
+
+/// content 窄探测：字符串原样；数组逐块取 text；null/对象/标量 → 空
+/// （对齐 fingerprint_messages：非 String/Array → 空串）
+#[derive(Default)]
+enum ProbeContent {
+    #[default]
+    Empty,
+    Text(String),
+    Blocks(Vec<ProbeBlock>),
+}
+
+impl<'de> serde::Deserialize<'de> for ProbeContent {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        struct V;
+        impl<'de> serde::de::Visitor<'de> for V {
+            type Value = ProbeContent;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("string, array, null or any")
+            }
+            fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<Self::Value, E> {
+                Ok(ProbeContent::Text(v.to_owned()))
+            }
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                mut seq: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut blocks = Vec::new();
+                while let Some(b) = seq.next_element::<ProbeBlock>()? {
+                    blocks.push(b);
+                }
+                Ok(ProbeContent::Blocks(blocks))
+            }
+            fn visit_none<E>(self) -> Result<Self::Value, E> {
+                Ok(ProbeContent::Empty)
+            }
+            fn visit_unit<E>(self) -> Result<Self::Value, E> {
+                Ok(ProbeContent::Empty)
+            }
+            fn visit_bool<E>(self, _: bool) -> Result<Self::Value, E> {
+                Ok(ProbeContent::Empty)
+            }
+            fn visit_u64<E>(self, _: u64) -> Result<Self::Value, E> {
+                Ok(ProbeContent::Empty)
+            }
+            fn visit_i64<E>(self, _: i64) -> Result<Self::Value, E> {
+                Ok(ProbeContent::Empty)
+            }
+            fn visit_f64<E>(self, _: f64) -> Result<Self::Value, E> {
+                Ok(ProbeContent::Empty)
+            }
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<Self::Value, A::Error> {
+                while map
+                    .next_entry::<serde::de::IgnoredAny, serde::de::IgnoredAny>()?
+                    .is_some()
+                {}
+                Ok(ProbeContent::Empty)
+            }
+        }
+        d.deserialize_any(V)
+    }
+}
+
+/// content 数组块窄探测：仅取 text（未知字段自动忽略，图片 base64 零分配
+/// 跳过）；text 非串 → None；非对象块（数组混入标量）按无 text 降级，
+/// 对齐 from_body 链路 `b.get("text")` 对标量块返回 None 的宽松口径
+#[derive(Default)]
+struct ProbeBlock {
+    text: Option<String>,
+}
+
+impl<'de> serde::Deserialize<'de> for ProbeBlock {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        struct V;
+        impl<'de> serde::de::Visitor<'de> for V {
+            type Value = ProbeBlock;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("a content block or any")
+            }
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut b = ProbeBlock::default();
+                while let Some(key) = map.next_key::<String>()? {
+                    match key.as_str() {
+                        "text" => b.text = map.next_value::<OptStringLenient>()?.0,
+                        _ => {
+                            map.next_value::<serde::de::IgnoredAny>()?;
+                        }
+                    }
+                }
+                Ok(b)
+            }
+            fn visit_str<E: serde::de::Error>(self, _: &str) -> Result<Self::Value, E> {
+                Ok(ProbeBlock::default())
+            }
+            fn visit_none<E>(self) -> Result<Self::Value, E> {
+                Ok(ProbeBlock::default())
+            }
+            fn visit_unit<E>(self) -> Result<Self::Value, E> {
+                Ok(ProbeBlock::default())
+            }
+            fn visit_bool<E>(self, _: bool) -> Result<Self::Value, E> {
+                Ok(ProbeBlock::default())
+            }
+            fn visit_u64<E>(self, _: u64) -> Result<Self::Value, E> {
+                Ok(ProbeBlock::default())
+            }
+            fn visit_i64<E>(self, _: i64) -> Result<Self::Value, E> {
+                Ok(ProbeBlock::default())
+            }
+            fn visit_f64<E>(self, _: f64) -> Result<Self::Value, E> {
+                Ok(ProbeBlock::default())
+            }
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                mut seq: A,
+            ) -> Result<Self::Value, A::Error> {
+                while seq.next_element::<serde::de::IgnoredAny>()?.is_some() {}
+                Ok(ProbeBlock::default())
+            }
+        }
+        d.deserialize_any(V)
+    }
+}
+
+/// messages 窄提取：仅实例化前 3 条（指纹输入），第 4+ 条以 IgnoredAny 流式
+/// 吞掉（零分配），对齐 fingerprint_messages 的 take(3)
+fn first_three_messages<'de, D: serde::Deserializer<'de>>(
+    d: D,
+) -> Result<Vec<ProbeMessage>, D::Error> {
+    struct V;
+    impl<'de> serde::de::Visitor<'de> for V {
+        type Value = Vec<ProbeMessage>;
+        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            f.write_str("a sequence of messages")
+        }
+        fn visit_seq<A: serde::de::SeqAccess<'de>>(
+            self,
+            mut seq: A,
+        ) -> Result<Self::Value, A::Error> {
+            let mut out = Vec::new();
+            while out.len() < 3 {
+                match seq.next_element::<ProbeMessage>()? {
+                    Some(m) => out.push(m),
+                    None => break,
+                }
+            }
+            while seq.next_element::<serde::de::IgnoredAny>()?.is_some() {}
+            Ok(out)
+        }
+    }
+    d.deserialize_seq(V)
+}
+
+/// 探测载荷 → 指纹（norm 口径与 fingerprint_messages 逐字节一致：
+/// role|trim(content)| 前 3 条；空消息序列 → 空串）
+fn fingerprint_probe(msgs: &[ProbeMessage]) -> String {
+    if msgs.is_empty() {
+        return String::new();
+    }
+    let mut norm = String::new();
+    for m in msgs {
+        norm.push_str(m.role.as_deref().unwrap_or(""));
+        norm.push('|');
+        norm.push_str(probe_content_text(&m.content).trim());
+        norm.push('|');
+    }
+    fingerprint_hex(&norm)
+}
+
+/// ProbeContent → content 文本（对齐 fingerprint_messages：String 原样、
+/// 数组取 text 块拼接、其余空串）
+fn probe_content_text(c: &ProbeContent) -> String {
+    match c {
+        ProbeContent::Text(s) => s.clone(),
+        ProbeContent::Blocks(blocks) => blocks
+            .iter()
+            .filter_map(|b| b.text.as_deref())
+            .collect::<Vec<_>>()
+            .join(""),
+        ProbeContent::Empty => String::new(),
+    }
 }
 
 /// 多池共用 sticky_bindings 表的键命名空间登记（F-80-余 v2）。
@@ -401,6 +773,73 @@ mod tests {
         assert_eq!(a, a2); // string 与 [{type:text}] 等价
         // 空 messages → 空指纹
         assert_eq!(fingerprint_messages(&json!({"messages":[]})), "");
+    }
+
+    /// issue #138 P0：from_slice 窄探测与 from_body 全 DOM 口径逐字节一致
+    /// （显式/指纹/空体/畸形类型/仅前 3 条参与），保证替换无行为漂移
+    #[test]
+    fn from_slice_matches_from_body_semantics() {
+        // 显式 conversation_id（含 trim/空白拒绝）
+        let explicit = json!({"conversation_id":" conv-1 ", "messages":[]});
+        assert_eq!(
+            SessionKey::from_slice(&serde_json::to_vec(&explicit).unwrap()),
+            SessionKey::from_body(&explicit)
+        );
+        // 指纹模式：string content 与 blocks content 等价、第 4+ 条不参与
+        let msgs = json!([
+            {"role":"user","content":[{"type":"text","text":"问题A"}]},
+            {"role":"assistant","content":"回答"},
+            {"role":"user","content":"续"},
+            {"role":"user","content":"应被忽略的第四条"},
+            {"role":"user","content":[{"type":"image_url","image_url":{"url":"data:image/png;base64,AAAA"}}]},
+        ]);
+        let fp_body = json!({"messages": msgs});
+        assert_eq!(
+            SessionKey::from_slice(&serde_json::to_vec(&fp_body).unwrap()),
+            SessionKey::from_body(&fp_body)
+        );
+        // 畸形 messages（对象而非数组）：两路同为兜底口径（from_body 走
+        // fingerprint_messages 的非数组 → 空；from_slice 主探测失败 → CidProbe
+        // 仍取不到 → 空指纹）
+        let bad = json!({"messages":{"role":"user"}});
+        assert_eq!(
+            SessionKey::from_slice(&serde_json::to_vec(&bad).unwrap()),
+            SessionKey::from_body(&bad)
+        );
+        // 空 body（非 JSON）：空指纹（对齐 unwrap_or(json!({})) 口径）
+        assert_eq!(SessionKey::from_slice(b"not-json"), SessionKey::Fingerprint(String::new()));
+        // 字段级畸形宽松跳过（修复审查 #1）：非串 conversation_id/role、content
+        // 数组混入标量块、对象 content、null content —— from_slice 与 from_body
+        // 宽松口径逐字节一致（同产指纹，而非窄探测整体失败）
+        let malformed = json!({
+            "conversation_id": 123,
+            "messages": [
+                {"role": 1, "content": "问题A"},
+                {"role": "user", "content": ["plain", {"type": "text", "text": "B"}]},
+                {"role": "user", "content": {"type": "text", "text": "对象"}},
+                {"role": "user", "content": null},
+            ],
+        });
+        assert_eq!(
+            SessionKey::from_slice(&serde_json::to_vec(&malformed).unwrap()),
+            SessionKey::from_body(&malformed)
+        );
+        // 且确为指纹模式且非空（防两路同错为空串的平凡通过）
+        assert_eq!(
+            SessionKey::from_body(&malformed),
+            SessionKey::Fingerprint(fingerprint_hex("|问题A|user|B|user||"))
+        );
+        // 结构性畸形（messages 非数组）+ 合法 conversation_id：主探测失败 →
+        // CidProbe 兜底，两路均显式粘性（explicit 尽力保留）
+        let structural = json!({"conversation_id":" conv-9 ","messages":5});
+        assert_eq!(
+            SessionKey::from_slice(&serde_json::to_vec(&structural).unwrap()),
+            SessionKey::from_body(&structural)
+        );
+        assert_eq!(
+            SessionKey::from_body(&structural),
+            SessionKey::Explicit("conv-9".to_string())
+        );
     }
 
     #[test]

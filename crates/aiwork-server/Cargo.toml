@@ -1,6 +1,6 @@
 [package]
 name = "aiwork-server"
-version = "1.5.4"
+version = "1.5.5"
 description = "AI Work 助手 Web 版服务端（管理面 + OpenAI 网关 + 调度器，单进程 axum）"
 edition = "2021"
 rust-version = "1.89"
@@ -24,3 +24,7 @@ serde_json = "1"
 tokio-stream = { version = "0.1", features = ["sync"] }
 # 启动日志的调度时区可观测（chrono 已在 workspace 树内，无额外编译成本）
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
+
+# issue #138 P0：仅 Linux gnu 目标启用 jemalloc（MSVC/macOS 走系统分配器）
+[target.'cfg(target_env = "gnu")'.dependencies]
+tikv-jemallocator = "0.6"

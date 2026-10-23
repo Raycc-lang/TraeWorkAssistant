@@ -128,7 +128,8 @@ function authMsg(msg) {
 }
 
 async function loadHealth() {
-  // 免鉴权探活：/health 收敏后仅存活布尔，仅作圆点点亮；不可达才整页降级
+  // 免鉴权探活：/health 收敏后仅存活布尔 + 低敏运维指标（inflight/rss_kib），
+  // 仅作圆点点亮；不可达才整页降级
   try {
     await j('/health');
     $('dot').classList.add('on');

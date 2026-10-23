@@ -6,6 +6,23 @@
 
 ---
 
+## [1.5.5] · 2026-10-23 · 常驻内存治理（issue #138：2核2G RSS 驻留 512MiB 被 earlyoom 反复 SIGTERM）
+
+### 修复与加固
+
+- **peek DOM 窄探测化**：会话粘性键改 `SessionKey::from_slice` 流式窄探测（仅目标字段反序列化，不建整包 DOM），WB peek 改作用域块「用完即弃」——消除大 body 下 DOM 放大 3~6 倍的驻留大头。
+- **对冲大 body 门槛**：Trae/WB/Qoder 三池首字对冲在 body > 256KiB 时退化为纯首字超时（语义与关闭对冲一致），消除全量快照 + 整包重建的瞬时内存放大。
+- **jemalloc 全局分配器**：Linux gnu 目标换 tikv-jemallocator，容器注入 `_RJEM_MALLOC_CONF` 后台归还页——治 glibc 碎片导致的「RSS 只涨不降」。
+- **请求体上限环境变量化**：默认 32MiB → 8MiB（`AIWORK_MAX_BODY_BYTES` 可调，clamp [256KiB, 64MiB]）。**升级提示**：长上下文/图片 base64 客户端若升级后遇 413（`request body exceeds 8MB limit`），设 `AIWORK_MAX_BODY_BYTES=33554432` 可恢复 1.5.4 的 32MiB 行为。
+
+### 新增
+
+- **/health 内存探针**：响应新增 `rss_kib`（仅 Linux）与 `inflight`（在途请求数），容器内存告警/OOM 排查可直接 curl。
+
+### 验证
+
+- `cargo check` + `cargo test --workspace` 通过（795 通过 0 失败）；Linux gnu 侧 jemalloc 由 Docker 构建覆盖。
+
 ## [1.5.4] · 2026-10-22 · Custom 模型上游组（第五资源池）+ 侧边栏应用拖拽排序
 
 > 语义移植 main `f4888f6` => `21fc6fb`（11 提交，未 merge）。跳过：d34a99d 桌面更新器/NSIS（OS 专属）；61bd1ab / 21fc6fb 为 main 自有 CHANGELOG（本文件替代）；f8f1bce 为 main 版本 chore（本分支自管 1.5.4）；2079d8c 为 merge 提交。

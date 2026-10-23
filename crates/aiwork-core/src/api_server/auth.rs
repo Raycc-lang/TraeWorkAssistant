@@ -11,7 +11,8 @@ use super::usage::KeyId;
 use super::ApiSharedState;
 
 /// API Key 鉴权中间件：
-/// - /health 跳过鉴权（无条件豁免：响应已收敏为 status/running 存活布尔，完整诊断在需鉴权的 /status；
+/// - /health 跳过鉴权（无条件豁免：响应仅含存活布尔与低敏运维指标
+///   inflight/rss_kib（issue #138 P2），账号/积分等完整诊断在需鉴权的 /status；
 ///   容器 HEALTHCHECK 与状态页探活均无凭据直打本端点，环回条件豁免会在 0.0.0.0 监听下失效）
 /// - Key 注册表存 vault（加密），内存权威副本 + flusher 落盘（批次 E），
 ///   支持 Authorization: Bearer <key>（OpenAI 风格）或 x-api-key: <key>（Anthropic 风格）
@@ -27,7 +28,8 @@ pub async fn bearer_auth(
     next: Next,
 ) -> Response {
     // 网关状态页免鉴权：页面为静态 HTML。/health 无条件豁免（2026-10-12 审查
-    // P1 修复）：响应已收敏为存活布尔（见 routes::health），无泄漏面；容器
+    // P1 修复）：响应已收敏为存活布尔 + 低敏运维指标 inflight/rss_kib（issue
+    // #138 P2，无账号/凭据/积分信息，见 routes::health），无实质泄漏面；容器
     // HEALTHCHECK（Dockerfile）与状态页探活圆点均无凭据直打 /health，而容器
     // 强制 0.0.0.0 非环回监听（docker-compose）——若按「仅环回豁免」，非环回
     // 下鉴权强制生效，开箱即 401：容器恒 unhealthy、状态页整页降级「不可达」。
@@ -46,7 +48,7 @@ pub async fn bearer_auth(
         .and_then(|v| v.to_str().ok())
         .and_then(|s| s.parse::<usize>().ok())
     {
-        if len > super::routes::MAX_BODY_BYTES {
+        if len > super::routes::max_body_bytes() {
             log_reject(&state, &request, 413, "body too large");
             return body_too_large();
         }
