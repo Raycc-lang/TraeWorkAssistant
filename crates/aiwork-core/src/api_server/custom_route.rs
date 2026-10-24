@@ -1,7 +1,7 @@
 //! 自定义模型上游执行路径（OpenAI 兼容直通）
 //!
 //! 与 WB 上游同策略：请求体强制 `stream:true`，上游只回 OpenAI 风格 SSE——
-//! - 流式：wb_sse::stream_forward 按客户端协议转发；
+//! - 流式：wb_sse::stream_forward_ex 按客户端协议转发（含 failed_inline 就地收尾）；
 //! - 非流式：wb_sse::aggregate 本地聚合为单个 OpenAI completion 后按协议转换。
 //!
 //! P2 上游组语义（custom_lb.rs）：入参为同名多条构成的上游组（Vec<CustomModel>）——
@@ -73,12 +73,8 @@ fn custom_agent_read_secs(read_secs: u64) -> ureq::Agent {
         .build()
 }
 
-/// 发起自定义上游请求（Bearer 鉴权；网关热路径用 custom_agent()）
-fn make_custom_request(cm: &CustomModel, body: &[u8]) -> Result<Box<dyn std::io::Read + Send>, (u16, String)> {
-    make_custom_request_with(cm, body, custom_agent())
-}
-
-/// agent 参数化变体：探活传短读超时 agent（custom_agent_read_secs(30)）
+/// 发起自定义上游请求（Bearer 鉴权；agent 由调用方指定——主路径 custom_agent
+/// 快速失败参数，probe 独立短超时 agent，两池连接互不干扰）
 fn make_custom_request_with(
     cm: &CustomModel,
     body: &[u8],
@@ -101,6 +97,22 @@ fn make_custom_request_with(
     }
 }
 
+/// 主路径请求入口（custom 专用 agent）
+fn make_custom_request(cm: &CustomModel, body: &[u8]) -> Result<Box<dyn std::io::Read + Send>, (u16, String)> {
+    make_custom_request_with(cm, body, custom_agent())
+}
+
+/// probe 专用 agent（B3）：独立连接池 + 全程短超时，不复用主路径 custom_agent
+/// （空闲读 300s 的连接池宿主——探测借用会受慢上游陈旧连接拖累，且命令层
+/// 30s 外部超时仅兜底不精准）。连接 5s / 读 10s（对齐网关首字超时口径）/ 写 10s
+fn probe_agent() -> ureq::Agent {
+    ureq::AgentBuilder::new()
+        .timeout_read(std::time::Duration::from_secs(10))
+        .timeout_write(std::time::Duration::from_secs(10))
+        .timeout_connect(std::time::Duration::from_secs(5))
+        .build()
+}
+
 /// 失败类别判定（熔断记账口径）：401/403/402 = 配置/账户错误落 600s 长窗，
 /// 其余（传输错误/5xx/429 等）走渐进冷却表
 fn classify_failure(status: u16) -> FailKind {
@@ -119,25 +131,37 @@ fn acct_display(cm: &CustomModel) -> String {
     }
 }
 
-/// 组内选下一上游：粘性命中优先（跳过计数器；粘住条目已 tried 时忽略重选），
-/// 否则组内加权轮询（pick_with_state，熔断中/已试条目排除）
+/// 组内选下一上游：粘性命中优先（跳过计数器；粘住条目已 tried 或被 Key 白名单
+/// 排除时忽略重选），否则组内加权轮询（pick_with_state，熔断中/已试/白名单外
+/// 条目排除——A1/M-2 与预检侧 dispatch::pool_health 同口径）
 fn pick_next(
     state: &Arc<ApiSharedState>,
     group: &[CustomModel],
     tried: &HashSet<String>,
     session_key: Option<&String>,
     canonical: &str,
+    allowed: Option<&HashSet<String>>,
 ) -> Option<CustomModel> {
     if let Some(sk) = session_key {
         if let Some(id) = custom_lb::sticky_upstream(state, sk) {
-            if !tried.contains(&id) {
+            if !tried.contains(&id) && allowed.map_or(true, |set| set.contains(&id)) {
                 if let Some(cm) = group.iter().find(|m| m.id == id) {
                     return Some(cm.clone());
                 }
             }
         }
     }
-    custom_lb::pick_with_state(state, canonical, group, tried)
+    custom_lb::pick_with_state(state, canonical, group, tried, allowed)
+}
+
+/// 命中 Key 的 custom 池白名单（A1/M-2 路由侧口径）。与 dispatch::key_allowed_for
+/// 对 custom 池结果等价：未绑定且非 mixed 的旧 Key，pool_constraints("custom")
+/// 因 constrains_pool 仅认绑定池/buddy 而天然返回 None，无需再走门控。
+/// None = 不感知白名单；Some(集) = 白名单外 cm.id 一律不选。
+fn key_allowed_for_custom(state: &Arc<ApiSharedState>, key_id: &str) -> Option<HashSet<String>> {
+    super::api_keys::constraints_for(&state.data_dir, key_id)
+        .and_then(|rk| rk.pool_constraints("custom"))
+        .and_then(|c| c.allowed)
 }
 
 /// 连通性探活（custom_model_test 命令底层）：向自定义上游发一条最小 chat 请求
@@ -152,7 +176,7 @@ pub fn probe(cm: &CustomModel) -> Result<String, String> {
     })
     .to_string()
     .into_bytes();
-    let reader = make_custom_request_with(cm, &body, custom_agent_read_secs(30))
+    let reader = make_custom_request_with(cm, &body, probe_agent())
         .map_err(|(status, resp_body)| {
             let preview: String = resp_body.chars().take(200).collect();
             if preview.is_empty() {
@@ -264,11 +288,13 @@ pub fn custom_stream_chat(
         let max_attempts = group.len().min(3);
         let mut attempt = 0usize;
         let mut last_err = String::from("自定义上游组内无可用条目");
+        // A1/M-2：命中 Key 的 custom 白名单 loop 外解析一次（constraints_for 缓存读）
+        let allowed = key_allowed_for_custom(&state, &key_id);
 
         loop {
-            let Some(cm) = pick_next(&state, &group, &tried, session_key.as_ref(), &canonical)
+            let Some(cm) = pick_next(&state, &group, &tried, session_key.as_ref(), &canonical, allowed.as_ref())
             else {
-                // 组内全熔断/已试尽（pool_health 前置下理论不可达，防御性兜底）
+                // 组内全熔断/已试尽/白名单排除（pool_health 前置下理论不可达，防御性兜底）
                 set_last_error(&state, format!("custom model={} group exhausted", model));
                 state.logger.log_request(
                     "custom", "POST", proto.log_path(), &model, true, 503, "custom",
@@ -336,12 +362,17 @@ pub fn custom_stream_chat(
                         }
                     }
                     Ok(lines) => {
-                        // 可中断行源：stream_forward 停滞期间周期性检查客户端断连。
+                        // 可中断行源：stream_forward_ex 停滞期间周期性检查客户端断连。
                         // 自定义上游无 namespace 展平编码 → 空集合禁用编码名拆分（F4 移植）
-                        let (error_info, sent_any, up_usage) = wb_sse::stream_forward(
+                        // B1：迁 stream_forward_ex 四元组——failed_inline = 流内失败
+                        // （response.failed / error 帧）已就地透传客户端，此时 error_info
+                        // 恒 None，旧三元组仅凭 is_none() 会把流内失败误判成功
+                        let (error_info, sent_any, failed_inline, up_usage) = wb_sse::stream_forward_ex(
                             lines, &tx, proto, &chat_id, &model, &std::collections::HashSet::new(),
                         );
                         let duration_ms = start_ts.elapsed().as_millis() as u64;
+                        // 记账成功口径（对齐 wb_route）：无流内错误且未流内失败
+                        let ok = error_info.is_none() && !failed_inline;
                         {
                             // 宽口径提取（别名 + 字符串数字形态，审查 P2）
                             let (pt, ct) = up_usage.as_ref().map(wb_sse::u64_pair).unwrap_or((0, 0));
@@ -351,9 +382,19 @@ pub fn custom_stream_chat(
                                 up_usage.as_ref().map(wb_sse::cached_tokens_of).unwrap_or(0),
                             );
                             state.record_usage_custom(
-                                &model, &key_id, error_info.is_none(), true,
+                                &model, &key_id, ok, true,
                                 duration_ms, pt, ct,
                             );
+                        }
+                        if failed_inline {
+                            // 流内失败已透传客户端（wb_route 同口径）：不重试、不清熔断、
+                            // 不绑粘性、亦不记账熔断——错误已原样给到客户端，内容类失败
+                            // 计入冷却会造成上游过度冷却
+                            state.logger.log_request(
+                                "custom", "POST", proto.log_path(), &model, true, 200, "custom",
+                                duration_ms, &key_name, &acct_name, Some("流内失败已透传客户端"),
+                            );
+                            break;
                         }
                         match error_info {
                             None => {
@@ -442,11 +483,13 @@ pub async fn custom_aggregate_chat(
         let max_attempts = group.len().min(3);
         let mut attempt = 0usize;
         let mut last_err = String::from("自定义上游组内无可用条目");
+        // A1/M-2：命中 Key 的 custom 白名单 loop 外解析一次（constraints_for 缓存读）
+        let allowed = key_allowed_for_custom(&state, &key_id);
 
         loop {
-            let Some(cm) = pick_next(&state, &group, &tried, session_key.as_ref(), &canonical)
+            let Some(cm) = pick_next(&state, &group, &tried, session_key.as_ref(), &canonical, allowed.as_ref())
             else {
-                // 组内全熔断/已试尽（pool_health 前置下理论不可达，防御性兜底）；
+                // 组内全熔断/已试尽/白名单排除（pool_health 前置下理论不可达，防御性兜底）；
                 // [DEBUG] 排障行由 loop 后收尾统一落（此处 break 即达，不重复）
                 set_last_error(&state, format!("custom model={} group exhausted", model));
                 // 日志记 502（与下方 openai_error(BAD_GATEWAY) 实收一致；stream 路径为 503）
@@ -623,8 +666,7 @@ mod tests {
         std::thread::spawn(move || {
             for (i, conn) in listener.incoming().enumerate() {
                 let Ok(mut s) = conn else { break };
-                let mut buf = [0u8; 4096];
-                let _ = s.read(&mut buf);
+                drain_request(&mut s);
                 let resp: &[u8] = if i == 0 {
                     b"HTTP/1.1 401 Unauthorized\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
                 } else {
@@ -635,12 +677,53 @@ mod tests {
                 };
                 let _ = s.write_all(resp);
                 let _ = s.flush();
-                if i >= 1 {
-                    break; // 只服务两个连接（两个 attempt）
+                if i >= 3 {
+                    // 只服务 4 个连接：轮换 2 个 + 传输层抖动重试余量；此后
+                    // drop listener，迟到连接由 OS 拒绝（不应发生在 max_attempts 内）
+                    break;
                 }
             }
         });
         format!("http://127.0.0.1:{port}/v1")
+    }
+
+    /// 完整排空请求头 + Content-Length 体后再响应。单次 read 可能在头部 TCP 段
+    /// 即返回，残留未读体数据时关闭连接——Windows 对接收缓冲区仍有未读数据的
+    /// socket 关闭发 RST 而非 FIN，客户端在状态行读取阶段偶发
+    /// os error 10054（t01 全量并行跑的抖动根因）
+    fn drain_request(s: &mut std::net::TcpStream) {
+        // 读超时兜底：对端 connect 后不发数据 / 头部永不完整时不得无限阻塞
+        // （超时 Err 走 return，照常响应，客户端收到响应无害）
+        let _ = s.set_read_timeout(Some(std::time::Duration::from_secs(5)));
+        let mut req = Vec::new();
+        let mut buf = [0u8; 4096];
+        loop {
+            match s.read(&mut buf) {
+                Ok(0) | Err(_) => return,
+                Ok(n) => {
+                    req.extend_from_slice(&buf[..n]);
+                    let Some(h) = req.windows(4).position(|w| w == b"\r\n\r\n") else {
+                        continue;
+                    };
+                    let head = String::from_utf8_lossy(&req[..h]);
+                    let content_length = head
+                        .lines()
+                        .filter_map(|l| {
+                            let (k, v) = l.split_once(':')?;
+                            if k.trim().eq_ignore_ascii_case("content-length") {
+                                v.trim().parse::<usize>().ok()
+                            } else {
+                                None
+                            }
+                        })
+                        .next()
+                        .unwrap_or(0);
+                    if req.len() >= h + 4 + content_length {
+                        return;
+                    }
+                }
+            }
+        }
     }
 
     fn cm(id: &str, base_url: &str) -> CustomModel {

@@ -586,10 +586,20 @@ fn import_api_keys(store: &Store, path: &Path) -> ImportStatus {
 
 fn import_custom_models(store: &Store, path: &Path) -> ImportStatus {
     match std::fs::read_to_string(path) {
-        Ok(text) => match serde_json::from_str::<crate::api_server::custom_models::CustomModelsFile>(&text) {
-            Ok(f) => wrap(docs::custom_models_save(store, &f)),
-            Err(e) => ImportStatus::Corrupt(e.to_string()),
-        },
+        Ok(text) => {
+            match serde_json::from_str::<crate::api_server::custom_models::CustomModelsFile>(&text) {
+                // A5/A6 对齐：legacy 导入与 upsert 保存同口径过 norm_base
+                // （scheme 小写化 / 默认端口剥离 / 尾斜杠去除）——直调
+                // custom_models_save 会绕过归一，历史变体形态残留到下次编辑才收敛
+                Ok(mut f) => {
+                    for m in &mut f.models {
+                        m.base_url = crate::api_server::custom_models::norm_base(&m.base_url);
+                    }
+                    wrap(docs::custom_models_save(store, &f))
+                }
+                Err(e) => ImportStatus::Corrupt(e.to_string()),
+            }
+        }
         Err(e) => ImportStatus::Error(e.to_string()),
     }
 }
@@ -1343,6 +1353,27 @@ mod tests {
         assert!(store.kv_get::<bool>("unified_groups_migrated"), "迁移标记置位");
 
         assert_eq!(migrate_unified_groups(&store).unwrap(), 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A5/A6 回归：legacy 导入 custom_models 与 upsert 保存同口径过 norm_base——
+    /// `HTTPS://x:443/` 变体入库即归一，不残留到下次编辑才收敛
+    #[test]
+    fn import_custom_models_normalizes_base_url() {
+        let dir = tmp_dir("cm_norm");
+        let store = db(&dir);
+        write(
+            &dir.join("data/custom_models.json"),
+            r#"{"models":[{"id":"cm-norm0000001","name":"m","base_url":"HTTPS://a.example.com:443/","api_key":"k"}],"updated_at":0}"#,
+        );
+        let st = import_custom_models(&store, &dir.join("data/custom_models.json"));
+        assert!(
+            matches!(st, ImportStatus::Ok),
+            "导入应成功，异常状态：Corrupt/Error（见 detail）"
+        );
+        let list = crate::api_server::custom_models::load(&dir);
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].base_url, "https://a.example.com", "导入即归一");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

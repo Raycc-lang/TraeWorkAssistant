@@ -33,6 +33,18 @@ pub fn default_priority() -> Vec<String> {
     vec!["buddy".into(), "trae".into(), "qoder".into()]
 }
 
+/// 池固定序（A2 共享常量）：候选序尾部补全与统一目录显示层兜底回退共用同一
+/// 顺序，杜绝两处字面量漂移（unified_catalog 曾按 sources 插入序回退，buddy-ai
+/// 被插在 trae 之前与默认候选序不一致）。默认 priority 下尾部补全结果
+/// [buddy, trae, qoder, buddy-ai, custom] 与既有行为零差异；custom 保持尾部兜底位。
+pub const POOL_FIXED_ORDER: [TargetPool; 5] = [
+    TargetPool::Buddy,
+    TargetPool::Trae,
+    TargetPool::Qoder,
+    TargetPool::BuddyAi,
+    TargetPool::Custom,
+];
+
 /// 资源池标识（对外统一 `trae` / `buddy` / `qoder` / `buddy-ai` / `custom`）。
 /// v3 拍板：custom 为第五资源池参与统一调度规则（priority / per_model / Smart /
 /// Key 绑定 / fallback 全链路生效），默认候选序尾部兜底——不再「命中即直达」
@@ -739,10 +751,12 @@ pub fn resolve_target(
             .collect()
     };
     // per_model / 绑定序可能只写了部分池：其余可用源追加尾部，保证多源回退有序
-    // （issue #90 修复③a：前缀锁定 = 单池候选，不追加。v3：custom 尾部兜底位——
-    // 默认候选序 = [buddy, trae, qoder, custom]）
+    // per_model / 绑定序可能只写了部分池：其余可用源按 POOL_FIXED_ORDER 追加尾部，
+    // 保证多源回退有序（issue #90 修复③a：前缀锁定 = 单池候选，不追加。
+    // v3：custom 尾部兜底位——默认候选序 = [buddy, trae, qoder, buddy-ai, custom]，
+    // 与 unified_catalog 显示层兜底回退同源 A2）
     if forced_pool.is_none() {
-        for p in [TargetPool::Buddy, TargetPool::BuddyAi, TargetPool::Trae, TargetPool::Qoder, TargetPool::Custom] {
+        for p in POOL_FIXED_ORDER {
             if !order.contains(&p) {
                 order.push(p);
             }
@@ -765,8 +779,13 @@ pub fn resolve_target(
         .find(|p| sources.available(*p, trae_enabled, wb_enabled, qoder_enabled, buddy_ai_enabled));
 
     let mut fallback_from: Option<(TargetPool, FallbackReason)> = None;
+    // issue #136 逐池归因：记录候选序中每个池的失败原因（unavailable / 账号不健康 /
+    // 模型冷却），全部耗尽时随 app_log 落盘——「白名单把池排除」与「账号不健康」
+    // 在一行日志内即可区分，替代盲猜调用路径
+    let mut pool_reasons: Vec<String> = Vec::new();
     for (i, pool) in order.iter().copied().enumerate() {
         if !sources.available(pool, trae_enabled, wb_enabled, qoder_enabled, buddy_ai_enabled) {
+            pool_reasons.push(format!("{}=unavailable", pool.as_str()));
             continue;
         }
         match pool_health(state, pool, &sources, wb_enabled, key_allowed_for(pool).as_ref()) {
@@ -800,6 +819,7 @@ pub fn resolve_target(
                 });
             }
             Err(reason) => {
+                pool_reasons.push(format!("{}={}", pool.as_str(), reason.as_str()));
                 // 首选池不可用：双源 + fallback 开 + 后续还有可用源 → 按序回退；
                 // 单源（或 fallback 关）→ 错误矩阵显式报错（§4.3，不静默换池）。
                 // BM-3 审查修复：门控从 is_dual（家族计数，Buddy/BuddyAi 同族不叠加）
@@ -813,6 +833,19 @@ pub fn resolve_target(
                     && sources.available_count(trae_enabled, wb_enabled, qoder_enabled, buddy_ai_enabled) >= 2
                     && has_next;
                 if !can_fallback {
+                    // issue #136：提前终止（无更多回退目标）同样落逐池归因——实证
+                    // 「白名单排除 + 单/末位可用池」场景走的是本提前 return，仅
+                    // 零可用源才会自然走到循环末尾的 exhausted 块，两处都须落日志
+                    log_dispatch_exhausted(
+                        state,
+                        model,
+                        key_id,
+                        preferred,
+                        &sources,
+                        wb_enabled,
+                        buddy_ai_enabled,
+                        &pool_reasons,
+                    );
                     return Err(match (pool, reason) {
                         (TargetPool::Buddy, FallbackReason::ModelCooldown) => {
                             let view = super::wb_route::WbView::wb(state.clone());
@@ -844,37 +877,72 @@ pub fn resolve_target(
             }
         }
     }
-    // 可用源全部耗尽（双源回退目标也不可用 / 源剔除后无源 / Key 白名单排除）：
-    // 落盘调度日志便于排查轮询异常（issue #30：凭证调度可观测，含 Key 展示名）
-    {
-        let key_label = key_id
-            .map(|id| super::api_keys::key_name_for(&state.data_dir, id))
-            .filter(|n| !n.is_empty())
-            .unwrap_or_else(|| "anonymous".to_string());
-        crate::fs_utils::app_log(
-            &state.data_dir,
-            &format!(
-                // 审查修复（可观测）：Intl 专属模型（buddy_intl_only）在国际档关闭时
-                // 四源全不可用，原日志只记 model/preferred，排障会误判成「Trae 池耗尽」；
-                // 补源判定与开关快照
-                "dispatch exhausted: model={} key={} preferred={} trae={} buddy={} intl_only={} qoder={} buddy_ai_on={} wb_on={}",
-                model,
-                key_label,
-                preferred.map(|p| p.as_str()).unwrap_or("none"),
-                sources.trae,
-                sources.buddy.is_some(),
-                sources.buddy_intl_only,
-                sources.qoder.is_some(),
-                buddy_ai_enabled,
-                wb_enabled,
-            ),
-        );
-    }
+    // 仅零可用源（循环内全部 continue）才走到此处；有可用池但失败的场景均在
+    // 循环内 !can_fallback 提前终止并落同款归因日志（issue #136）。落盘调度
+    // 日志便于排查轮询异常（issue #30：凭证调度可观测，含 Key 展示名）
+    log_dispatch_exhausted(
+        state,
+        model,
+        key_id,
+        preferred,
+        &sources,
+        wb_enabled,
+        buddy_ai_enabled,
+        &pool_reasons,
+    );
     Err(DispatchError::NoHealthy(
         // issue #90 修复③a：前缀锁定池不可用时错误指向该池（而非兜底 Trae，
         // 否则「qoder/xxx 但 qoder 池耗尽」报成 Trae 无健康账号，误导排障）
         forced_pool.or(preferred).unwrap_or(TargetPool::Trae),
     ))
+}
+
+/// dispatch 耗尽/提前终止的逐池归因日志（issue #30 可观测 + issue #136 逐池
+/// candidates）：候选序中每个池的失败原因（unavailable / no_healthy_account /
+/// model_cooldown）一行落盘，「白名单把池排除」与「账号不健康」直接可辨。
+/// 连续相同归因 60s 内去重（客户端重试风暴防刷屏，对齐调度器 Busy 不重复
+/// 落日志先例），data_dir 参与去重键——多实例/测试目录互不干扰。
+/// docker 版保留既有源判定与开关快照字段（审查修复：Intl 专属模型在国际档
+/// 关闭时四源全不可用，仅 model/preferred 会误判成「Trae 池耗尽」）
+fn log_dispatch_exhausted(
+    state: &Arc<ApiSharedState>,
+    model: &str,
+    key_id: Option<&str>,
+    preferred: Option<TargetPool>,
+    sources: &ModelSources,
+    wb_enabled: bool,
+    buddy_ai_enabled: bool,
+    reasons: &[String],
+) {
+    let key_label = key_id
+        .map(|id| super::api_keys::key_name_for(&state.data_dir, id))
+        .filter(|n| !n.is_empty())
+        .unwrap_or_else(|| "anonymous".to_string());
+    let line = format!(
+        "dispatch exhausted: model={} key={} preferred={} trae={} buddy={} intl_only={} qoder={} buddy_ai_on={} wb_on={} candidates={}",
+        model,
+        key_label,
+        preferred.map(|p| p.as_str()).unwrap_or("none"),
+        sources.trae,
+        sources.buddy.is_some(),
+        sources.buddy_intl_only,
+        sources.qoder.is_some(),
+        buddy_ai_enabled,
+        wb_enabled,
+        reasons.join(","),
+    );
+    static LAST: std::sync::OnceLock<std::sync::Mutex<(String, std::time::Instant)>> =
+        std::sync::OnceLock::new();
+    let cell = LAST
+        .get_or_init(|| std::sync::Mutex::new((String::new(), std::time::Instant::now())));
+    if let Ok(mut g) = cell.lock() {
+        let dedup_key = format!("{}\u{1}{}", state.data_dir.display(), line);
+        if g.0 == dedup_key && g.1.elapsed() < std::time::Duration::from_secs(60) {
+            return;
+        }
+        *g = (dedup_key, std::time::Instant::now());
+    }
+    crate::fs_utils::app_log(&state.data_dir, &line);
 }
 
 /// 会话池粘性键（§4.4：复用现有粘性会话键，conversation 维度）。
@@ -1043,13 +1111,18 @@ fn pool_health(
             }
             Ok(())
         }
-        // v3：custom 上游组健康判定——任一上游未熔断即可候选（组内选路跳过
-        // 熔断条目；全熔断 → NoHealthyAccount 走现有 fallback 按序回退下一池）
+        // v3：custom 上游组健康判定——任一上游「未熔断且在 Key 白名单内」即可候选
+        // （M-2 预检感知白名单，与 custom_lb::pick_upstream 执行侧同口径：白名单
+        // 排除组内全部健康条目时判不健康走 fallback，避免执行侧 pick_next 返回
+        // None 才 503 exhausted、丢失本可成功的跨池回退）
         TargetPool::Custom => {
             if sources
                 .custom
                 .iter()
-                .any(|cm| !super::custom_lb::circuit_open(&cm.id))
+                .any(|cm| {
+                    !super::custom_lb::circuit_open(&cm.id)
+                        && allowed.map_or(true, |set| set.contains(&cm.id))
+                })
             {
                 Ok(())
             } else {
@@ -1508,6 +1581,59 @@ mod tests {
             "dispatch fallback: pool=custom->trae model=glm-5.3 preferred=custom actual=trae reason=no_healthy_account"
         ));
         super::super::custom_lb::clear_circuit(&list[0].id);
+    }
+
+    /// M-2：custom 白名单预检感知（正反对照）——Key 白名单排除组内全部健康条目
+    /// 时预检判不健康走跨池 fallback（而非执行侧 pick_next 返回 None 才 503
+    /// exhausted）；白名单条目健康时照常落 Custom。
+    /// seed_key 须在首次 resolve 之前调用（constraints_for 经 KEYS_STATE 首读固化
+    /// 内存副本）；CustomModel 显式唯一 id 隔离进程级全局熔断表
+    #[test]
+    fn t91_custom_whitelist_excluded_falls_back() {
+        let f = fixture(&["glm-5.3"], Some(&["glm-5.3"]), Some(&policy_default()));
+        f.seed_healthy(true);
+        // 绑定 custom + 白名单仅含 cm-whitelist0001（bind Key → pool_constraints
+        // 旧语义生效）；两条 custom 均显式唯一 id
+        f.seed_key("k-cw", "custom", &["cm-whitelist0001"]);
+        let cm1: super::super::custom_models::CustomModel = serde_json::from_value(json!({
+            "id": "cm-whitelist0001",
+            "name": "glm-5.3",
+            "base_url": "https://custom-a.example.invalid",
+            "enabled": true
+        }))
+        .unwrap();
+        let cm2: super::super::custom_models::CustomModel = serde_json::from_value(json!({
+            "id": "cm-excluded00001",
+            "name": "glm-5.3",
+            "base_url": "https://custom-b.example.invalid",
+            "enabled": true
+        }))
+        .unwrap();
+        super::super::custom_models::upsert(&f.dir, cm1).unwrap();
+        super::super::custom_models::upsert(&f.dir, cm2).unwrap();
+
+        // 反对照：白名单条目熔断 → 组内全部健康条目被白名单排除 → 预检不健康
+        // → 落 Trae（fallback_from=Custom），而非留到执行侧 503。
+        // 用 Auth 类 600s 长窗记账（pool_health 仅判 circuit_open，不分类别）：
+        // Server 类基准窗仅 30s，全量并行跑时 constraints_for 可能在 KEYS_STATE
+        // 锁上被其他测试的 vault 加密操作阻塞超 30s，窗口过期会假失败
+        super::super::custom_lb::note_circuit_failure(
+            "cm-whitelist0001",
+            super::super::custom_lb::FailKind::Auth,
+        );
+        let r = f.resolve_key("glm-5.3", "k-cw").unwrap();
+        assert_eq!(r.pool, TargetPool::Trae, "白名单排除全部健康条目须走跨池回退");
+        assert_eq!(r.fallback_from, Some(TargetPool::Custom));
+        assert!(f.app_log_contains(
+            // docker 增强格式（issue #90 F-80）：fallback 日志带 pool= 与 actual= 上下文
+            "dispatch fallback: pool=custom->trae model=glm-5.3 preferred=custom actual=trae reason=no_healthy_account"
+        ));
+
+        // 正对照：白名单条目熔断清除 → 预检健康 → 照常落 Custom
+        super::super::custom_lb::clear_circuit("cm-whitelist0001");
+        let r = f.resolve_key("glm-5.3", "k-cw").unwrap();
+        assert_eq!(r.pool, TargetPool::Custom, "白名单内条目健康时正常命中 custom");
+        super::super::custom_lb::clear_circuit("cm-whitelist0001");
     }
 
     /// v3 P4：custom/xxx 前缀锁池 + 组全熔断 → NoHealthy(Custom) 显式报错
@@ -2405,6 +2531,72 @@ mod tests {
         assert!(msg2.contains("healthy_in_scope=1"), "{msg2}");
         // 作用域内有健康账号 → 不追加 hint（避免噪音）
         assert!(!msg2.contains("hint="), "{msg2}");
+    }
+
+    /// issue #136 hint 按根因分流（Case A）：混合白名单条目全指向其他池（buddy-ai）
+    /// → trae 池被整体排除（whitelist=0），hint 列出约束涉及池并点明「本次请求由
+    /// 本池提供」；白名单含本池条目但均不可用的 Case B 文案由 t40 覆盖（前缀不变）
+    #[test]
+    fn t40b_no_healthy_detail_hint_pool_mismatch() {
+        let f = fixture(&[], None, None);
+        f.seed_healthy(true); // trae 池健康账号 t1（healthy=1，在作用域外）
+        // 先种满全部 Key 再断言：constraints_for 首读后走内存缓存，后续直写不可见
+        f.seed_key("k1", "", &["buddy-ai:u1", "buddy-ai:u2"]); // 白名单仅国际版账号
+        // 专一锁他池变体：白名单指向 buddy-ai + 专一指向 qoder → trae 整体排除
+        // （dedicated 不随行，且 dedicated 指向池对约束涉及池列表有可见增量 qoder）
+        f.seed_key_cfg("k2", "", &["buddy-ai:u1"], "dedicated", "qoder:u9");
+
+        let msg = super::super::routes::no_healthy_detail(&f.state, TargetPool::Trae, "k1");
+        assert!(msg.contains("pool=trae healthy=1"), "{msg}");
+        assert!(
+            msg.contains("whitelist=0"),
+            "白名单条目全指向其他池 → trae 作用域空集: {msg}"
+        );
+        assert!(
+            msg.contains("hint=该 Key 的账号约束均指向其他资源池（buddy-ai）"),
+            "{msg}"
+        );
+        assert!(msg.contains("未包含 trae 池账号"), "{msg}");
+        assert!(msg.contains("由 trae 池提供"), "{msg}");
+        // Case A 不得误用 Case B 文案（该文案保留给白名单含本池条目的场景）
+        assert!(!msg.contains("约束排除了池内全部健康账号"), "{msg}");
+
+        let msg2 = super::super::routes::no_healthy_detail(&f.state, TargetPool::Trae, "k2");
+        assert!(msg2.contains("whitelist=0"), "{msg2}");
+        assert!(msg2.contains("dedicated=-"), "非归属池排除分支 dedicated 不随行: {msg2}");
+        assert!(
+            msg2.contains("hint=该 Key 的账号约束均指向其他资源池（buddy-ai/qoder）"),
+            "dedicated 指向池应并入约束涉及池列表: {msg2}"
+        );
+    }
+
+    /// issue #136 修复2：候选池耗尽/提前终止落逐池归因日志——「白名单把池排除」
+    /// （trae=no_healthy_account）与「源剔除」（buddy=unavailable）一行可辨；
+    /// 实证路径是循环内提前 return（单可用池失败即终止），非循环末尾 exhausted 块
+    #[test]
+    fn t40c_dispatch_exhausted_logs_per_pool_reasons() {
+        let f = fixture(&["glm-5.3"], None, None);
+        f.seed_healthy(true); // trae 池健康账号 t1（会被 Key 白名单排除）
+        f.seed_key("k1", "", &["buddy-ai:u1"]); // 混合白名单仅国际版账号
+
+        // buddy 无源目录走内置表 → 源存在但 wb_pool 无账号 → no_healthy_account；
+        // trae 有源但 Key 作用域空集 → no_healthy_account；无源池 → unavailable
+        // → 无更多回退目标，提前终止归因 trae
+        let r = f.resolve_key("glm-5.3", "k1");
+        assert!(matches!(r, Err(DispatchError::NoHealthy(TargetPool::Trae))), "{r:?}");
+        assert!(
+            f.app_log_contains("dispatch exhausted: model=glm-5.3 key=k1"),
+            "应落逐池归因日志"
+        );
+        assert!(
+            f.app_log_contains("trae=no_healthy_account"),
+            "被 Key 白名单排除的池应记 no_healthy_account"
+        );
+        assert!(
+            f.app_log_contains("buddy=no_healthy_account"),
+            "目录命中但池内无账号同样记 no_healthy_account"
+        );
+        assert!(f.app_log_contains("qoder=unavailable"), "无源池应记 unavailable");
     }
 
     /// 修复1 直测：调度阶段失败落 API 请求日志——NoHealthy → status=503、

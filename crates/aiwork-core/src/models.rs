@@ -280,6 +280,14 @@ pub struct Settings {
     pub sessions_preview_enabled: bool,
 }
 
+/// 侧边栏应用合法 key 白名单（单一来源）：app_order 写入侧（settings_set C4 校验）
+/// 与 app_order / app_icons 读取侧（state.rs 归一）共用，杜绝多处硬编码漂移——
+/// 新增应用时仅需改此处与前端 APP_TABS。hidden_apps 读取侧有意不用本谓词：
+/// buddy-ai 可见性走独立 opt-in 开关 buddy_ai_visible，不进隐藏列表（见 state.rs）
+pub fn is_valid_app_key(k: &str) -> bool {
+    matches!(k, "trae" | "buddy" | "qoder" | "buddy-ai")
+}
+
 fn default_api_port() -> u16 {
     7864
 }

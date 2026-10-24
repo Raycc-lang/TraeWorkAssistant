@@ -414,14 +414,12 @@ impl AppState {
         // 前端 resolveAppIcon 未命中即回退默认图标（候选表只有前端持有，避免后端重复维护）。
         // buddy-ai（BuddyAI 国际版）：图标自定义放行（应用显示面板行首入口），
         // hidden_apps 不放行（可见性走独立 opt-in 开关）
-        s.app_icons.retain(|k, v| {
-            matches!(k.as_str(), "trae" | "buddy" | "qoder" | "buddy-ai") && !v.trim().is_empty()
-        });
+        s.app_icons
+            .retain(|k, v| crate::models::is_valid_app_key(k) && !v.trim().is_empty());
         // 应用显示顺序归一：仅保留合法 key + 保序去重（HashSet 全量去重——
         // Vec::dedup 只去相邻重复，非相邻重复如 [trae,buddy,trae] 漏网；
         // 保持用户拖拽后的相对顺序，不排序）；未提及/空缺 = 前端按内置默认顺序补在末尾
-        s.app_order
-            .retain(|k| matches!(k.as_str(), "trae" | "buddy" | "qoder" | "buddy-ai"));
+        s.app_order.retain(|k| crate::models::is_valid_app_key(k));
         let mut seen_order = std::collections::HashSet::new();
         s.app_order.retain(|k| seen_order.insert(k.clone()));
         s

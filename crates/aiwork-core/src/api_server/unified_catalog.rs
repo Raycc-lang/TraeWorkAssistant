@@ -894,7 +894,7 @@ pub fn unified_models_ex(
             .filter_map(|s| TargetPool::parse(s))
             .collect();
         // 审查修复（P1）：v3 已废除「custom 命中即直达」短路（dispatch ⓪ 移除，
-        // 默认候选序 = [buddy, buddy-ai, trae, qoder, custom] 尾部兜底）——目录
+        // 默认候选序 = [buddy, trae, qoder, buddy-ai, custom] 尾部兜底）——目录
         // 命中侧同步对齐 dispatch 候选序口径：per_model/全局优先级序 + 缺池尾部
         // 补齐（与 resolve_target 的补齐序列一致），custom 仅在候选序排到时才命中。
         // 否则多源同名模型会出现「目录展示取 custom 侧倍率/上下文，实际调度
@@ -903,18 +903,17 @@ pub fn unified_models_ex(
         // 目录作为静态派生视图不镜像（与 sticky/前缀锁定/Key 绑定序同理）——
         // strategy=Smart 且无 per_model 时 hit 侧可能与实际命中池不同，此为
         // 静态目录的既有取舍，非本判定引入
-        for p in [
-            TargetPool::Buddy,
-            TargetPool::BuddyAi,
-            TargetPool::Trae,
-            TargetPool::Qoder,
-            TargetPool::Custom,
-        ] {
+        // A2：补全序引用 dispatch::POOL_FIXED_ORDER 单一来源（此前硬编码旧序
+        // [buddy, buddy-ai, trae, ...]，priority 缺 trae/qoder 时 buddy-ai 会插到
+        // trae 前，显示层命中侧与 dispatch 实际候选序错位）
+        for p in super::dispatch::POOL_FIXED_ORDER {
             if !pools.contains(&p) {
                 pools.push(p);
             }
         }
-        // 命中池：候选序首个 enabled 源 → 任一 enabled 源 → 首源
+        // 命中池：候选序首个 enabled 源 → 任一 enabled 源（A2：按 POOL_FIXED_ORDER，
+        // 与 dispatch 候选序尾部补全同源——此前按 sources 插入序，buddy-ai 被插在
+        // trae 之前导致回退顺序与默认候选序不一致）→ 首源
         let hit = pools
             .iter()
             .find_map(|p| {
@@ -923,12 +922,26 @@ pub fn unified_models_ex(
                     .find(|s| s.pool == p.as_str() && s.enabled)
                     .map(|s| s.pool)
             })
-            .or_else(|| u.sources.iter().find(|s| s.enabled).map(|s| s.pool))
+            .or_else(|| {
+                super::dispatch::POOL_FIXED_ORDER.iter().find_map(|p| {
+                    u.sources
+                        .iter()
+                        .find(|s| s.pool == p.as_str() && s.enabled)
+                        .map(|s| s.pool)
+                })
+            })
             .or_else(|| u.sources.first().map(|s| s.pool));
-        // rate = 命中侧倍率；未声明退可用源 → 首源 → 保持原值
+        // rate = 命中侧倍率；未声明退可用源（A2：同 POOL_FIXED_ORDER 口径）→ 首源 → 保持原值
         u.rate = hit
             .and_then(|hp| u.sources.iter().find(|s| s.pool == hp).and_then(|s| s.rate))
-            .or_else(|| u.sources.iter().find(|s| s.enabled).and_then(|s| s.rate))
+            .or_else(|| {
+                super::dispatch::POOL_FIXED_ORDER.iter().find_map(|p| {
+                    u.sources
+                        .iter()
+                        .find(|s| s.pool == p.as_str() && s.enabled)
+                        .and_then(|s| s.rate)
+                })
+            })
             .or_else(|| u.sources.first().and_then(|s| s.rate))
             .or(u.rate);
         // context_length 跟随命中侧（issue #38-4）：命中 buddy → WB 目录值；
