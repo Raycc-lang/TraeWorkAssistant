@@ -6,6 +6,7 @@
 pub mod accounts;
 pub mod api_server;
 pub mod checkin;
+pub mod custom;
 pub mod misc;
 pub mod oauth;
 pub mod qoder;

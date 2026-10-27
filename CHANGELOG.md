@@ -6,6 +6,27 @@
 
 ---
 
+## [1.5.8] · 2026-10-27 · 语义移植 main aa4ec5a => f04d495
+
+> 语义移植 main `aa4ec5a`（不含）=> `f04d495`（9 提交，未 merge）。跳过：切换器链路（095e3ca 部分、84a5402、c440b20，本分支无 switcher 模块）与豆包桌面端开关（c097170，本分支无 doubao 模块）。
+
+### 新功能
+
+- **渠道内单模型开关（#145）**：模型可按源启用/禁用（管理端手选 + 「已禁」徽标），dispatch 不再路由被禁源，网关目录全禁条目不发布。
+- **付费受限免误冷却（#145）**：新增 `PaidRestricted` 错误分类——免费账号打付费模型不再触发冷却/禁用/熔断（仅换号或 fail-fast）。
+- **自定义池会话明细（#149）**：请求级本地流水表（会话指纹 + 请求阶段 + 消息预览，90 天保留）；用量统计「自定义模型」新增按会话归并的明细表，可展开看各轮。
+- **工具名别名改写（#150）**：破解按 `tools` 工具名集合识别客户端的指纹风控——请求侧改名、响应侧自动回改（流式/聚合/Anthropic 双形态 + 对冲/重试同步重放）；管理面新增「工具别名」tab（内置默认表 + 自定义覆盖/停用，保存即生效）。
+
+### 修复
+
+- **finish_reason 误标 stop（#148）**：带工具调用的完成帧统一升级为 `tool_calls`，严格客户端不再取消 pending 工具。
+- **Qoder 凭证续期（#143）**：兼容 `device_token`/`expires_at` 响应形态，修复手动续期恒报「响应结构异常」。
+- **元数据编辑弹框串值（#146）**：快速连点模型时慢响应覆盖/残留旧值——序号令牌 + 回填期清空禁用；指纹清洗面板规则行改稳定 key。
+
+### 验证
+
+- `cargo test --workspace`（834 通过）、`npx tsc --noEmit`、`npm test`（81 通过）全部通过。
+
 ## [1.5.7] · 2026-10-25 · Qoder 登录直连 SSO + 签到盲发兜底 + vault 加固
 
 > 语义移植 main `2e02cfc`（不含）=> `aa4ec5a`（3 提交，未 merge）。跳过（OS/桌面专属或本分支不适用）：2fe9396 `commands/env.rs`（Windows 注册表安装检测 WOW6432Node，桌面探测模块本分支无此文件）与 `build-assets/installer-hooks.nsh`（NSIS 安装器注释，本分支无 build-assets）；aa4ec5a vault DPAPI 双格式自适应与 `AIWORK_VAULT_SHARED` 一次性迁移（桌面侧特性——本分支 vault 即 V2: hex 格式源头，DPAPI blob 维持明确迁移报错）、`commands/qoder/oauth.rs` 桌面 open_in_browser（Web 化已移除，授权页由前端 window.open）、AGENT.md / docs/tech-framework.md 的 Qoder OAuth 行（本分支无对应行）、版本号 chore（main 3.8.4，本分支版本自管）。74b4d55（issue #138）与本分支 1.5.5 的 3349a9e 为同题异构实现，仅补移植其独有增量。
